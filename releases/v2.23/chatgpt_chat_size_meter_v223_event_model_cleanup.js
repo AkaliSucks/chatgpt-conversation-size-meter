@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP
 // @namespace    local.chatgpt.size.v2101
-// @version      2.23.1
+// @version      2.23.2
 // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
 // @match        https://chatgpt.com/*
 // @grant        unsafeWindow
@@ -85,6 +85,11 @@ const page = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 const attemptCache = new Map();
 const episodeCache = new Map();
 const storageHealth = new Map();
+const snapshotCache = new Map();
+const lifecycleCache = new Map();
+const diagnosticCache = new Map();
+const meterStorageTotals = {meterOwnedKeyCount:null,meterOwnedBytes:null,meterOwnedUtf16Bytes:null,
+  bytesReclaimed:0,cleanupAt:null,lastAuditAt:null};
 const streamBuffers = new Map(); // ephemeral framing only, never persisted
 const captureJobs = new Map();
 let meterFetch = null;
@@ -177,14 +182,17 @@ function blankSnapshot() {
 function loadSnapshot(id = chatIdFromURL()) {
   const k = snapshotKey(id);
   if (!k) return blankSnapshot();
+  if (snapshotCache.has(id)) return snapshotCache.get(id);
 
   try {
     const parsed = eventStorageParse(localStorage.getItem(k));
     if (parsed && Array.isArray(parsed.records)) {
-      return {
+      const snapshot = {
         ...blankSnapshot(),
         ...parsed
       };
+      snapshotCache.set(id,snapshot);
+      return snapshot;
     }
   } catch {}
 
@@ -193,28 +201,32 @@ function loadSnapshot(id = chatIdFromURL()) {
 
 function saveSnapshot(id, snap) {
   const key = snapshotKey(id);
-  if (key) eventSave(id,key,snap);
+  if (key) { snapshotCache.set(id,snap); eventSave(id,key,snap); }
 }
 
 function saveDiagnostic(id, diag) {
   const key = diagKey(id);
   if (!key) return;
   let previous = {};
-  try { previous = eventStorageParse(localStorage.getItem(key)) || {}; }
+  try { previous = loadDiagnostic(id) || {}; }
   catch (error) { eventStorageError(id,error); }
   const value = {...previous,...diag,time:Date.now()};
   for (const field of ['lastObservedURL','lastSourceURL']) {
     if (value[field]) value[field] = sanitizeURL(value[field]);
   }
+  diagnosticCache.set(id,value);
   eventSave(id,key,value);
 }
 
 function loadDiagnostic(id = chatIdFromURL()) {
   const k = diagKey(id);
   if (!k) return null;
+  if (diagnosticCache.has(id)) return diagnosticCache.get(id);
 
   try {
-    return eventStorageParse(localStorage.getItem(k));
+    const value = eventStorageParse(localStorage.getItem(k));
+    if (value) diagnosticCache.set(id,value);
+    return value;
   } catch {
     return null;
   }
@@ -3335,12 +3347,13 @@ function blankLifecycle() {
 function loadLifecycle(id = chatIdFromURL()) {
   const k = lifecycleKey(id);
   if (!k) return blankLifecycle();
+  if (lifecycleCache.has(id)) return lifecycleCache.get(id);
 
   try {
     const x = eventStorageParse(localStorage.getItem(k));
 
     if (!x || typeof x !== 'object') {
-      return blankLifecycle();
+      const empty = blankLifecycle(); lifecycleCache.set(id,empty); return empty;
     }
 
     if (
@@ -3348,7 +3361,7 @@ function loadLifecycle(id = chatIdFromURL()) {
       x.families &&
       typeof x.families === 'object'
     ) {
-      return {
+      const state = {
         ...blankLifecycle(),
         ...x,
         families: {
@@ -3366,6 +3379,8 @@ function loadLifecycle(id = chatIdFromURL()) {
           ? x.observations
           : []
       };
+      lifecycleCache.set(id,state);
+      return state;
     }
 
     const migrated = migrateLifecycleV216(x);
@@ -3378,7 +3393,7 @@ function loadLifecycle(id = chatIdFromURL()) {
 
 function saveLifecycle(id, x) {
   const key = lifecycleKey(id);
-  if (key) eventSave(id,key,x);
+  if (key) { lifecycleCache.set(id,x); eventSave(id,key,x); }
 }
 
 function visibleGenerationActive() {
@@ -3500,6 +3515,7 @@ function recordLifecycleFullCapture(id, sourceURL = '', payloadBytes = null) {
 
   state.lastSourceFamily = sourceFamily;
   state.lastObservation = obs;
+  family.lastObservation = obs;
 
   if (phase === 'inflight') {
     family.lastInflight = obs;
@@ -3771,7 +3787,7 @@ function eventStorageError(id, error) {
 
 // Lossless storage codec: intern field names and repeated nested observations.
 // Logical in-memory/exported schemas stay unchanged; old plain JSON still loads.
-function eventStorageText(data) {
+function eventStorageText(data, alwaysPack = false) {
   const plain = JSON.stringify(data), keys = [], keyMap = new Map(), values = [], seen = new Map();
   function encode(value) {
     if (!value || typeof value !== 'object') return value;
@@ -3795,7 +3811,7 @@ function eventStorageText(data) {
   }
   const root = encode(data);
   const packed = JSON.stringify({encoding:'v223-key-table-1',keys,values,root});
-  return packed.length < plain.length ? packed : plain;
+  return alwaysPack || packed.length < plain.length ? packed : plain;
 }
 
 // A second, lossless compression tier is reserved for quota pressure. No attempt,
@@ -3813,7 +3829,7 @@ function eventStorageRetryText(text) {
   if (word) codes.push(word.length === 1 ? word.charCodeAt(0) : dict.get(word));
   let binary = '';
   for (const code of codes) binary += String.fromCharCode(code >> 8,code & 255);
-  const compressed = JSON.stringify({encoding:'v223-lzw-1',data:btoa(binary)});
+  const compressed = JSON.stringify({encoding:'v223-lzw-1',savedAt:JSON.parse(text)?.savedAt || null,data:btoa(binary)});
   return compressed.length < text.length ? compressed : text;
 }
 
@@ -3846,6 +3862,121 @@ function eventStorageParse(text) {
   return decode(data.root);
 }
 
+function eventStorageSavedText(data) {
+  // Timestamp the write envelope, not the research observations it contains.
+  const packed = JSON.parse(eventStorageText(data,true));
+  packed.savedAt = Date.now();
+  return JSON.stringify(packed);
+}
+
+function meterStorageInventory() {
+  const entries = [], seen = new Set(), namespaces = Object.create(null);
+  let bytes = 0, utf16Bytes = 0;
+  // Enumerate names across the origin, but read values only after exact ownership.
+  for (let i=0;i<localStorage.length;i++) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(`${P}:`) || seen.has(key)) continue;
+    seen.add(key);
+    const value = localStorage.getItem(key);
+    if (value == null) continue;
+    const size = new TextEncoder().encode(key).length + new TextEncoder().encode(value).length;
+    const namespace = key.slice(P.length+1).split(':')[0];
+    const row = namespaces[namespace] ||= {keys:0,bytes:0}; row.keys++; row.bytes += size;
+    entries.push({key,value,bytes:size}); bytes += size; utf16Bytes += 2*(key.length+value.length);
+  }
+  Object.assign(meterStorageTotals,{meterOwnedKeyCount:entries.length,meterOwnedBytes:bytes,
+    meterOwnedUtf16Bytes:utf16Bytes,meterOwnedNamespaces:namespaces,lastAuditAt:Date.now(),auditError:null});
+  return entries;
+}
+
+function eventStorageHealth(id, force = false) {
+  if (force || meterStorageTotals.lastAuditAt == null || Date.now()-meterStorageTotals.lastAuditAt >= 5000) {
+    try { meterStorageInventory(); }
+    catch (error) { meterStorageTotals.auditError = redactDiagnosticText(error?.message || String(error)).slice(0,300); }
+  }
+  const health = storageHealth.get(id) || {lastSaveSuccessful:null};
+  Object.assign(health,meterStorageTotals);
+  storageHealth.set(id,health);
+  return health;
+}
+
+function meterStorageActivity(value) {
+  let raw;
+  try {
+    raw = JSON.parse(value);
+    // New envelopes carry last-write time without interpreting source metrics.
+    if (Number.isFinite(raw?.savedAt) && raw.savedAt > 0) return raw.savedAt;
+    raw = eventStorageParse(value);
+  } catch { return null; }
+  const stack = [raw], dates = /^(?:time|capturedAt|fullCapturedAt|startedAt|sendIntentAt|dispatchAt|firstSeenAt|lastSeenAt|finalizedAt|outcomeConfirmedAt|telemetryFinalizedAt|responseObservedAt|responseCompletedAt|lastSavedAt)$/;
+  let newest = null, visited = 0;
+  while (stack.length && visited++ < 10000) {
+    const item = stack.pop();
+    if (!item || typeof item !== 'object') continue;
+    for (const [name,child] of Object.entries(item)) {
+      if (dates.test(name) && typeof child === 'number' && Number.isFinite(child) && child > 0) newest = Math.max(newest || 0,child);
+      else if (child && typeof child === 'object') stack.push(child);
+    }
+  }
+  return stack.length ? null : newest; // Unknown/incompletely examined dates fail closed.
+}
+
+function meterStorageCleanup(id, writeKey) {
+  const now = Date.now();
+  if (meterStorageTotals.cleanupAt != null && now-meterStorageTotals.cleanupAt < 30000) return 0;
+  meterStorageTotals.cleanupAt = now;
+  meterStorageTotals.cleanupBytesReclaimed = 0;
+  meterStorageTotals.cleanupRemovedKeyCount = 0;
+  meterStorageTotals.cleanupByNamespace = {};
+  meterStorageTotals.cleanupError = null;
+  meterStorageTotals.cleanupEligibleKeyCount = null;
+  meterStorageTotals.cleanupEligibleBytes = null;
+  meterStorageTotals.cleanupPolicy = '30 days inactive; max 12 keys / 3 chats; stop after 512 KiB reclaimed';
+  try {
+    const entries = meterStorageInventory(), groups = new Map();
+    const protectedChats = new Set([id,chatIdFromURL()]);
+    for (const [chat,store] of attemptCache) if (store.current) protectedChats.add(chat);
+    for (const entry of entries) {
+      const suffix = entry.key.slice(P.length+1);
+      const match = /^(snapshot|diag|lifecycle-v\d+|attempts-v\d+|max-episodes-v\d+):([^:]+)$/.exec(suffix);
+      // Settings, positions, verified samples, manual MAX settings, notifications
+      // and unrecognized namespaces are audited but never selected for deletion.
+      if (!match || protectedChats.has(match[2]) || entry.key === writeKey) continue;
+      const group = groups.get(match[2]) || {entries:[],newest:0,unknown:false};
+      const activity = meterStorageActivity(entry.value);
+      group.entries.push(entry); group.unknown ||= activity == null;
+      group.newest = Math.max(group.newest,activity || 0); groups.set(match[2],group);
+    }
+    const cutoff = now-30*86400000;
+    const stale = [...groups.values()].filter(g=>!g.unknown && g.newest < cutoff).sort((a,b)=>a.newest-b.newest);
+    meterStorageTotals.cleanupEligibleKeyCount = stale.reduce((n,g)=>n+g.entries.length,0);
+    meterStorageTotals.cleanupEligibleBytes = stale.reduce((n,g)=>n+g.entries.reduce((sum,e)=>sum+e.bytes,0),0);
+    let chats = 0;
+    for (const group of stale) {
+      if (chats++ >= 3 || meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
+      // Recheck every key in a chat before removing any: another tab may have saved.
+      if (group.entries.some(entry=>localStorage.getItem(entry.key) !== entry.value)) continue;
+      for (const entry of group.entries.sort((a,b)=>b.bytes-a.bytes)) {
+        if (meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
+        if (localStorage.getItem(entry.key) !== entry.value) continue;
+        localStorage.removeItem(entry.key);
+        if (localStorage.getItem(entry.key) != null) continue;
+        meterStorageTotals.cleanupBytesReclaimed += entry.bytes;
+        meterStorageTotals.bytesReclaimed += entry.bytes;
+        meterStorageTotals.cleanupRemovedKeyCount++;
+        const namespace = entry.key.slice(P.length+1).split(':')[0];
+        meterStorageTotals.cleanupByNamespace[namespace] = (meterStorageTotals.cleanupByNamespace[namespace] || 0)+1;
+      }
+    }
+  } catch (error) { meterStorageTotals.cleanupError = redactDiagnosticText(error?.message || String(error)).slice(0,300); }
+  eventStorageHealth(id,true);
+  return meterStorageTotals.cleanupBytesReclaimed;
+}
+
+function eventIsQuotaError(error) {
+  return /quota/i.test(`${error?.name || ''} ${error?.message || ''}`) || error?.code === 22 || error?.code === 1014;
+}
+
 function eventSave(id, key, data) {
   const health = storageHealth.get(id) || {};
   storageHealth.set(id,health);
@@ -3858,19 +3989,32 @@ function eventSave(id, key, data) {
     health.lastSavedAt = Date.now();
     if (retry) { health.compactRetryRecoveredAt = Date.now(); health.compactRetryBytes = bytes; }
   }
-  let text;
-  try { text = eventStorageText(data); save(text,false); }
+  let text, cleanupRecovered = false;
+  try { text = eventStorageSavedText(data); save(text,false); }
   catch (error) {
+    let quotaPressure = eventIsQuotaError(error);
     eventStorageError(id,error);
     health.failedSaveCount = (health.failedSaveCount || 0)+1;
     health.lastFailedSaveAt = Date.now();
-    if (!text) return;
-    try {
-      const compact = eventStorageRetryText(text);
-      if (compact.length >= text.length) return;
-      health.compactRetryCount = (health.compactRetryCount || 0)+1;
-      save(compact,true);
-    } catch (retryError) { eventStorageError(id,retryError); }
+    if (text) {
+      let compact = text;
+      try {
+        compact = eventStorageRetryText(text);
+        if (compact.length < text.length) {
+          health.compactRetryCount = (health.compactRetryCount || 0)+1;
+          save(compact,true);
+        }
+      } catch (retryError) { quotaPressure ||= eventIsQuotaError(retryError); eventStorageError(id,retryError); }
+      if (quotaPressure && !health.lastSaveSuccessful && meterStorageCleanup(id,key) > 0) {
+        try { save(compact,true); health.cleanupRetryRecoveredAt = Date.now(); cleanupRecovered = true; }
+        catch (cleanupRetryError) { eventStorageError(id,cleanupRetryError); }
+      }
+    }
+  } finally {
+    health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+    health.saveResultsByKey = {...health.saveResultsByKey,[key]:health.finalSaveResult};
+    health.unsavedKeyCount = Object.values(health.saveResultsByKey).filter(result=>result === 'failed').length;
+    eventStorageHealth(id,cleanupRecovered);
   }
 }
 
@@ -4141,15 +4285,22 @@ function eventComparison(id) {
       blockedBeforeDispatch:max.blockedBeforeDispatch,confirmationSource:max.confirmationSource} : null,families};
 }
 
+function eventStaticState(id) {
+  const life = loadLifecycle(id);
+  const latest = family => [family?.lastObservation,family?.lastStable,family?.lastInflight,family?.lastMaxEvent?.metrics]
+    .filter(Boolean).sort((a,b)=>(b.fullCapturedAt || b.time || 0)-(a.fullCapturedAt || a.time || 0))[0] || null;
+  return {direct:latest(life.families?.direct),batch:latest(life.families?.batch),latest:life.lastObservation};
+}
+
 function eventDiagnostics(id) {
   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
   const a = store.current || store.last;
   const life = loadLifecycle(id);
-  return ['ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP',
+  return ['ChatGPT Conversation Size Meter V2.23.2 EVENT MODEL CLEANUP',
     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
     `Active MAX episode ID: ${e?.id ?? 'none'}`,
     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
-    `Storage health: ${JSON.stringify(storageHealth.get(id) || {lastSaveSuccessful:null})}`,
+    `Storage health: ${JSON.stringify(eventStorageHealth(id,true))}`,
     'REAL ATTEMPTS',JSON.stringify({current:store.current,history:store.attempts,sendIntents:store.sendIntents}),
     'MAX EPISODES',JSON.stringify(state.episodes),
     `Fresh DIRECT: ${e?.direct ? JSON.stringify(e.direct) : 'No fresh DIRECT capture for this MAX episode'}`,
@@ -4161,8 +4312,7 @@ function eventDiagnostics(id) {
     'APP STATE NETWORK',JSON.stringify({http:store.appStateNetwork,uncorrelatedWebSocket:store.uncorrelatedWebSocket,unclassifiedConversationPosts:store.unclassifiedConversationPosts}),
     'METER CAPTURE NETWORK',JSON.stringify(store.meterCaptureNetwork),
     'POST-OUTCOME CORRELATION',JSON.stringify(a?.postCorrelation || null),
-    'STATIC STATE VECTOR',JSON.stringify({direct:life.families?.direct?.lastStable,batch:life.families?.batch?.lastStable,
-      latest:life.lastObservation})];
+    'STATIC STATE VECTOR',JSON.stringify(eventStaticState(id))];
 }
 
 function eventPanelMarkup(id) {
@@ -4183,8 +4333,8 @@ function eventPanelMarkup(id) {
     section('SOURCE COMPARISON / NUMERIC DELTAS',JSON.stringify(comparison.families)) +
     section('GENERATION TRANSPORT',`${attemptStreamSummary(a)}\n${a?.streamStats?.readErrorBenign ? 'Benign post-completion clone abort' : ''}\nHTTP: ${JSON.stringify(a?.generationHTTP || null)}\nCorrelated WS: ${attemptTransportSummary(a)}\nTransport closed: ${a?.transportClosedAt ?? 'pending'}; telemetry finalized: ${a?.telemetryFinalizedAt ?? 'pending'}`) +
     section('POST-OUTCOME CORRELATION',attemptPostCorrelationText(a)) +
-    section('SOURCE-SEPARATED STATIC STATE VECTOR',`DIRECT: ${JSON.stringify(loadLifecycle(id).families?.direct?.lastStable)}\nBATCH: ${JSON.stringify(loadLifecycle(id).families?.batch?.lastStable)}\nRepresentations are descriptive; no universal threshold or remaining capacity is inferred.`) +
-    section('APP STATE NETWORK / METER CAPTURE NETWORK',`App HTTP rows: ${store.appStateNetwork.length}; uncorrelated WS rows: ${store.uncorrelatedWebSocket.length}; meter rows: ${store.meterCaptureNetwork.length}\nStorage: ${JSON.stringify(storageHealth.get(id) || {})}`);
+    section('SOURCE-SEPARATED STATIC STATE VECTOR',`DIRECT: ${JSON.stringify(eventStaticState(id).direct)}\nBATCH: ${JSON.stringify(eventStaticState(id).batch)}\nRepresentations are descriptive; no universal threshold or remaining capacity is inferred.`) +
+    section('APP STATE NETWORK / METER CAPTURE NETWORK',`App HTTP rows: ${store.appStateNetwork.length}; uncorrelated WS rows: ${store.uncorrelatedWebSocket.length}; meter rows: ${store.meterCaptureNetwork.length}\nStorage: ${JSON.stringify(eventStorageHealth(id))}`);
 }
 
 
@@ -8623,6 +8773,7 @@ function clearSnapshot() {
 
   if (k && confirm('Clear the saved network snapshot for this chat?')) {
     localStorage.removeItem(k);
+    snapshotCache.delete(chatIdFromURL());
     render();
     return true;
   }

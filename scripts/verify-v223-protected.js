@@ -32,3 +32,17 @@ for (const marker of ["const P = 'cgpt-size-meter-v2101';",'// @grant        uns
   assert(candidate.includes(Buffer.from(marker)),marker);
 }
 console.log(`PASS ${total} protected bytes; baseline identity and capture-lineage markers`);
+const checkpoint = require('node:child_process').execFileSync('git',['show',
+  '4b14425c50ff62b093082908c5861ae796fa7a7d:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js']);
+let sendBytes = 0;
+for (const [start,end] of [
+  ['function sendComposer(', 'function eventComparison('],
+  ['function attemptStartFromNetwork(', 'function attemptEnrichRequestBody(']
+]) {
+  const original = region(checkpoint,start,end);
+  assert.deepEqual(region(candidate,start,end),original,`validated send path: ${start}`);
+  sendBytes += original.length;
+}
+for (const marker of ['let pendingComposerEnter = null;','let lastComposerSubmission = null;',
+  'installNetworkHooks();\ninstallSendIntentHook();']) assert(candidate.includes(Buffer.from(marker)),marker);
+console.log(`PASS ${sendBytes} validated send/correlation bytes unchanged from 4b14425`);

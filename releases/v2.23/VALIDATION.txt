@@ -1,8 +1,8 @@
-V2.23.1 native-validation fixes; synthetic verification only
-Branch: codex/v223-native-validation-fixes
-Exact parent checkpoint: ab2b19bfec736dc03cbdd2d1ad3c363bfe87b67a
-Native diagnostic files were unavailable in the checkout; user findings supplied the regression requirements.
-Live browser audit was read-only DOM inspection, not candidate runtime validation.
+V2.23.2 storage/static-state repair candidate; synthetic verification only
+Exact parent: 4b14425c50ff62b093082908c5861ae796fa7a7d
+Branch: codex/v223-storage-static-state-fixes
+Parent native send validation supplied by user: button 183 ms; Enter 170 ms; each one intent/attempt.
+No new native-browser validation or live origin storage measurement was performed.
 
 $ C:/Program Files/Git/bin/bash.exe --noprofile --norc -c export PATH=/usr/bin:/bin:$PATH; bash scripts/verify-baseline.sh
 PASS: V2.22 baseline SHA-256 matches: 08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696
@@ -13,7 +13,11 @@ $ node --check releases\v2.23\chatgpt_chat_size_meter_v223_event_model_cleanup.j
 
 exit 0
 
-$ node --check scripts/test-v223.js
+$ node --check scripts\test-v223.js
+
+exit 0
+
+$ node --check scripts\verify-v223-protected.js
 
 exit 0
 
@@ -23,6 +27,7 @@ PASS protected region function mergeRecordsForChat( (1190 bytes)
 PASS protected region function inspectJSON( (282 bytes)
 PASS protected region function inspectRequestBody( (408 bytes)
 PASS 66862 protected bytes; baseline identity and capture-lineage markers
+PASS 8807 validated send/correlation bytes unchanged from 4b14425
 exit 0
 
 $ node scripts/test-v223.js
@@ -77,24 +82,42 @@ PASS Enter newline, ignored key and excluded search fields never become intents
 PASS disabled and unrelated composer controls are ignored; default submit semantics work
 PASS handled Enter followed by native MAX stays blocked without inventing a dispatch
 PASS native Enter composer clear confirms original length; navigation cancels provisional key
-STORAGE representative 10-attempt fixture: original JSON 259873; compact 37807; quota retry 17691 bytes
-STORAGE representative 1-attempt fixture: original JSON 60295; compact 25466; quota retry 11243 bytes
+STORAGE representative 10-attempt fixture: original JSON 259873; compact 37807; quota retry 17706 bytes
+STORAGE representative 1-attempt fixture: original JSON 60295; compact 25466; quota retry 11258 bytes
 PASS lossless storage compaction roundtrips repeated snapshots, nulls and Unicode
 PASS quota pressure bounds traces, recovers losslessly and retains attempt/MAX identity and outcomes
 PASS compact saved attempts, episodes, lifecycle, snapshot and diagnostics reload through production readers
-54/54 synthetic harness tests passed; native-browser validation not performed
+PASS parsed DIRECT then BATCH publish distinct static vectors even when every storage write fails
+PASS partial quota failure reproduces deep snapshot success and must retain lifecycle publication in memory
+PASS inflight parsed snapshots publish valid vectors without relabelling them stable or fabricating BATCH
+PASS snapshot persistence succeeds while lifecycle alone fails: profiler and published source metrics both survive
+PASS explicit snapshot clear invalidates its new memory cache
+PASS healthy parsed DIRECT and BATCH HTTP responses publish static metrics through production network hooks
+PASS origin-wide meter audit includes every owned namespace and conversation without reading unrelated values
+GC fixture: reclaimed 8162 meter-owned bytes from 2 stale keys; final save saved
+PASS stale cross-conversation legacy state is reclaimed and quota save finally succeeds without touching app storage
+PASS GC retains current, in-memory active, recent, undated, malformed, future and reserved research/settings keys
+PASS GC key/chat bounds and cooldown hold across many stale conversations
+PASS GC stops after reclaim target even if the first eligible key is large
+PASS GC skips a whole stale conversation changed by another tab during inspection
+PASS new storage write times protect recently used conversations containing old research observations
+PASS validated 4b14425 checkpoint readers can still decode timestamped normal and retry storage
+PASS no eligible headroom and denied cleanup surface final failure while parsed in-memory state remains valid
+PASS non-quota storage failures never trigger destructive cleanup of stale evidence
+70/70 synthetic harness tests passed; native-browser validation not performed
 exit 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 281660 bytes; SHA-256 5040718bbd964b33a80b33757c64cdfb0697962fe537bd36f6130c38458134f5
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 62182 bytes; SHA-256 26ee7bc9a7cf8d548e7303ffc9b21f5e45d9e45bf25104ee768d7d5f81ca827d
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 289872 bytes; SHA-256 135db44a19b8b410e3aeae27e4ff2e7694854b13ffdc74c554f9afcd9f88fce4
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 64425 bytes; SHA-256 ef13191e39f57225d19536d779a746226b0c928c584892e053b129e0993bb3b7
 exit 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 281660 bytes; SHA-256 5040718bbd964b33a80b33757c64cdfb0697962fe537bd36f6130c38458134f5
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 62182 bytes; SHA-256 26ee7bc9a7cf8d548e7303ffc9b21f5e45d9e45bf25104ee768d7d5f81ca827d
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 289872 bytes; SHA-256 135db44a19b8b410e3aeae27e4ff2e7694854b13ffdc74c554f9afcd9f88fce4
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 64425 bytes; SHA-256 ef13191e39f57225d19536d779a746226b0c928c584892e053b129e0993bb3b7
 exit 0
 
-PASS deterministic ZIP: two builds byte-identical; one JS member matching source bytes.
-PASS release JS has LF only.
-Native browser validation of this candidate has not been performed.
+PASS two deterministic ZIP builds byte-identical; single member exactly matches source.
+PASS candidate LF-only.
+Protected parser bytes and validated send/correlation bytes verified independently.
+Runtime origin-wide byte/key totals and native GC recovery await this candidate being installed.

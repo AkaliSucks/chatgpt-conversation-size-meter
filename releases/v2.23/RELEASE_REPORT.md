@@ -1,3 +1,141 @@
+# V2.23.2 candidate — Shared-origin storage and static publication
+
+Prepared 2026-09-30 on `codex/v223-storage-static-state-fixes`, directly from
+`4b14425c50ff62b093082908c5861ae796fa7a7d`. The child commit containing this report
+is the new candidate. The parent is preserved on `codex/v223-native-validation-fixes`.
+No V2.24 work, merge to main, push or PR.
+
+The user reports native confirmation of the parent's send path: button produced
+one intent/attempt with 183 ms latency; Enter produced one intent/attempt with
+170 ms latency. Those results are user-supplied native evidence. This child keeps
+the send observation and dispatch correlation implementation byte-identical.
+New native diagnostic files were not present in the checkout. This repair uses
+the supplied quota and null-vector findings; it does not claim native validation
+of the new storage cleanup or publication behavior.
+
+## Two repairs
+
+Current-chat bounded histories and serialization health did not inventory the
+whole origin. The new runtime audit enumerates every exact
+`cgpt-size-meter-v2101:` key, including all conversations and legacy/unknown
+namespaces. It reads values only after that ownership check. Diagnostics expose
+`meterOwnedKeyCount`, `meterOwnedBytes`, `meterOwnedUtf16Bytes`, per-namespace
+key/byte totals and `lastAuditAt`. UTF-8 bytes include key and value; UTF-16 bytes
+are a separate estimate, not a claim about the browser's internal quota accounting.
+Copy performs a fresh audit; routine health refresh is throttled to five seconds.
+Actual native origin-wide totals still need collection after installation.
+
+After an unrecovered compact save retry caused by quota pressure, bounded GC may reclaim dated conversation
+data inactive for **over 30 days**. It groups recognized snapshot/diagnostic/
+lifecycle/attempt/MAX-episode namespaces by conversation, using the newest date
+across that conversation. New writes timestamp the existing key-table/LZW
+envelopes, so old research observations in a recently used chat are not stale.
+Old plain/packed data uses its observation/event timestamps; unknown or
+incompletely examined dates fail closed. The validated parent can still decode
+the timestamped formats.
+
+GC preserves the current/writing conversation, known in-memory active attempts,
+recent/future/undated/malformed data, settings, positions, verified samples,
+manual MAX settings, notification keys and unknown namespaces. Unrelated ChatGPT
+keys and lookalike prefixes are never selected or read for their values. It
+rechecks values for cross-tab changes before deletion. Each run removes at most
+**12 keys across 3 stale conversations**, stops after reaching **512 KiB** reclaimed
+(one large key can exceed this target), and has a **30-second cooldown**. It then
+retries the pending save. Cleanup is pressure-triggered, not a background deletion
+of recent research history.
+
+Health exposes cumulative session `bytesReclaimed`, last-run reclaimed bytes/key
+count, `cleanupAt`, eligible bytes/key count, namespace removal counts/errors,
+`cleanupRetryRecoveredAt`, `finalSaveResult`, per-key save results and
+`unsavedKeyCount`. Later successful writes cannot hide another key's unsaved
+state. These counters are session-scoped; origin totals are re-audited on reload.
+No eligible stale headroom means the final failure remains visible. GC never
+tries to make room by clearing unrelated app storage or recent evidence.
+
+The publication failure was downstream of the protected parser:
+`inspectJSON → acceptCandidate → mergeRecordsForChat → saveSnapshot →
+recordLifecycleFullCapture → lifecycleMetrics/loadSnapshot → saveLifecycle →
+diagnostics/loadLifecycle`. Previously these reads depended on successful
+localStorage writes. Quota failure could discard/re-read stale source state even
+though parsing/topology/profiling had succeeded. Separately, publication selected
+only `lastStable`, hiding valid in-flight source captures.
+
+Snapshot, lifecycle and diagnostic state now remain authoritative in memory
+before saving. Each family tracks its latest accepted full observation; the
+STATIC STATE VECTOR publishes DIRECT/BATCH separately with original phase labels
+and a latest observation. In-flight/MAX captures are not relabelled stable, and
+missing BATCH stays null. Accepted metrics come from the unchanged parser result.
+Explicit snapshot clear also invalidates its cache. Storage failure does not
+erase valid in-memory metrics; a failed save still cannot guarantee durability
+across a page reload.
+
+## Verification and candidate artifacts
+
+- **70/70 synthetic tests PASS**: all 54 previous cases plus 16 new cases for
+  healthy DIRECT/BATCH responses through network hooks; total/partial/lifecycle-only
+  persistence failure; in-flight publication; explicit cache clear; origin-wide
+  accounting and ownership; safe GC exclusions/bounds/cooldown/change detection;
+  new-write age protection; parent-reader compatibility; unrecoverable cleanup;
+  and non-quota failures that must never trigger deletion.
+- Deterministic quota fixture reclaimed **8,162 meter-owned bytes from 2 stale
+  keys**, then saved the current attempt state successfully. Required current
+  attempt/MAX identity and outcomes, verified samples and unrelated app values
+  were preserved. This is synthetic evidence, not a native origin measurement.
+- All **66,862 protected parser/extraction/topology/profiler bytes** match V2.22.
+- All **8,807 validated send/correlation bytes** match `4b14425`.
+- Candidate, harness, verifier and immutable baseline `node --check`: PASS.
+  `scripts/verify-baseline.sh`: PASS. Baseline remains 289,994 bytes, SHA-256
+  `08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696`.
+- Two deterministic ZIP builds are byte-identical, with one JS member exactly
+  matching the LF-only source. Full outputs are in `VALIDATION.txt`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `chatgpt_chat_size_meter_v223_event_model_cleanup.js` | 289872 | `135db44a19b8b410e3aeae27e4ff2e7694854b13ffdc74c554f9afcd9f88fce4` |
+| `chatgpt_chat_size_meter_v223_event_model_cleanup.zip` | 64425 | `ef13191e39f57225d19536d779a746226b0c928c584892e053b129e0993bb3b7` |
+
+Changed files: release JS/ZIP, checksums, validation log, this report,
+`scripts/test-v223.js`, and `scripts/verify-v223-protected.js`. Baseline, protected
+functions, send implementation, spec, package script and line-ending policy are
+unchanged. UI changes are limited to the requested static-vector/storage-health
+publication; no layout or unrelated controls changed.
+
+## Next native retest
+
+1. Preserve the current diagnostics and install only **2.23.2**. Keep origin
+   storage intact. Hard reload an established `/c/<id>` test chat, wait for its
+   full conversation response, and copy diagnostics. Record origin-wide owned
+   key/byte totals, namespace breakdown, current-chat bytes and the audit timestamp.
+2. Compare STATIC STATE VECTOR against the valid full snapshot/topology/profiler.
+   DIRECT must have source/phase/time and corresponding scalar metrics after its
+   parsed GET. If necessary press Retry Capture once, wait 2–3 seconds and copy.
+   BATCH must populate separately when its real response arrives naturally; if
+   no BATCH response occurs, null BATCH is expected. Do not replay a BATCH POST.
+3. Send exactly `Reply with one short sentence.` by button, copy after SUCCESS,
+   then repeat by Enter and copy separately. Expect one new intent/attempt each,
+   positive recorded latency, and unchanged send behavior. Wait for closure and
+   post-capture jobs; confirm source metrics remain published.
+4. Under the existing natural quota pressure, retain before/after copies. Inspect
+   cleanup timestamp, eligible count/bytes, removed namespace counts, reclaimed
+   bytes, final result, per-key results and unsaved count. Successful recovery
+   requires final saved results with no remaining failed keys. If none of the
+   owned data is eligible, retain the visible failure; do not clear unrelated
+   storage or fabricate quota pressure. Even then valid in-memory DIRECT/BATCH
+   metrics must remain available and update on later accepted full captures.
+5. After a successful save, copy, hard reload and copy again to verify persisted
+   attempt/MAX identities and source metrics. For a failed save, copy before
+   reload: in-memory evidence is not a durability claim. Confirm a new full
+   capture republishes metrics even if quota continues failing. Native cleanup,
+   shared-origin headroom and cross-tab behavior remain validation-open until
+   these samples are supplied.
+
+---
+
+## Historical V2.23.1 report (4b14425; not this child build)
+
+The remaining text preserves earlier checkpoint reports, hashes and test counts.
+Current V2.23.2 evidence and retest instructions are above.
+
 # V2.23.1 candidate — Native validation fixes
 
 Prepared 2026-09-30 on `codex/v223-native-validation-fixes`, directly from
