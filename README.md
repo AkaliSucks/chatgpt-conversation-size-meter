@@ -4,8 +4,8 @@ This is the clean development workspace for future revisions of the Conversation
 
 ## Current state
 - Accepted implementation baseline: **V2.22**
-- Next planned implementation: **V2.23 — Event Model Cleanup**
-- V2.23 implementation has **not** been created in this scaffold.
+- Candidate implementation: **V2.23 — Event Model Cleanup**, pending manual browser validation
+- Candidate JS, ZIP, checksums, validation evidence and browser steps: [releases/v2.23/RELEASE_REPORT.md](releases/v2.23/RELEASE_REPORT.md)
 
 ## Key inputs
 - `src/baseline/` — exact V2.22 source
@@ -26,3 +26,19 @@ Run:
 ```
 
 The script checks the exact V2.22 SHA-256 and runs `node --check`.
+
+JavaScript and shell sources check out with LF on Windows; ZIPs remain binary.
+For Git for Windows Bash, set `export PATH=/usr/bin:/bin:$PATH` inside Bash
+if needed so the verifier can find `sha256sum`, `awk` and `dirname`.
+
+Candidate checks (Node 18+):
+
+```sh
+node --check releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js
+node scripts/verify-v223-protected.js
+node scripts/test-v223.js
+python scripts/package-v223.py
+```
+
+The deterministic harness runs synthetic scenarios against the actual candidate
+in a Node VM. It does not validate native ChatGPT browser/server behavior.

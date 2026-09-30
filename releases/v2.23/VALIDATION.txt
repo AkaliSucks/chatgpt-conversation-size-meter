@@ -1,0 +1,59 @@
+V2.23 validation — 2026-09-30; Node v24.19.0 Policy commit b15e7fd618ed6aee9020aa25cde20efdf45a3ca3; implementation parent is this commit.
+PASS baseline size 289994 bytes
+PASS: V2.22 baseline SHA-256 matches: 08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696
+PASS: node --check
+PASS node --check candidate, harness and protected verifier
+PASS protected region function normalizeRole( (64982 bytes)
+PASS protected region function mergeRecordsForChat( (1190 bytes)
+PASS protected region function inspectJSON( (282 bytes)
+PASS protected region function inspectRequestBody( (408 bytes)
+PASS 66862 protected bytes; baseline identity and capture-lineage markers
+PASS 1 short SUCCESS confirms immediately; archived telemetry continues
+PASS 2/7 long assistant stream quotes MAX without false outcomes
+PASS 3/10 repeated visible MAX at load creates one episode and zero attempts
+PASS 4 capped Send intent times out without inventing a dispatch
+PASS 5 Retry Capture bypasses fetch hook, parses once, attaches fresh episode source
+PASS 6 ordinary conversation text, hidden banners, panel and wrapper quotes are ignored
+PASS 8 SUCCESS then clone abort preserves outcome and archived totals
+PASS 9 SPA navigation cancels scheduled captures and in-progress parser attribution
+PASS split SSE lines and completion tokens survive arbitrary chunk boundaries
+PASS quoted completion markers in assistant deltas do not confirm SUCCESS
+PASS structured SSE MAX relates episode to real dispatch; repeated errors deduplicate
+PASS HTTP structured MAX, generic HTTP error and normal assistant JSON differ
+PASS preflight matching prefers identity and rejects conflicting parent/action/chat
+PASS delayed preflight response updates consumed preflight identity
+PASS classifier ignores mutation, prepare, wrong endpoints and action-only POST
+PASS fetch Request object body classification completes before clone reader starts
+PASS real network activity sets INFLIGHT despite absent Stop UI
+PASS lingering Stop UI cannot create attempts after SUCCESS
+PASS old stream callback never updates a newer dispatch with same URL
+PASS post-outcome job attaches to archived attempt while newer attempt runs
+PASS MAX clear starts a new episode; stale historical metrics remain pending
+PASS WebSocket auth redaction, no previews and explicit correlation only
+PASS null numeric helpers preserve unknown DIRECT rather than green/zero
+PASS quota failure is visible and in-memory SUCCESS tracking continues
+PASS bounded persistence retains ten full attempts and episodes
+PASS transport timeout closes telemetry without inventing stream close
+PASS SSE full fetch wrapper observes final totals once and preserves original Response
+PASS saved false-MAX fixtures replay quotes and synthetic attempt flooding only
+PASS fetch rejection closes only its generation attempt and passes rejection to page
+PASS XHR success, preflight and error use fixed request identities
+PASS fetch preflight response arrives after dispatch and attaches once
+PASS two preflights in the same millisecond keep distinct response ownership
+PASS pre-existing banner does not finalize a later unrelated dispatch
+PASS send followed by dispatch records latency and cannot become blocked
+PASS send listeners ignore Shift Enter, IME, modifiers and non-composer keys
+PASS coalesced Retry clicks use one internal workflow during generation
+PASS same-millisecond fresh capture does not trigger duplicate fallback parsing
+PASS cleared episode cancels its pending capture job
+PASS banner clearing alone is not recovery; later real SSE SUCCESS is
+PASS comparison missing metrics stay null and source families remain distinct
+PASS restart archives lost transport as correlation incomplete, preserving evidence
+PASS historical V2.22 synthetic attempts are neither migrated nor relabelled
+PASS rendered event sections and copied diagnostics omit predictive bands and tokens
+PASS late dispatch corrects provisional blocked-before-dispatch classification
+PASS unclassified conversation POST prevents a false blocked-before-dispatch label
+45/45 synthetic harness tests passed; native-browser validation not performed
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 272063 bytes; SHA-256 deff5a557eed8836e3cb996c09332741de0f7c417c9fb8902f96713fca0f0836
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 59316 bytes; SHA-256 bc6c97cfe16e4f2e0b3095a99edce9ee6f297e56709246c9808a17ee9096145e
+PASS deterministic ZIP regeneration; exactly one member; extracted JS bytes match release
