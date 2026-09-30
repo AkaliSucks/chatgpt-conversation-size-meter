@@ -1,0 +1,284 @@
+ChatGPT Conversation Size Meter V2.22 SSE OUTCOME + POST CORRELATION
+
+Full snapshot captured: Yes
+Data source: network conversation mapping
+Full snapshot age: 0m ago
+Red maximum banner visible now: Yes
+Verified MAX events stored: 4
+V2.11 topology snapshot present: Yes
+V2.11 topology calculation OK: Yes
+V2.11 topology error: None
+
+ACTIVE BRANCH — TEXT / ROLES
+Role-based user/assistant token estimate: 490713
+Role-based user/assistant characters: 1962851
+Role-based user/assistant messages: 688
+User messages: 82
+Assistant messages: 606
+Display-like token estimate (heuristic): 490300
+Display-like characters (heuristic): 1961200
+Display-like messages (heuristic): 585
+Active branch nodes: 1379
+Active message nodes: 1378
+All-role text token estimate: 917033
+All-role text characters: 3668131
+Hidden/internal message nodes: 467
+Hidden/internal text token estimate: 426320
+Hidden/internal text characters: 1705280
+Empty message nodes: 300
+Active role counts: assistant:803, tool:467, user:108
+Active content types: code:397, execution_output:357, text:230, thoughts:185, reasoning_recap:103, multimodal_text:79, tether_browsing_display:27
+
+TOOLS — V2.10.1 FIXED CLASSIFIER
+Explicit tool/function role nodes: 467
+Tool-like nodes: 876
+Tool call nodes: 409
+Tool result nodes: 467
+Tool call serialized node bytes: 1771156
+Tool result serialized node bytes: 4603097
+Tool call names: python:205, container.exec:189, web.run:12, bio:1, de1d73e.create:1, q7dr546:1
+Tool result names: container.exec:189, python:161, api_tool:96, web.run:12, container.open_image:7, bio:1, de1d73e.create:1
+Non-generic recipient distribution: python:205, container.exec:189, web.run:12, bio:1, de1d73e.create:1, q7dr546:1
+
+IMAGE / FILE / ASSET DIAGNOSTICS
+Attachment-like nodes: 65
+Image-like nodes: 44
+File-like nodes: 94
+Audio-like nodes: 0
+Video-like nodes: 0
+Image-generation call nodes: 12
+Image-generation result nodes: 69
+Generated-image nodes: 86
+Uploaded-image nodes: 37
+Unique asset IDs: 69
+Unique image asset IDs: 6
+Unique file asset IDs: 0
+Unique generated-image asset IDs: 0
+Unique uploaded-image asset IDs: 0
+Image reference occurrences: 155
+File reference occurrences: 1446
+Asset-like serialized node bytes: 757774
+Image-like serialized node bytes: 252302
+File-like serialized node bytes: 606114
+
+MODEL METADATA
+Active model distribution: gpt-5-6-thinking:1271
+GPT-6 Pro-labeled message nodes: 0
+
+CONTEXT-HISTORY TOPOLOGY — V2.12
+Current active depth: 1378
+Latest/current model label: gpt-5-6-thinking
+Model segment count: 1
+Recent model segments: gpt-5-6-thinking d2→1378 (1271 labeled)
+GPT-6 Pro segment count: 0
+Longest GPT-6 Pro segment: —
+Latest GPT-6 Pro segment: —
+GPT-6 Pro depth count: 0
+GPT-6 Pro depths: —
+First GPT-6 Pro depth: Unavailable
+Last GPT-6 Pro depth: Unavailable
+Nodes since last GPT-6 Pro node: Unavailable
+Image-generation event depth count: 81
+Image-generation event depths: 247, 248, 294, 295, 296, 349, 351, 352, 377, 379, 383, 388, 389, 399, 413, 414, 419, 442, 443, 454, 470, 473, 474, 478, 479, 480, 491, 506, 508, 512, 513, 514, 515, 516, 517, 518, 526, 554, 562, 563, 564, 565, 566, 567, 568, 569, 581, 582, 583, 584, 585, 620, 627, 681, 688, 700, 715, 722, 737, 752, 766, 773, 774, 775, 782, 802, 810, 841, 857, 866, 890, 900, 908, 918, 925, 1002, 1009, 1015, 1053, 1055, 1118
+Generated-image depth count: 86
+Generated-image depths: 125, 247, 248, 256, 294, 295, 296, 300, 339, 349, 351, 352, 377, 379, 383, 388, 389, 399, 413, 414, 419, 438, 442, 443, 454, 470, 473, 474, 478, 479, 480, 491, 506, 508, 512, 513, 514, 515, 516, 517, 518, 526, 554, 562, 563, 564, 565, 566, 567, 568, 569, 581, 582, 583, 584, 585, 620, 627, 681, 688, 700, 715, 722, 737, 752, 766, 773, 774, 775, 782, 802, 810, 841, 857, 866, 890, 900, 908, 918, 925, 1002, 1009, 1015, 1053, 1055, 1118
+Last image-generation depth: 1118
+Nodes since last image-generation event: 260
+Inferred image-generation pairs: 68
+Unpaired image-generation results: 18
+Inferred image-generation call names: python:51, container.exec:12, web.run:4, q7dr546:1
+Image-generation pair distance min/max/avg: 1 / 23 / 6.37
+Strong context marker count: 0
+Strong context marker depths: —
+Nodes since last strong context marker: Unavailable
+Reasoning recap marker count: 103
+Reasoning recap depths: 3, 12, 16, 20, 25, 29, 32, 36, 41, 55, 60, 76, 79, 86, 94, 100, 106, 124, 127, 136, 140, 150, 153, 157, 161, 213, 218, 226, 246, 252, 272, 286, 299, 303, 308, 313, 328, 338, 342, 345, 354, 361, 367, 387, 405, 408, 424, 434, 439, 450, 461, 464, 487, 498, 502, 522, 529, 533, 543, 546, 550, 558, 573, 577, 588, 591, 607, 616, 623, 636, 657, 677, 684, 691, 694, 711, 718, 725, 731, 740, 744, 769, 778, 785, 788, 806, 813, 817, 845, 849, 862, 870, 873, 884, 893, 896, 904, 911, 914, 921, 929, 995, 998
+Nodes since last reasoning recap: 380
+Branch points after last image-gen: 0
+Branch points after last GPT-6 Pro node: Unavailable
+Branch points within ±32 nodes of image-gen: 0
+Branch points within ±32 nodes of GPT-6 Pro: 0
+Nearest branch distance to last image-gen: Unavailable
+Nearest branch distance to last GPT-6 Pro: Unavailable
+Recent windows: last64: 199kB, 2,670 disp, 13.4k all, tools 26/26, img 0, pro 0, ctx 0, branches 0 || last128: 414kB, 5,871 disp, 29.0k all, tools 56/53, img 0, pro 0, ctx 0, branches 0 || last256: 959kB, 12.4k disp, 74.2k all, tools 113/108, img 0, pro 0, ctx 0, branches 0 || last512: 2.53MB, 82.2k disp, 247k all, tools 220/196, img 11, pro 0, ctx 0, branches 0
+Since last strong context marker: Unavailable
+
+SSE OUTCOME + POST CORRELATION — V2.22
+Current attempt: None
+Last attempt: #298 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner
+Outcome confirmed by: MAX banner
+Outcome confirmed timestamp: 1790782255781
+Post-outcome source correlation: scheduled / awaiting source snapshot
+Post-outcome captures: 0
+Post-outcome snapshots by family: {"direct":null,"batch":null,"other":null}
+Post-outcome deltas by family: {"direct":null,"batch":null,"other":null}
+Attempts stored: 30
+Prompt chars: Unavailable
+Attempt trigger: max-banner-without-generation-edge
+Request URL: Unavailable
+Request path: Unavailable
+Request method: Unavailable
+Request body bytes: Unavailable
+Request action: Unavailable
+Request model: Unavailable
+Request effort: Unavailable
+Request conversation ID: Unavailable
+Request parent message ID: Unavailable
+Request keys: 
+Attached preflight: Unavailable
+Transport summary: —
+Fetch/SSE stream summary: —
+Stream observed: No
+Stream chunk count: 0
+Stream total bytes: 0
+Stream largest chunk bytes: 0
+Stream first-byte timestamp: Unavailable
+Stream ended timestamp: Unavailable
+Stream done signals: 0
+Stream MAX text detected: No
+Stream read error: None
+Stream read error benign after completion: No
+Stream event types: —
+DOM mutation summary: 0 observer events · 0 assistant changes · 0 starts / 0 stops
+DOM observer events: 0
+DOM assistant changes: 0
+DOM generation starts: 0
+DOM generation stops: 0
+Recent transport events: —
+WebSocket URLs: 
+WebSocket inbound messages: 0
+WebSocket inbound bytes: 0
+WebSocket outbound messages: 0
+WebSocket outbound bytes: 0
+WebSocket largest message bytes: 0
+Transport done signals: 0
+Response status: Unavailable
+Response content type: Unavailable
+Response bytes: Unavailable
+Response MAX text detected: No
+Pre-attempt model label: gpt-5-6-thinking
+Effort UI hint: Extra High
+Pre-attempt DIRECT: DIRECT stable · 3.76MB retained · 6.43MB active · 964 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772
+Pre-attempt BATCH: BATCH stable · 3.90MB retained · 6.91MB active · 1363 nodes · /backend-api/conversations/batch
+DIRECT generation peak: —
+BATCH generation peak: —
+OTHER generation peak: —
+Network events stored (rolling rows): 0
+Network events total (family counters): 0
+Largest network event bytes: 0
+Network families: —
+Attempt MAX snapshot: {"time":1790782255781,"currentSourceFamily":"direct","direct":{"time":1790782249784,"fullCapturedAt":1790782249781,"source":"/backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772","sourceFamily":"direct","phase":"max","retainedBytes":5121747,"retainedShare":61.05927942437878,"activeBranchBytes":8389535,"mappingBytes":8443299,"branchNodes":1379,"messageNodes":1378,"userMessages":82,"assistantMessages":606,"toolResults":467,"toolCalls":409,"strongContextMarkers":0,"systemRoleNodes":null,"displayLikeTokens":490300,"payloadBytes":8453097},"batch":{"time":1790782248060,"fullCapturedAt":1790782248056,"source":"/backend-api/conversations/batch","sourceFamily":"batch","phase":"max","retainedBytes":5184978,"retainedShare":59.29151767489357,"activeBranchBytes":8746645,"mappingBytes":8815034,"branchNodes":1754,"messageNodes":1753,"userMessages":82,"assistantMessages":606,"toolResults":472,"toolCalls":409,"strongContextMarkers":75,"systemRoleNodes":295,"displayLikeTokens":490300,"payloadBytes":8819692},"other":null}
+Attempt post snapshot: Unavailable
+Attempt post delta: Unavailable
+Recent attempts: #269 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #270 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #271 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #272 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #273 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #274 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #275 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #276 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #277 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #278 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #279 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #280 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #281 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #282 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #283 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #284 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #285 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #286 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #287 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #288 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #289 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #290 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #291 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #292 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #293 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort — · 0.0s · response 0B · network max 0B · confirmed MAX banner || #294 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort — · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #295 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #296 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #297 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner via DOM observer || #298 MAX · max-banner-without-generation-edge · prompt — chars · request 0B · model gpt-5-6-thinking · effort Extra High · 0.0s · response 0B · network max 0B · confirmed MAX banner
+
+SOURCE-SEPARATED BASELINES — V2.22
+Current source family: DIRECT
+Source switches tracked: 30
+Canonical risk source: DIRECT
+Canonical DIRECT risk available: Yes
+Canonical DIRECT risk band: LOW
+Canonical DIRECT stable retained bytes: 3756581
+DIRECT stable snapshot: DIRECT stable · 3.76MB retained · 6.43MB active · 964 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772
+DIRECT inflight snapshot: —
+DIRECT MAX events tracked: 12
+DIRECT last MAX: {"time":1790782249784,"fullCapturedAt":1790782249781,"sourceFamily":"direct","metrics":{"time":1790782249784,"fullCapturedAt":1790782249781,"retainedBytes":5121747,"retainedShare":61.05927942437878,"activeBranchBytes":8389535,"mappingBytes":8443299,"branchNodes":1379,"messageNodes":1378,"userMessages":82,"assistantMessages":606,"toolResults":467,"toolCalls":409,"strongContextMarkers":0,"systemRoleNodes":null,"displayLikeTokens":490300,"phase":"max","generating":false,"maxVisible":true,"source":"/backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772","sourceFamily":"direct","payloadBytes":8453097},"generationPeak":null}
+DIRECT recovery: Unavailable
+BATCH stable snapshot: BATCH stable · 3.90MB retained · 6.91MB active · 1363 nodes · /backend-api/conversations/batch
+BATCH inflight snapshot: —
+BATCH MAX events tracked: 12
+BATCH last MAX: {"time":1790782248060,"fullCapturedAt":1790782248056,"sourceFamily":"batch","metrics":{"time":1790782248060,"fullCapturedAt":1790782248056,"retainedBytes":5184978,"retainedShare":59.29151767489357,"activeBranchBytes":8746645,"mappingBytes":8815034,"branchNodes":1754,"messageNodes":1753,"userMessages":82,"assistantMessages":606,"toolResults":472,"toolCalls":409,"strongContextMarkers":75,"systemRoleNodes":295,"displayLikeTokens":490300,"phase":"max","generating":false,"maxVisible":true,"source":"/backend-api/conversations/batch","sourceFamily":"batch","payloadBytes":8819692},"generationPeak":null}
+BATCH recovery: Unavailable
+OTHER stable snapshot: —
+Recent source-separated snapshot history: DIRECT stable · 3.49MB retained · 6.01MB active · 883 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH stable · 3.51MB retained · 6.31MB active · 1225 nodes · /backend-api/conversations/batch || DIRECT stable · 3.49MB retained · 6.01MB active · 883 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH stable · 3.51MB retained · 6.32MB active · 1232 nodes · /backend-api/conversations/batch || BATCH stable · 3.53MB retained · 6.36MB active · 1245 nodes · /backend-api/conversations/batch || BATCH stable · 3.56MB retained · 6.45MB active · 1261 nodes · /backend-api/conversations/batch || BATCH stable · 3.59MB retained · 6.51MB active · 1276 nodes · /backend-api/conversations/batch || BATCH stable · 3.66MB retained · 6.61MB active · 1297 nodes · /backend-api/conversations/batch || BATCH stable · 3.77MB retained · 6.74MB active · 1320 nodes · /backend-api/conversations/batch || DIRECT stable · 3.76MB retained · 6.43MB active · 964 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH stable · 3.81MB retained · 6.79MB active · 1333 nodes · /backend-api/conversations/batch || BATCH stable · 3.90MB retained · 6.91MB active · 1363 nodes · /backend-api/conversations/batch || DIRECT max · 3.85MB retained · 6.58MB active · 997 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 3.90MB retained · 6.94MB active · 1366 nodes · /backend-api/conversations/batch || BATCH max · 3.90MB retained · 6.95MB active · 1370 nodes · /backend-api/conversations/batch || BATCH max · 3.90MB retained · 6.98MB active · 1372 nodes · /backend-api/conversations/batch || BATCH max · 4.31MB retained · 7.42MB active · 1424 nodes · /backend-api/conversations/batch || BATCH max · 4.43MB retained · 7.57MB active · 1445 nodes · /backend-api/conversations/batch || BATCH max · 4.43MB retained · 7.63MB active · 1456 nodes · /backend-api/conversations/batch || BATCH max · 4.43MB retained · 7.69MB active · 1468 nodes · /backend-api/conversations/batch || DIRECT max · 4.36MB retained · 7.32MB active · 1093 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 4.43MB retained · 7.69MB active · 1468 nodes · /backend-api/conversations/batch || BATCH max · 4.46MB retained · 7.75MB active · 1487 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772 || BATCH max · 5.18MB retained · 8.75MB active · 1754 nodes · /backend-api/conversations/batch || DIRECT max · 5.12MB retained · 8.39MB active · 1379 nodes · /backend-api/conversation/6abb71e7-6f40-83e8-865c-a357091f6772
+
+CURRENT-SOURCE RETAINED DIAGNOSTIC — V2.22
+Risk meter available: Yes
+Primary experimental risk band: ELEVATED
+Absolute retained-state proxy bytes: 5121747
+Secondary retained-state proxy share: 61.06%
+Delta vs smallest observed MAX sample: 1.89MB below the smallest observed MAX sample
+Highest confirmed healthy retained proxy: 6826995
+Smallest observed MAX retained proxy: 7015394
+Second observed MAX retained proxy: 7293688
+Density advisory: NORMAL
+128-node hottest special-state bytes: 778221
+256-node hottest special-state bytes: 1272201
+Primary risk reasons: absolute retained proxy 5.12MB | 1.89MB below the smallest observed MAX sample | secondary share 61.1%
+Density reasons: no dense-history advisory threshold crossed
+Primary calibration: Low <5.0MB; Elevated 5.0–6.0MB; High 6.0–6.5MB; Very High 6.5–7.0MB; Observed MAX Zone >=7.0MB retained proxy.
+Calibration evidence: highest confirmed healthy 6,826,995 B; independent MAX samples 7,015,394 B and 7,293,688 B.
+This is an empirical script heuristic, not an official OpenAI byte limit or remaining-capacity value.
+
+RETAINED-STATE PROFILER — V2.12
+Retained-state profiler present: Yes
+Deduplicated active special-node JSON bytes: 5121747
+Active special-node share: 61.06%
+Retained-state proxy bytes (active special + alternate subtrees): 5121747
+Retained-state proxy / active branch: 61.06%
+Active tool-result JSON bytes: 4603097
+Active image-like JSON bytes: 252302
+Active GPT-6 Pro-labeled JSON bytes: 0
+Alternate subtree JSON bytes total: 0
+Largest alternate subtree JSON bytes: 0
+Hottest 100-node buckets: d700-799: 576kB special / 886kB total · tools 19/39 · img 10 · pro 0 · br 0 || d1000-1099: 529kB special / 733kB total · tools 58/33 · img 5 · pro 0 · br 0 || d400-499: 520kB special / 770kB total · tools 22/33 · img 10 · pro 0 · br 0 || d500-599: 507kB special / 683kB total · tools 15/38 · img 21 · pro 0 · br 0 || d200-299: 504kB special / 677kB total · tools 31/31 · img 3 · pro 0 · br 0 || d800-899: 399kB special / 720kB total · tools 18/34 · img 6 · pro 0 · br 0 || d900-999: 333kB special / 522kB total · tools 30/41 · img 4 · pro 0 · br 0 || d1200-1299: 305kB special / 394kB total · tools 47/44 · img 0 · pro 0 · br 0 || d300-399: 298kB special / 457kB total · tools 24/25 · img 6 · pro 0 · br 0 || d600-699: 295kB special / 519kB total · tools 21/37 · img 4 · pro 0 · br 0
+Hottest 128-node window: d412-539 · 778kB special / 1.09MB total (71.6%) · toolres 612kB · image 15.2kB · img-gen 387kB · pro 0B · branches 0
+Hottest 256-node window: d230-485 · 1.27MB special / 1.71MB total (74.4%) · toolres 917kB · image 128kB · img-gen 406kB · pro 0B · branches 0
+Hottest 512-node window: d379-890 · 2.39MB special / 3.64MB total (65.7%) · toolres 2.18MB · image 43.6kB · img-gen 1.06MB · pro 0B · branches 0
+Branch retained-state details: —
+GPT-6 Pro segment retained-state: —
+Image-generation result count: 69
+Image-generation result JSON bytes total: 1397525
+Average image-generation result JSON bytes: 20253.985507246376
+Largest image-generation result JSON bytes: 76691
+Top image-generation results: d248:76.7kB:python, d474:55.2kB:python, d443:45.4kB:python, d857:44.7kB:python, d1015:42.5kB:container.exec, d1055:42.2kB:container.exec, d508:39.8kB:python, d752:38.2kB:python, d470:33.5kB:python, d414:30.0kB:python, d518:28.0kB:python, d700:27.4kB:python
+Unique asset IDs observed in active branch: 69
+Image-generation-associated asset IDs: 4
+Assets existing by last image-gen event: 69
+Old assets referenced after last image-gen event: 0
+Image-gen-associated assets referenced after last image-gen event: 0
+Post-image nodes referencing pre-image assets: 0
+
+MAPPING / BRANCH TOPOLOGY
+Total mapping nodes: 1379
+Off-branch nodes: 0
+Leaf nodes: 1
+Branch points (>1 child): 0
+Maximum children on one node: 1
+Branch points on active ancestry: 0
+Active branch-point depths: 
+Last branch-point depth: 0
+Nodes since last branch point: 1379
+Alternate subtree nodes total: 0
+Largest alternate subtree nodes: 0
+Branch-point details: —
+
+SERIALIZED BY ROLE / CONTENT TYPE
+Active node JSON bytes by role: tool:4.60MB, assistant:3.55MB, user:234kB
+Active node JSON bytes by content type: execution_output:3.74MB, code:1.73MB, text:1.65MB, multimodal_text:784kB, thoughts:332kB, reasoning_recap:123kB, tether_browsing_display:29.2kB
+Largest active node: 93.7k B · assistant · text
+Largest active tool result: 76.7k B · tool · execution_output · python
+Largest active image-like node: 45.8k B · assistant · text
+
+WHOLE MAPPING — SELECTED DEEP COUNTERS
+Mapping explicit tool/function role nodes: 467
+Mapping tool-like nodes: 876
+Mapping tool call nodes: 409
+Mapping tool result nodes: 467
+Mapping image-generation call nodes: 12
+Mapping image-generation result nodes: 69
+Mapping generated-image nodes: 86
+Mapping uploaded-image nodes: 37
+Mapping unique image asset IDs: 6
+Mapping unique file asset IDs: 0
+Mapping model distribution: gpt-5-6-thinking:1271
+Mapping GPT-6 Pro-labeled message nodes: 0
+
+SERIALIZED / NETWORK SIZE
+Active branch serialized JSON bytes: 8389535
+Full mapping serialized JSON bytes: 8443299
+Largest captured full conversation response bytes: 8825384
+Largest observed conversation-network event bytes: 8825384
+Last observed conversation-network event bytes: 168
+
+Note: V2.22 confirms SUCCESS directly from explicit SSE completion signals, records outcome-confirmation evidence, treats post-completion clone aborts as benign, and collects optional post-outcome source-family correlation while preserving preflight/WebSocket/source separation; heuristic classifiers for display-like content, tool names, image generation, assets and model metadata because these internal payload fields are not a public stable schema. Counts are for comparison across chats, not a universal remaining-capacity percentage.
