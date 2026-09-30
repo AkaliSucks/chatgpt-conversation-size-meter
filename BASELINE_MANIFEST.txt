@@ -1,0 +1,15 @@
+ChatGPT Conversation Size Meter — Codex workflow baseline
+Created: 2026-09-30
+
+Baseline version: V2.22
+Baseline JS: src/baseline/chatgpt_chat_size_meter_v222_sse_outcome_post_correlation.js
+Baseline JS bytes: 289994
+Baseline JS SHA-256: 08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696
+Original V2.22 ZIP bytes: 59746
+Original V2.22 ZIP SHA-256: 2aa527d90cacad4f947c1dd83f8e66aeaadef3db6b32903c7ad4511e9917086d
+
+Next authorized specification:
+specs/V2.23-event-model-cleanup.md
+
+IMPORTANT: This scaffold does NOT contain a V2.23 implementation yet.
+The V2.22 baseline file is immutable reference material. Future Codex work should copy it to a working path rather than edit it in place.
