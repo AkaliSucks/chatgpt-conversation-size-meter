@@ -997,7 +997,8 @@ function messageDiagnostics(msg) {
     attachment: signals.attachment,
     image: signals.image,
     file: signals.file,
-    audio: signals.audio,    video: signals.video,
+    audio: signals.audio,
+    video: signals.video,
     assetIds: [...signals.assetIds],
     imageAssetIds: [...signals.imageAssetIds],
     fileAssetIds: [...signals.fileAssetIds],
@@ -1996,7 +1997,8 @@ function analyzeContextHistoryLite(
       lastImageDepth == null
         ? null
         : branchDepths.filter(
-            x => x > lastImageDepth          ).length,
+            x => x > lastImageDepth
+          ).length,
 
     branchPointsAfterLastGpt6Pro:
       lastGpt6Depth == null
@@ -2995,7 +2997,8 @@ function parseMappingConversation(obj) {
 
   return {
     records,
-    full: true,    mappingNodes: keys.length,
+    full: true,
+    mappingNodes: keys.length,
     structure: analyzeMapping(mapping, activeNodes),
     conversationId:
       obj.conversation_id ??
@@ -3994,7 +3997,8 @@ function attemptStart(id,trigger='generation-start') {
     },
 
     firstCaptureByFamily:{direct:null,batch:null,other:null},
-    peakRetainedByFamily:{direct:null,batch:null,other:null},    peakActiveByFamily:{direct:null,batch:null,other:null},
+    peakRetainedByFamily:{direct:null,batch:null,other:null},
+    peakActiveByFamily:{direct:null,batch:null,other:null},
     lastCaptureByFamily:{direct:null,batch:null,other:null},
 
     networkEvents:[],
@@ -4993,6 +4997,7 @@ function attemptRecordTransportEvent(
     attemptSchedulePostResponseCapture(id);
   }
 }
+
 function attemptSuccessCandidateFromCapture(a, c, pre) {
   return Boolean(
     a &&
@@ -5992,6 +5997,7 @@ function attemptStreamEventsText(a, limit = 20) {
     ? rows.map(([k,v]) => `${k}:${v}`).join(', ')
     : '—';
 }
+
 function attemptDOMAssistantSignature() {
   try {
     const turns = [
@@ -6991,7 +6997,8 @@ function installNetworkHooks() {
             null;
         } catch {}
 
-        /*          V2.19 primary attempt-start signal.
+        /*
+          V2.19 primary attempt-start signal.
           This runs synchronously before originalFetch.
         */
         attemptInspectOutgoingRequest(
@@ -7990,6 +7997,7 @@ function v213AssessRisk(retainedState) {
       `128-node historical window ${fmt(hot128Bytes)}B`
     );
   }
+
   if (hotspot256) {
     densityReasons.push(
       `256-node historical window ${fmt(hot256Bytes)}B`
@@ -8989,7 +8997,8 @@ function render() {
       <div class="wide">
         <div class="label">DENSITY DETAILS</div>
         <div class="value tiny-value">
-          ${esc(v214DensityExplanation({            densityReasons: latest.experimentalDensityReasons
+          ${esc(v214DensityExplanation({
+            densityReasons: latest.experimentalDensityReasons
           }))}
         </div>
       </div>
@@ -9988,7 +9997,8 @@ function injectStyles() {
 
 #${P} .dot{font-size:13px}
 #${P} .dot.normal{color:#70f3b6}
-#${P} .dot.large{color:#ffe36b}#${P} .dot.warning{color:#ffad5c}
+#${P} .dot.large{color:#ffe36b}
+#${P} .dot.warning{color:#ffad5c}
 #${P} .dot.critical,
 #${P} .dot.maximum{color:#ff7777}
 #${P} .dot.waiting{color:#b8c0c8}
