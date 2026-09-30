@@ -1,34 +1,7 @@
-V2.23.2 storage/static-state repair candidate; synthetic verification only
-Exact parent: 4b14425c50ff62b093082908c5861ae796fa7a7d
-Branch: codex/v223-storage-static-state-fixes
-Parent native send validation supplied by user: button 183 ms; Enter 170 ms; each one intent/attempt.
-No new native-browser validation or live origin storage measurement was performed.
-
 $ C:/Program Files/Git/bin/bash.exe --noprofile --norc -c export PATH=/usr/bin:/bin:$PATH; bash scripts/verify-baseline.sh
 PASS: V2.22 baseline SHA-256 matches: 08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696
 PASS: node --check
-exit 0
-
-$ node --check releases\v2.23\chatgpt_chat_size_meter_v223_event_model_cleanup.js
-
-exit 0
-
-$ node --check scripts\test-v223.js
-
-exit 0
-
-$ node --check scripts\verify-v223-protected.js
-
-exit 0
-
-$ node scripts/verify-v223-protected.js
-PASS protected region function normalizeRole( (64982 bytes)
-PASS protected region function mergeRecordsForChat( (1190 bytes)
-PASS protected region function inspectJSON( (282 bytes)
-PASS protected region function inspectRequestBody( (408 bytes)
-PASS 66862 protected bytes; baseline identity and capture-lineage markers
-PASS 8807 validated send/correlation bytes unchanged from 4b14425
-exit 0
+EXIT 0
 
 $ node scripts/test-v223.js
 PASS 1 short SUCCESS confirms immediately; archived telemetry continues
@@ -96,28 +69,56 @@ PASS healthy parsed DIRECT and BATCH HTTP responses publish static metrics throu
 PASS origin-wide meter audit includes every owned namespace and conversation without reading unrelated values
 GC fixture: reclaimed 8162 meter-owned bytes from 2 stale keys; final save saved
 PASS stale cross-conversation legacy state is reclaimed and quota save finally succeeds without touching app storage
-PASS GC retains current, in-memory active, recent, undated, malformed, future and reserved research/settings keys
-PASS GC key/chat bounds and cooldown hold across many stale conversations
+PASS GC retains current sources, active/unknown V223 owners, undated/malformed/future caches and reserved metadata
+PASS GC twelve-key pass bound and cooldown hold across many inactive conversations; V223 episodes stay
 PASS GC stops after reclaim target even if the first eligible key is large
 PASS GC skips a whole stale conversation changed by another tab during inspection
 PASS new storage write times protect recently used conversations containing old research observations
 PASS validated 4b14425 checkpoint readers can still decode timestamped normal and retry storage
 PASS no eligible headroom and denied cleanup surface final failure while parsed in-memory state remains valid
 PASS non-quota storage failures never trigger destructive cleanup of stale evidence
-70/70 synthetic harness tests passed; native-browser validation not performed
-exit 0
+RECENT ORIGIN: 2504575 UTF-8 bytes / 5009150 UTF-16 bytes reclaimed; 5 obsolete keys; 3 bounded passes; 5/5 required keys saved; namespaces {"attempts-v218":{"keys":1,"bytes":150115,"utf16Bytes":300230},"attempts-v219":{"keys":1,"bytes":499115,"utf16Bytes":998230},"attempts-v220":{"keys":1,"bytes":323115,"utf16Bytes":646230},"attempts-v221":{"keys":1,"bytes":402115,"utf16Bytes":804230},"attempts-v222":{"keys":1,"bytes":1130115,"utf16Bytes":2260230}}
+RECENT ORIGIN AUDIT: before {"keys":65,"bytes":3384875,"utf16Bytes":6769750}; after {"keys":60,"bytes":890164,"utf16Bytes":1780328}; required current key bytes {"attempts-v223:chat-a":4439,"snapshot:chat-a":7141,"lifecycle-v216:chat-a":1584,"diag:chat-a":277,"max-episodes-v223:chat-a":1330}
+PASS recent multi-megabyte origin reclaims superseded v218-v222 histories and retries every current key
+PASS obsolete current-chat attempt versions are reclaimable; current sources and all V223 evidence survive
+PASS recent source caches are reclaimable only without active V223 owners; closed V223 history is retained
+PASS cleanup prioritizes obsolete non-current histories, then current legacy histories, then oldest caches
+PASS unrecoverable quota stops at four twelve-key passes and preserves every current key in memory
+PASS cleanup success cannot mask a remaining required-key failure and later recovery retries every key
+PASS silent storage write loss and externally missing keys cannot produce overall save success
+77/77 synthetic harness tests passed; native-browser validation not performed
+EXIT 0
+
+$ node scripts/verify-v223-protected.js
+PASS protected region function normalizeRole( (64982 bytes)
+PASS protected region function mergeRecordsForChat( (1190 bytes)
+PASS protected region function inspectJSON( (282 bytes)
+PASS protected region function inspectRequestBody( (408 bytes)
+PASS 66862 protected bytes; baseline identity and capture-lineage markers
+PASS 8807 validated send/correlation bytes unchanged from 4b14425
+PASS 15435 validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30
+EXIT 0
+
+$ node --check releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js
+EXIT 0
+
+$ node --check scripts/test-v223.js
+EXIT 0
+
+$ node --check scripts/verify-v223-protected.js
+EXIT 0
+
+$ node --check src/baseline/chatgpt_chat_size_meter_v222_sse_outcome_post_correlation.js
+EXIT 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 289872 bytes; SHA-256 135db44a19b8b410e3aeae27e4ff2e7694854b13ffdc74c554f9afcd9f88fce4
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 64425 bytes; SHA-256 ef13191e39f57225d19536d779a746226b0c928c584892e053b129e0993bb3b7
-exit 0
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 295749 bytes; SHA-256 1d5de3edec497ad35bbd74c0a8d97062d45622d87425604d4bbd85170a83adc0
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 65904 bytes; SHA-256 781e023afc4142026f36df9dad2580dd1c0bc3554091dbf5e37f19585d527524
+EXIT 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 289872 bytes; SHA-256 135db44a19b8b410e3aeae27e4ff2e7694854b13ffdc74c554f9afcd9f88fce4
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 64425 bytes; SHA-256 ef13191e39f57225d19536d779a746226b0c928c584892e053b129e0993bb3b7
-exit 0
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 295749 bytes; SHA-256 1d5de3edec497ad35bbd74c0a8d97062d45622d87425604d4bbd85170a83adc0
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 65904 bytes; SHA-256 781e023afc4142026f36df9dad2580dd1c0bc3554091dbf5e37f19585d527524
+EXIT 0
 
-PASS two deterministic ZIP builds byte-identical; single member exactly matches source.
-PASS candidate LF-only.
-Protected parser bytes and validated send/correlation bytes verified independently.
-Runtime origin-wide byte/key totals and native GC recovery await this candidate being installed.
+PASS two builds byte-identical; ZIP sole member equals LF source; no native-browser validation performed

@@ -46,3 +46,18 @@ for (const [start,end] of [
 for (const marker of ['let pendingComposerEnter = null;','let lastComposerSubmission = null;',
   'installNetworkHooks();\ninstallSendIntentHook();']) assert(candidate.includes(Buffer.from(marker)),marker);
 console.log(`PASS ${sendBytes} validated send/correlation bytes unchanged from 4b14425`);
+const staticCheckpoint = require('node:child_process').execFileSync('git',['show',
+  '3be6a3004172c2aca2e51b0e0cc0e49d9f86e407:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js']);
+let staticBytes = 0;
+for (const [start,end] of [
+  ['function loadSnapshot(', 'function esc('],
+  ['function loadLifecycle(', 'function visibleGenerationActive('],
+  ['function lifecycleMetrics(', 'function chooseHigher('],
+  ['function recordLifecycleFullCapture(', 'function lifecyclePollPhase('],
+  ['function eventStaticState(', 'function attemptKey(']
+]) {
+  const original = region(staticCheckpoint,start,end);
+  assert.deepEqual(region(candidate,start,end),original,`validated static publication: ${start}`);
+  staticBytes += original.length;
+}
+console.log(`PASS ${staticBytes} validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30`);

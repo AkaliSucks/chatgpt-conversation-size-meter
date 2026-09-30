@@ -19,7 +19,7 @@ function successfulStreamResponse() {
 function environment(candidateSource=source) {
   let now = 1000000, counter = 0;
   const timers = new Map(), storage = new Map(), listeners = {}, fetches = [];
-  const state = {banners:[],stop:false,turns:[],composer:'small prompt',quota:false,quotaBytes:Infinity,failedWrites:0,fetch:async()=>response('{}'),clipboard:null};
+  const state = {banners:[],stop:false,turns:[],composer:'small prompt',quota:false,quotaBytes:Infinity,quotaUtf16:false,failedWrites:0,fetch:async()=>response('{}'),clipboard:null};
   const location = {origin:'https://chatgpt.com',pathname:'/c/chat-a',href:'https://chatgpt.com/c/chat-a'};
   class FakeDate extends Date { static now(){return now;} }
   const document = {body:null,querySelectorAll(selector) {
@@ -39,8 +39,9 @@ function environment(candidateSource=source) {
     Request,Blob,btoa,atob,Date:FakeDate,console,performance:{getEntriesByType:()=>[]},
     getComputedStyle:el=>({display:el.hidden?'none':'block',visibility:'visible',opacity:'1'}),
     localStorage:{get length(){return storage.size;},key:i=>[...storage.keys()][i] ?? null,getItem:k=>storage.get(k)||null,setItem:(k,v)=>{
-      const used=[...storage].filter(([key])=>key!==k).reduce((sum,[key,value])=>sum+Buffer.byteLength(value),0);
-      if(state.quota || used+Buffer.byteLength(v)>state.quotaBytes){state.failedWrites++;throw Error('QuotaExceededError');}
+      const size=(key,value)=>state.quotaUtf16?2*(key.length+value.length):Buffer.byteLength(value);
+      const used=[...storage].filter(([key])=>key!==k).reduce((sum,[key,value])=>sum+size(key,value),0);
+      if(state.quota || used+size(k,v)>state.quotaBytes){state.failedWrites++;throw Error('QuotaExceededError');}
       storage.set(k,v);
     },removeItem:k=>storage.delete(k)},
     navigator:{clipboard:{writeText:async text=>{state.clipboard=text;}}},alert:()=>{},
@@ -502,9 +503,10 @@ check('quota pressure bounds traces, recovers losslessly and retains attempt/MAX
   for(const a of store.attempts)a.streamStats.recentEvents=Array.from({length:55},(_,i)=>({time:h.now()+i,type:'message_delta'}));
   h.test.saveAttemptState('chat-a',store);
   const packed=h.test.eventStorageSavedText(store),retry=h.test.eventStorageRetryText(packed);
-  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(retry)+1;h.test.saveAttemptState('chat-a',store);
-  assert.equal(h.state.failedWrites,1);const health=h.test.storageHealth.get('chat-a');
-  assert.equal(health.lastSaveSuccessful,true);assert.match(health.lastError,/QuotaExceeded/);assert.equal(health.compactRetryCount,1);assert(health.compactRetryRecoveredAt);
+  const otherBytes=[...h.test.meterRequiredState('chat-a')].filter(([k])=>k!==key).reduce((sum,[,data])=>sum+Buffer.byteLength(h.test.eventStorageSavedText(data)),0);
+  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(retry)+otherBytes+1;h.test.saveAttemptState('chat-a',store);
+  assert(h.state.failedWrites>=1);const health=h.test.storageHealth.get('chat-a');
+  assert.equal(health.lastSaveSuccessful,true);assert.match(health.lastError,/QuotaExceeded/);assert(health.compactRetryCount>=1);assert(health.compactRetryRecoveredAt);
   const decoded=h.test.eventStorageParse(h.storage.get(key));assert.equal(decoded.attempts.length,10);
   assert.deepEqual(JSON.parse(JSON.stringify(decoded)),JSON.parse(JSON.stringify(store)));
   assert.equal(decoded.attempts[0].id,6);assert.equal(decoded.attempts.at(-1).outcome,'success');
@@ -521,7 +523,8 @@ check('quota pressure bounds traces, recovers losslessly and retains attempt/MAX
   }
   const state=h.test.eventEpisodes('chat-a'),episodeKey='cgpt-size-meter-v2101:max-episodes-v223:chat-a';
   const full=h.test.eventStorageSavedText(state),small=h.test.eventStorageRetryText(full);assert(small.length<full.length);
-  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(small)+1;h.test.eventSaveEpisodes('chat-a');
+  const episodeOtherBytes=[...h.test.meterRequiredState('chat-a')].filter(([k])=>k!==episodeKey).reduce((sum,[,data])=>sum+Buffer.byteLength(h.test.eventStorageSavedText(data)),0);
+  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(small)+episodeOtherBytes+1;h.test.eventSaveEpisodes('chat-a');
   const episodes=h.test.eventStorageParse(h.storage.get(episodeKey));assert.equal(episodes.episodes.length,10);
   assert.deepEqual(JSON.parse(JSON.stringify(episodes)),JSON.parse(JSON.stringify(state)));
   const last=episodes.episodes.at(-1);assert.equal(last.id,15);assert.equal(last.relatedRealAttemptId,15);assert.equal(last.blockedBeforeDispatch,true);
@@ -635,32 +638,32 @@ check('stale cross-conversation legacy state is reclaimed and quota save finally
   assert.equal(health.lastSaveSuccessful,true);assert.equal(health.finalSaveResult,'saved');assert(health.cleanupRetryRecoveredAt);
   assert.equal(health.cleanupRemovedKeyCount,2);assert(health.bytesReclaimed>8000);assert.equal(health.cleanupAt,h.now());
   assert.equal(h.storage.has(oldKey),false);assert.deepEqual(JSON.parse(JSON.stringify(h.test.eventStorageParse(h.storage.get(h.test.attemptKey('chat-a'))))),JSON.parse(JSON.stringify(store)));
-  assert.equal(h.storage.get(episodeKey),JSON.stringify(episode));assert.equal(h.storage.get(meterPrefix+'verified-max-samples'),samples);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.test.eventStorageParse(h.storage.get(episodeKey)))),episode);assert.equal(h.storage.get(meterPrefix+'verified-max-samples'),samples);
   assert.equal(h.storage.get('ChatGPT-app-state'),'PRIVATE'.repeat(100));assert.equal(h.storage.get('cgpt-size-meter-v21010:lookalike'),'PRIVATE');
   assert(removed.every(key=>key.endsWith(':stale')));
   console.log(`GC fixture: reclaimed ${health.bytesReclaimed} meter-owned bytes from ${removed.length} stale keys; final save ${health.finalSaveResult}`);
 });
-check('GC retains current, in-memory active, recent, undated, malformed, future and reserved research/settings keys',()=>{
+check('GC retains current sources, active/unknown V223 owners, undated/malformed/future caches and reserved metadata',()=>{
   const h=gcEnvironment(),old=h.now()-40*86400000;
   const keep=new Map();const seed=(suffix,value)=>{const key=meterPrefix+suffix;h.storage.set(key,value);keep.set(key,value);};
-  seed('attempts-v222:chat-a',legacyData(old));
+  seed('snapshot:chat-a',legacyData(old));
   seed('attempts-v223:active',legacyData(old));h.test.loadAttemptState('active').current={id:2,status:'running'};
-  seed('attempts-v222:recent',legacyData(old));seed('diag:recent',JSON.stringify({time:h.now()}));
-  seed('attempts-v222:undated',legacyData(old));seed('diag:undated','{}');
-  seed('attempts-v222:malformed',legacyData(old));seed('diag:malformed','invalid JSON');
-  seed('attempts-v222:future',legacyData(h.now()+86400000));
+  seed('snapshot:active',legacyData(old));seed('lifecycle-v216:active',legacyData(old));
+  seed('attempts-v223:recent',legacyData(old));seed('diag:recent',JSON.stringify({time:h.now()}));
+  seed('diag:undated','{}');seed('diag:malformed','invalid JSON');seed('snapshot:future',legacyData(h.now()+86400000));
   for(const suffix of ['settings','position','verified-max-samples','max:old','notify:old:live-max','unknown:old'])seed(suffix,legacyData(old));
   h.storage.set(meterPrefix+'attempts-v222:eligible',legacyData(old));
   assert(h.test.meterStorageCleanup('chat-a',h.test.attemptKey('chat-a'))>0);
   for(const [key,value]of keep)assert.equal(h.storage.get(key),value,key);
   assert.equal(h.storage.has(meterPrefix+'attempts-v222:eligible'),false);
 });
-check('GC key/chat bounds and cooldown hold across many stale conversations',()=>{
+check('GC twelve-key pass bound and cooldown hold across many inactive conversations; V223 episodes stay',()=>{
   const h=gcEnvironment(),old=h.now()-40*86400000;
-  for(let i=0;i<10;i++)for(const namespace of ['snapshot','diag','lifecycle-v216','attempts-v222','max-episodes-v223'])h.storage.set(meterPrefix+namespace+':old-'+i,legacyData(old));
+  for(let i=0;i<10;i++)for(const namespace of ['snapshot','diag','lifecycle-v216','attempts-v222','max-episodes-v223'])h.storage.set(meterPrefix+namespace+':old-'+i,
+    namespace==='max-episodes-v223'?JSON.stringify({nextId:2,activeId:null,episodes:[{id:1,active:false,firstSeenAt:old}]}):legacyData(old));
   const removed=[],remove=h.context.localStorage.removeItem;h.context.localStorage.removeItem=key=>{removed.push(key);remove(key);};
   h.test.meterStorageCleanup('chat-a',h.test.attemptKey('chat-a'));
-  assert.equal(removed.length,12);assert(new Set(removed.map(key=>key.split(':').at(-1))).size<=3);
+  assert.equal(removed.length,12);assert(removed.every(key=>!key.includes(':max-episodes-v223:')));
   const count=h.storage.size;assert.equal(h.test.meterStorageCleanup('chat-a',h.test.attemptKey('chat-a')),0);assert.equal(h.storage.size,count);
   h.setNow(h.now()+30001);h.test.meterStorageCleanup('chat-a',h.test.attemptKey('chat-a'));assert.equal(removed.length,24);
 });
@@ -706,6 +709,134 @@ check('non-quota storage failures never trigger destructive cleanup of stale evi
   h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',501);
   const health=h.test.eventStorageHealth('chat-a');assert.equal(health.finalSaveResult,'failed');assert.equal(health.cleanupAt,null);
   assert.equal(health.bytesReclaimed,0);assert(h.storage.has(key));assert(staticVector(h).direct);
+});
+
+check('recent multi-megabyte origin reclaims superseded v218-v222 histories and retries every current key',()=>{
+  const h=environment(),a=h.start();
+  h.chunk(a,'data: {"type":"error","error":{"code":"conversation_too_long"}}\n\n');
+  h.test.attemptFinishStream('chat-a',dispatchURL,response(),null,a.id);
+  const episodeKey=meterPrefix+'max-episodes-v223:chat-a';
+  const preserve=new Map();
+  const keep=(suffix,value)=>{const key=meterPrefix+suffix;h.storage.set(key,value);preserve.set(key,value);};
+  for(const suffix of ['settings','position','verified-max-samples'])keep(suffix,JSON.stringify({verified:true,time:h.now(),researchId:'retain-exact'}));
+  for(let i=0;i<49;i++)keep('unknown-metadata-'+i,JSON.stringify({time:h.now(),value:i}));
+  const active=h.test.blankAttemptState();active.current={id:9,startedAt:h.now(),status:'running'};
+  keep('attempts-v223:other-active',JSON.stringify(active));keep('snapshot:other-active',legacyData(h.now(),2000));
+  h.storage.set('ChatGPT-private-app','PRIVATE'.repeat(242857));
+  h.storage.set('cgpt-size-meter-v21010:lookalike','do not delete');
+  const obsolete=[];
+  for(const [version,padding] of [[218,150000],[219,499000],[220,323000],[221,402000],[222,1130000]]){
+    const key=meterPrefix+`attempts-v${version}:history-${version}`;
+    const value=legacyData(h.now()-1000+version,padding);h.storage.set(key,value);
+    obsolete.push({key,namespace:`attempts-v${version}`,bytes:Buffer.byteLength(key)+Buffer.byteLength(value),utf16Bytes:2*(key.length+value.length)});
+  }
+  const oldSnapshot=meterPrefix+'snapshot:orphan';h.storage.set(oldSnapshot,legacyData(h.now()-1,869000));
+  // Simulate the previously failed four-key working set, without cleanup during setup.
+  const save=h.context.localStorage.setItem;
+  h.context.localStorage.setItem=()=>{throw Error('storage temporarily unavailable');};
+  h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',1200);
+  h.test.inspectJSON({conversations:[mapping()]},'/backend-api/conversations/batch',1400);
+  const before=h.test.eventStorageHealth('chat-a',true);
+  assert.equal(before.meterOwnedKeyCount,65);assert(before.meterOwnedBytes>3300000);assert(before.meterOwnedUtf16Bytes>6600000);
+  assert.equal(before.unsavedKeyCount,5);assert.equal(before.finalSaveResult,'failed');
+  const initial={keys:before.meterOwnedKeyCount,bytes:before.meterOwnedBytes,utf16Bytes:before.meterOwnedUtf16Bytes};
+  const vector=staticVector(h),required=h.test.meterRequiredState('chat-a');
+  assert(vector.direct);assert(vector.batch);assert.equal(required.size,5);
+  const expected=new Map([...required].map(([key,data])=>[key,JSON.parse(JSON.stringify(data))]));
+  const writes=[],removed=[];h.context.localStorage.setItem=(key,value)=>{writes.push(key);save(key,value);};
+  const remove=h.context.localStorage.removeItem;h.context.localStorage.removeItem=key=>{assert(key.startsWith(meterPrefix));removed.push(key);remove(key);};
+  h.state.quotaUtf16=true;h.state.quotaBytes=5500000;
+  h.test.saveSnapshot('chat-a',h.test.loadSnapshot('chat-a'));
+  const health=h.test.eventStorageHealth('chat-a',true);
+  assert(h.state.failedWrites>=4);assert.equal(health.finalSaveResult,'saved');assert.equal(health.lastSaveSuccessful,true);
+  assert.equal(health.unsavedKeyCount,0);assert.equal(health.pendingWriteCount,0);
+  assert.equal(health.recoveryPassCount,3);assert.equal(removed.length,5);
+  assert.deepEqual(removed,obsolete.map(e=>e.key));
+  assert.equal(health.recoveryBytesReclaimed,obsolete.reduce((n,e)=>n+e.bytes,0));
+  assert.equal(health.bytesReclaimed,health.recoveryBytesReclaimed);assert.equal(health.cleanupAt,h.now());
+  assert(health.recoveryPasses.every(pass=>pass.keys<=12));
+  assert.deepEqual(JSON.parse(JSON.stringify(health.recoveryNamespaceTotals)),Object.fromEntries(obsolete.map(e=>[e.namespace,{keys:1,bytes:e.bytes,utf16Bytes:e.utf16Bytes}])));
+  for(const [key,data] of expected){assert.equal(health.saveResultsByKey[key],'saved');assert(writes.filter(k=>k===key).length>=2);assert.deepEqual(JSON.parse(JSON.stringify(h.test.eventStorageParse(h.storage.get(key)))),data);}
+  assert.equal(h.test.loadAttemptState('chat-a').last.id,a.id);assert.equal(h.test.loadAttemptState('chat-a').last.outcome,'max');
+  assert.equal(h.test.eventEpisodes('chat-a').episodes[0].relatedRealAttemptId,a.id);
+  for(const [key,value]of preserve)assert.equal(h.storage.get(key),value,key);
+  assert(h.storage.has(oldSnapshot));assert.equal(h.storage.get('ChatGPT-private-app'),'PRIVATE'.repeat(242857));
+  assert.equal(h.storage.get('cgpt-size-meter-v21010:lookalike'),'do not delete');
+  assert.deepEqual(staticVector(h),vector);
+  const fresh=environment();for(const [key,value]of h.storage)fresh.storage.set(key,value);
+  assert.deepEqual(staticVector(fresh),vector);assert.equal(fresh.test.loadSnapshot('chat-a').full,true);
+  assert.equal(fresh.test.loadAttemptState('chat-a').last.outcome,'max');assert.equal(fresh.test.eventEpisodes('chat-a').episodes[0].id,1);
+  console.log(`RECENT ORIGIN: ${health.recoveryBytesReclaimed} UTF-8 bytes / ${obsolete.reduce((n,e)=>n+e.utf16Bytes,0)} UTF-16 bytes reclaimed; ${removed.length} obsolete keys; ${health.recoveryPassCount} bounded passes; ${required.size}/${required.size} required keys saved; namespaces ${JSON.stringify(health.recoveryNamespaceTotals)}`);
+  const finalAudit={keys:health.meterOwnedKeyCount,bytes:health.meterOwnedBytes,utf16Bytes:health.meterOwnedUtf16Bytes};
+  const keyBytes=Object.fromEntries([...required.keys()].map(key=>[key.slice(meterPrefix.length),Buffer.byteLength(h.storage.get(key))]));
+  console.log(`RECENT ORIGIN AUDIT: before ${JSON.stringify(initial)}; after ${JSON.stringify(finalAudit)}; required current key bytes ${JSON.stringify(keyBytes)}`);
+});
+check('obsolete current-chat attempt versions are reclaimable; current sources and all V223 evidence survive',()=>{
+  const h=environment(),preserve=new Map();
+  for(const suffix of ['snapshot:chat-a','diag:chat-a','lifecycle-v216:chat-a','attempts-v223:chat-a','max-episodes-v223:chat-a','settings','position','verified-max-samples','max:chat-a','notify:chat-a:live-max']){
+    const key=meterPrefix+suffix,value=legacyData(h.now());h.storage.set(key,value);preserve.set(key,value);
+  }
+  for(let v=218;v<=222;v++)h.storage.set(meterPrefix+`attempts-v${v}:chat-a`,v===218?'undated/legacy format':legacyData(h.now()));
+  h.test.meterStorageCleanup('chat-a',h.test.snapshotKey('chat-a'));
+  const health=h.test.eventStorageHealth('chat-a');assert.equal(health.cleanupRemovedKeyCount,5);
+  for(let v=218;v<=222;v++)assert.equal(h.storage.has(meterPrefix+`attempts-v${v}:chat-a`),false);
+  for(const [key,value]of preserve)assert.equal(h.storage.get(key),value,key);
+});
+check('recent source caches are reclaimable only without active V223 owners; closed V223 history is retained',()=>{
+  const h=environment(),closed=h.test.blankAttemptState();closed.attempts=[{id:1,outcome:'success',telemetryFinalizedAt:h.now()}];
+  h.storage.set(meterPrefix+'attempts-v223:closed',JSON.stringify(closed));
+  h.storage.set(meterPrefix+'max-episodes-v223:closed',JSON.stringify({nextId:2,activeId:null,episodes:[{id:1,active:false,confirmationSource:'UI MAX banner'}]}));
+  const pending=h.test.blankAttemptState();pending.attempts=[{id:2,outcome:'success',telemetryFinalizedAt:null}];
+  h.storage.set(meterPrefix+'attempts-v223:pending',JSON.stringify(pending));
+  const activeEpisode=JSON.stringify({nextId:2,activeId:1,episodes:[{id:1,active:true}]});h.storage.set(meterPrefix+'max-episodes-v223:episode-active',activeEpisode);
+  for(const chat of ['closed','orphan','pending','episode-active'])for(const namespace of ['snapshot','diag','lifecycle-v216'])h.storage.set(meterPrefix+namespace+':'+chat,legacyData(h.now()));
+  h.test.meterStorageCleanup('chat-a',null);
+  assert.equal(h.test.eventStorageHealth('chat-a').cleanupRemovedKeyCount,6);
+  for(const namespace of ['snapshot','diag','lifecycle-v216']){
+    assert(!h.storage.has(meterPrefix+namespace+':closed'));assert(!h.storage.has(meterPrefix+namespace+':orphan'));
+    assert(h.storage.has(meterPrefix+namespace+':pending'));assert(h.storage.has(meterPrefix+namespace+':episode-active'));
+  }
+  assert.equal(h.storage.get(meterPrefix+'attempts-v223:closed'),JSON.stringify(closed));
+  assert.equal(h.storage.get(meterPrefix+'max-episodes-v223:episode-active'),activeEpisode);
+});
+check('cleanup prioritizes obsolete non-current histories, then current legacy histories, then oldest caches',()=>{
+  const h=environment(),removed=[],remove=h.context.localStorage.removeItem;
+  h.context.localStorage.removeItem=key=>{removed.push(key.slice(meterPrefix.length));remove(key);};
+  for(const [suffix,time]of [['snapshot:new-cache',h.now()],['diag:old-cache',h.now()-100],['attempts-v222:chat-a',h.now()-500],['attempts-v219:recent-other',h.now()],['attempts-v218:older-other',h.now()-50]])h.storage.set(meterPrefix+suffix,legacyData(time));
+  h.test.meterStorageCleanup('chat-a',null);
+  assert.deepEqual(removed,['attempts-v218:older-other','attempts-v219:recent-other','attempts-v222:chat-a','diag:old-cache','snapshot:new-cache']);
+});
+check('unrecoverable quota stops at four twelve-key passes and preserves every current key in memory',()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',300);
+  for(let i=0;i<100;i++)h.storage.set(meterPrefix+'attempts-v222:recent-'+i,legacyData(h.now()));
+  const before=staticVector(h);h.state.quota=true;h.test.saveSnapshot('chat-a',h.test.loadSnapshot('chat-a'));
+  const health=h.test.eventStorageHealth('chat-a');assert.equal(health.recoveryPassCount,4);assert.equal(health.recoveryPasses.reduce((n,p)=>n+p.keys,0),48);
+  assert(health.recoveryPasses.every(p=>p.keys===12));assert.equal(health.finalSaveResult,'failed');assert.equal(health.unsavedKeyCount,4);
+  assert.equal([...h.storage.keys()].filter(key=>key.includes(':attempts-v222:')).length,52);assert.deepEqual(staticVector(h),before);
+  h.test.saveDiagnostic('chat-a',{test:'cooldown'});assert.equal([...h.storage.keys()].filter(key=>key.includes(':attempts-v222:')).length,52);
+});
+check('cleanup success cannot mask a remaining required-key failure and later recovery retries every key',()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',300);
+  h.storage.set(meterPrefix+'attempts-v222:recent',legacyData(h.now(),20000));
+  const save=h.context.localStorage.setItem,writes=[];let deny=true;
+  h.context.localStorage.setItem=(key,value)=>{writes.push(key);if(deny && key===h.test.diagKey('chat-a'))throw Error('QuotaExceededError');save(key,value);};
+  h.test.saveSnapshot('chat-a',h.test.loadSnapshot('chat-a'));
+  // A failed diagnostic alone must trigger coordinated recovery, even after a successful snapshot.
+  h.test.saveDiagnostic('chat-a',{test:'fail'});
+  const health=h.test.eventStorageHealth('chat-a');assert.equal(health.finalSaveResult,'failed');assert.equal(health.unsavedKeyCount,1);
+  assert.equal(health.saveResultsByKey[h.test.diagKey('chat-a')],'failed');assert(!h.storage.has(meterPrefix+'attempts-v222:recent'));
+  writes.length=0;deny=false;h.test.saveAttemptState('chat-a',h.test.loadAttemptState('chat-a'));
+  assert.equal(health.finalSaveResult,'saved');assert.equal(health.unsavedKeyCount,0);assert.equal(health.pendingWriteCount,0);
+  for(const key of health.requiredCurrentKeys)assert(writes.includes(key));
+});
+check('silent storage write loss and externally missing keys cannot produce overall save success',()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',300);
+  const save=h.context.localStorage.setItem;h.context.localStorage.setItem=(key,value)=>{if(key!==h.test.diagKey('chat-a'))save(key,value);};
+  h.test.saveDiagnostic('chat-a',{test:'new diagnostic'});
+  const health=h.test.eventStorageHealth('chat-a');assert.equal(health.finalSaveResult,'failed');assert.equal(health.unsavedKeyCount,1);assert.match(health.lastError,/readback mismatch/);
+  h.context.localStorage.setItem=save;h.storage.delete(h.test.lifecycleKey('chat-a'));
+  h.test.saveAttemptState('chat-a',h.test.loadAttemptState('chat-a'));
+  assert.equal(health.finalSaveResult,'saved');assert.equal(health.unsavedKeyCount,0);assert(h.storage.has(h.test.lifecycleKey('chat-a')));
 });
 
 (async()=>{

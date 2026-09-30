@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP
 // @namespace    local.chatgpt.size.v2101
-// @version      2.23.2
+// @version      2.23.3
 // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
 // @match        https://chatgpt.com/*
 // @grant        unsafeWindow
@@ -88,6 +88,8 @@ const storageHealth = new Map();
 const snapshotCache = new Map();
 const lifecycleCache = new Map();
 const diagnosticCache = new Map();
+const storagePending = new Map();
+let storageRecoveryRunning = false;
 const meterStorageTotals = {meterOwnedKeyCount:null,meterOwnedBytes:null,meterOwnedUtf16Bytes:null,
   bytesReclaimed:0,cleanupAt:null,lastAuditAt:null};
 const streamBuffers = new Map(); // ephemeral framing only, never persisted
@@ -3921,52 +3923,78 @@ function meterStorageActivity(value) {
   return stack.length ? null : newest; // Unknown/incompletely examined dates fail closed.
 }
 
-function meterStorageCleanup(id, writeKey) {
+function meterV223NeedsSources(data, episodes = false) {
+  if (!data || typeof data !== 'object') return true;
+  if (episodes) return !Array.isArray(data.episodes) || data.activeId != null || data.episodes.some(e=>e.active);
+  if (data.version !== 3 || !Array.isArray(data.attempts)) return true;
+  return !!data.current || !!data.pendingPreflight || data.attempts.some(a=>!a.telemetryFinalizedAt) ||
+    (data.sendIntents || []).some(i=>!i.dispatchAt && Date.now()-i.sendIntentAt <= 5000);
+}
+
+function meterStorageChatActive(id) {
+  const attempt = attemptCache.get(id), episodes = episodeCache.get(id);
+  if (attempt && meterV223NeedsSources(attempt)) return true;
+  if (episodes && meterV223NeedsSources(episodes,true)) return true;
+  for (const [key,isEpisode] of [[attemptKey(id),false],[`${P}:max-episodes-v223:${id}`,true]]) {
+    const text = localStorage.getItem(key);
+    if (text == null) continue;
+    try { if (meterV223NeedsSources(eventStorageParse(text),isEpisode)) return true; }
+    catch { return true; } // Unknown V2.23 ownership protects dependent caches.
+  }
+  return false;
+}
+
+function meterStorageCleanup(id, writeKey, recoveryPass = false) {
   const now = Date.now();
-  if (meterStorageTotals.cleanupAt != null && now-meterStorageTotals.cleanupAt < 30000) return 0;
-  meterStorageTotals.cleanupAt = now;
-  meterStorageTotals.cleanupBytesReclaimed = 0;
-  meterStorageTotals.cleanupRemovedKeyCount = 0;
-  meterStorageTotals.cleanupByNamespace = {};
-  meterStorageTotals.cleanupError = null;
-  meterStorageTotals.cleanupEligibleKeyCount = null;
-  meterStorageTotals.cleanupEligibleBytes = null;
-  meterStorageTotals.cleanupPolicy = '30 days inactive; max 12 keys / 3 chats; stop after 512 KiB reclaimed';
+  if (!(recoveryPass && storageRecoveryRunning) && meterStorageTotals.cleanupAt != null && now-meterStorageTotals.cleanupAt < 30000) return 0;
+  Object.assign(meterStorageTotals,{cleanupAt:now,cleanupBytesReclaimed:0,cleanupRemovedKeyCount:0,
+    cleanupByNamespace:{},cleanupNamespaceTotals:{},cleanupEntries:[],cleanupError:null,
+    cleanupEligibleKeyCount:null,cleanupEligibleBytes:null,
+    cleanupPolicy:'quota only; superseded v218-v222 attempts then unreferenced non-current source caches; max 12 keys/pass, 4 recovery passes; 512 KiB target/pass'});
   try {
-    const entries = meterStorageInventory(), groups = new Map();
+    const entries = meterStorageInventory(), groups = new Map(), candidates = [];
     const protectedChats = new Set([id,chatIdFromURL()]);
-    for (const [chat,store] of attemptCache) if (store.current) protectedChats.add(chat);
     for (const entry of entries) {
-      const suffix = entry.key.slice(P.length+1);
-      const match = /^(snapshot|diag|lifecycle-v\d+|attempts-v\d+|max-episodes-v\d+):([^:]+)$/.exec(suffix);
-      // Settings, positions, verified samples, manual MAX settings, notifications
-      // and unrecognized namespaces are audited but never selected for deletion.
-      if (!match || protectedChats.has(match[2]) || entry.key === writeKey) continue;
-      const group = groups.get(match[2]) || {entries:[],newest:0,unknown:false};
+      const match = /^(attempts-v(?:218|219|220|221|222)|snapshot|diag|lifecycle-v(?:21[6-9]|22[0-2])|attempts-v223|max-episodes-v223):([^:]+)$/.exec(entry.key.slice(P.length+1));
+      if (!match) continue;
+      const [namespace,chat] = match.slice(1);
+      entry.namespace = namespace; entry.chat = chat;
+      const group = groups.get(chat) || []; group.push(entry); groups.set(chat,group);
+      if (entry.key === writeKey) continue;
+      const obsolete = /^attempts-v(?:218|219|220|221|222)$/.test(namespace);
+      if (!obsolete && (!/^(snapshot|diag|lifecycle-v)/.test(namespace) || protectedChats.has(chat) || meterStorageChatActive(chat))) continue;
       const activity = meterStorageActivity(entry.value);
-      group.entries.push(entry); group.unknown ||= activity == null;
-      group.newest = Math.max(group.newest,activity || 0); groups.set(match[2],group);
+      // Superseded histories are explicitly reclaimable regardless of age/format.
+      // Rebuildable caches still fail closed on unrecognized/future timestamps.
+      if (!obsolete && (activity == null || activity > now)) continue;
+      candidates.push({...entry,activity,priority:obsolete ? 0 : 1,
+        reason:obsolete ? 'superseded attempt history' : 'unreferenced source cache'});
     }
-    const cutoff = now-30*86400000;
-    const stale = [...groups.values()].filter(g=>!g.unknown && g.newest < cutoff).sort((a,b)=>a.newest-b.newest);
-    meterStorageTotals.cleanupEligibleKeyCount = stale.reduce((n,g)=>n+g.entries.length,0);
-    meterStorageTotals.cleanupEligibleBytes = stale.reduce((n,g)=>n+g.entries.reduce((sum,e)=>sum+e.bytes,0),0);
-    let chats = 0;
-    for (const group of stale) {
-      if (chats++ >= 3 || meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
-      // Recheck every key in a chat before removing any: another tab may have saved.
-      if (group.entries.some(entry=>localStorage.getItem(entry.key) !== entry.value)) continue;
-      for (const entry of group.entries.sort((a,b)=>b.bytes-a.bytes)) {
-        if (meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
-        if (localStorage.getItem(entry.key) !== entry.value) continue;
-        localStorage.removeItem(entry.key);
-        if (localStorage.getItem(entry.key) != null) continue;
-        meterStorageTotals.cleanupBytesReclaimed += entry.bytes;
-        meterStorageTotals.bytesReclaimed += entry.bytes;
-        meterStorageTotals.cleanupRemovedKeyCount++;
-        const namespace = entry.key.slice(P.length+1).split(':')[0];
-        meterStorageTotals.cleanupByNamespace[namespace] = (meterStorageTotals.cleanupByNamespace[namespace] || 0)+1;
+    candidates.sort((a,b)=>a.priority-b.priority || Number(protectedChats.has(a.chat))-Number(protectedChats.has(b.chat)) ||
+      (a.activity ?? Infinity)-(b.activity ?? Infinity) || a.bytes-b.bytes || a.key.localeCompare(b.key));
+    meterStorageTotals.cleanupEligibleKeyCount = candidates.length;
+    meterStorageTotals.cleanupEligibleBytes = candidates.reduce((n,e)=>n+e.bytes,0);
+    const checked = new Set(), skipped = new Set();
+    for (const entry of candidates) {
+      if (meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
+      if (!checked.has(entry.chat)) {
+        checked.add(entry.chat);
+        if (groups.get(entry.chat).some(e=>localStorage.getItem(e.key) !== e.value)) skipped.add(entry.chat);
       }
+      if (skipped.has(entry.chat) || localStorage.getItem(entry.key) !== entry.value) continue;
+      if (entry.priority === 1 && meterStorageChatActive(entry.chat)) continue;
+      localStorage.removeItem(entry.key);
+      if (localStorage.getItem(entry.key) != null) continue;
+      const utf16Bytes = 2*(entry.key.length+entry.value.length);
+      meterStorageTotals.cleanupBytesReclaimed += entry.bytes;
+      meterStorageTotals.bytesReclaimed += entry.bytes;
+      meterStorageTotals.cleanupRemovedKeyCount++;
+      meterStorageTotals.cleanupByNamespace[entry.namespace] = (meterStorageTotals.cleanupByNamespace[entry.namespace] || 0)+1;
+      for (const table of [meterStorageTotals.cleanupNamespaceTotals,meterStorageTotals.reclaimedNamespaceTotals ||= {}]) {
+        const row = table[entry.namespace] ||= {keys:0,bytes:0,utf16Bytes:0};
+        row.keys++; row.bytes += entry.bytes; row.utf16Bytes += utf16Bytes;
+      }
+      meterStorageTotals.cleanupEntries.push({key:entry.key,namespace:entry.namespace,bytes:entry.bytes,utf16Bytes,reason:entry.reason});
     }
   } catch (error) { meterStorageTotals.cleanupError = redactDiagnosticText(error?.message || String(error)).slice(0,300); }
   eventStorageHealth(id,true);
@@ -3977,45 +4005,121 @@ function eventIsQuotaError(error) {
   return /quota/i.test(`${error?.name || ''} ${error?.message || ''}`) || error?.code === 22 || error?.code === 1014;
 }
 
-function eventSave(id, key, data) {
+function meterRequiredState(id) {
+  const result = new Map([
+    [attemptKey(id),attemptCache.get(id) || storagePending.get(attemptKey(id))?.data || loadAttemptState(id)],
+    [snapshotKey(id),snapshotCache.get(id) || loadSnapshot(id)],
+    [lifecycleKey(id),lifecycleCache.get(id) || storagePending.get(lifecycleKey(id))?.data || loadLifecycle(id)],
+    [diagKey(id),diagnosticCache.get(id) || storagePending.get(diagKey(id))?.data || loadDiagnostic(id) || {}]
+  ]);
+  const key = `${P}:max-episodes-v223:${id}`;
+  const episodes = episodeCache.get(id);
+  if (episodes?.episodes.length || episodes?.activeId != null || localStorage.getItem(key) != null || storagePending.has(key)) result.set(key,episodes || eventEpisodes(id));
+  return result;
+}
+
+function meterStorageWrite(id, key, data) {
   const health = storageHealth.get(id) || {};
-  storageHealth.set(id,health);
-  function save(text, retry) {
-    const bytes = new TextEncoder().encode(text).length;
+  storageHealth.set(id,health); storagePending.set(key,{id,data});
+  health.saveResultsByKey ||= {};
+  let text, quota = false;
+  function save(value, compact) {
+    const bytes = new TextEncoder().encode(value).length;
     health.serializedBytesByKey = {...health.serializedBytesByKey,[key]:bytes};
     health.serializedBytes = Object.values(health.serializedBytesByKey).reduce((a,b)=>a+b,0);
-    localStorage.setItem(key,text);
-    health.lastSaveSuccessful = true;
+    localStorage.setItem(key,value);
+    if (localStorage.getItem(key) !== value) throw new Error('Storage readback mismatch');
+    health.saveResultsByKey[key] = 'saved'; storagePending.delete(key);
     health.lastSavedAt = Date.now();
-    if (retry) { health.compactRetryRecoveredAt = Date.now(); health.compactRetryBytes = bytes; }
+    if (compact) { health.compactRetryRecoveredAt = Date.now(); health.compactRetryBytes = bytes; }
   }
-  let text, cleanupRecovered = false;
   try { text = eventStorageSavedText(data); save(text,false); }
   catch (error) {
-    let quotaPressure = eventIsQuotaError(error);
-    eventStorageError(id,error);
-    health.failedSaveCount = (health.failedSaveCount || 0)+1;
-    health.lastFailedSaveAt = Date.now();
+    quota = eventIsQuotaError(error); eventStorageError(id,error);
+    health.failedSaveCount = (health.failedSaveCount || 0)+1; health.lastFailedSaveAt = Date.now();
+    health.saveResultsByKey[key] = 'failed';
     if (text) {
-      let compact = text;
       try {
-        compact = eventStorageRetryText(text);
-        if (compact.length < text.length) {
-          health.compactRetryCount = (health.compactRetryCount || 0)+1;
-          save(compact,true);
-        }
-      } catch (retryError) { quotaPressure ||= eventIsQuotaError(retryError); eventStorageError(id,retryError); }
-      if (quotaPressure && !health.lastSaveSuccessful && meterStorageCleanup(id,key) > 0) {
-        try { save(compact,true); health.cleanupRetryRecoveredAt = Date.now(); cleanupRecovered = true; }
-        catch (cleanupRetryError) { eventStorageError(id,cleanupRetryError); }
-      }
+        const compact = eventStorageRetryText(text);
+        if (compact.length < text.length) { health.compactRetryCount = (health.compactRetryCount || 0)+1; save(compact,true); }
+      } catch (error) { quota ||= eventIsQuotaError(error); eventStorageError(id,error); }
     }
-  } finally {
-    health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
-    health.saveResultsByKey = {...health.saveResultsByKey,[key]:health.finalSaveResult};
-    health.unsavedKeyCount = Object.values(health.saveResultsByKey).filter(result=>result === 'failed').length;
-    eventStorageHealth(id,cleanupRecovered);
   }
+  return {saved:health.saveResultsByKey[key] === 'saved',quota};
+}
+
+function meterStorageFinalResult(id, required) {
+  const health = storageHealth.get(id) || {};
+  health.requiredCurrentKeys = [...required.keys()];
+  health.unsavedKeyCount = health.requiredCurrentKeys.filter(key=>health.saveResultsByKey?.[key] !== 'saved' || localStorage.getItem(key) == null).length;
+  health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+  health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+  health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+  health.candidateVersion = '2.23.3';
+  storageHealth.set(id,health);
+  return health.lastSaveSuccessful;
+}
+
+function meterStorageRecover(id, quotaPressure) {
+  if (storageRecoveryRunning) return;
+  storageRecoveryRunning = true;
+  const targets = [...new Set([id,chatIdFromURL()].filter(Boolean))];
+  try {
+    const sets = new Map(targets.map(chat=>[chat,meterRequiredState(chat)]));
+    // Retry all required current keys, including keys that failed earlier.
+    function flush() {
+      let quota = false;
+      for (const [chat,required] of sets) {
+        for (const [key,data] of required) { const result = meterStorageWrite(chat,key,data); quota ||= !result.saved && result.quota; }
+        for (const [key,entry] of [...storagePending]) if (entry.id === chat && !required.has(key)) {
+          const result = meterStorageWrite(chat,key,entry.data); quota ||= !result.saved && result.quota;
+        }
+        meterStorageFinalResult(chat,required);
+      }
+      return quota;
+    }
+    quotaPressure = flush() || quotaPressure;
+    let passes = 0, reclaimed = 0;
+    const passResults = [], namespaceTotals = {};
+    while (quotaPressure && targets.some(chat=>storageHealth.get(chat).finalSaveResult !== 'saved') && passes < 4) {
+      const freed = meterStorageCleanup(id,null,passes > 0);
+      if (!freed) break;
+      passes++; reclaimed += freed;
+      const entries = meterStorageTotals.cleanupEntries.map(e=>({...e}));
+      passResults.push({pass:passes,keys:entries.length,bytes:freed,entries});
+      for (const e of entries) {
+        const row = namespaceTotals[e.namespace] ||= {keys:0,bytes:0,utf16Bytes:0};
+        row.keys++; row.bytes += e.bytes; row.utf16Bytes += e.utf16Bytes;
+      }
+      quotaPressure = flush();
+    }
+    for (const chat of targets) {
+      const health = storageHealth.get(chat);
+      health.recoveryPassCount = passes; health.recoveryBytesReclaimed = reclaimed;
+      health.recoveryPasses = passResults; health.recoveryNamespaceTotals = namespaceTotals;
+      if (reclaimed && health.lastSaveSuccessful) health.cleanupRetryRecoveredAt = Date.now();
+      eventStorageHealth(chat,true);
+    }
+  } catch (error) {
+    eventStorageError(id,error);
+    for (const chat of targets) {
+      const health = storageHealth.get(chat) || {};
+      health.lastSaveSuccessful = false; health.finalSaveResult = 'failed';
+      storageHealth.set(chat,health);
+    }
+  }
+  finally { storageRecoveryRunning = false; }
+}
+
+function eventSave(id, key, data) {
+  const result = meterStorageWrite(id,key,data);
+  if (storageRecoveryRunning) return;
+  const health = storageHealth.get(id);
+  const basic = [attemptKey(id),snapshotKey(id),lifecycleKey(id),diagKey(id)];
+  if (!result.saved || basic.some(key=>health.saveResultsByKey?.[key] !== 'saved' || localStorage.getItem(key) == null) || [...storagePending.values()].some(entry=>entry.id === id)) {
+    meterStorageRecover(id,!result.saved && result.quota);
+  } else meterStorageFinalResult(id,meterRequiredState(id));
+  eventStorageHealth(id);
 }
 
 function eventEpisodes(id) {

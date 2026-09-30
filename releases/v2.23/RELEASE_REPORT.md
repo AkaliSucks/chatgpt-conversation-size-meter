@@ -1,3 +1,172 @@
+# V2.23.3 candidate — Version-aware meter retention
+
+Prepared 2026-09-30 on `codex/v223-version-aware-retention`, directly from
+`3be6a3004172c2aca2e51b0e0cc0e49d9f86e407`. The commit containing this report is
+the child candidate. The V2.23.2 checkpoint and its branch are preserved.
+No merge, PR, push, or V2.24 work.
+
+The user reports that V2.23.2 clean-reload native validation passed DIRECT/BATCH
+publication, full snapshot, topology and retained-state profiling without a new
+generation. This child preserves that implementation, as well as the validated
+button/Enter send path. No new native diagnostic files were available in this
+checkout; the supplied 65-key / ~7.13 MB UTF-16 audit is native evidence from the
+user. All new results below are deterministic synthetic evidence.
+
+## Retention and save recovery
+
+The 30-day eligibility requirement excluded recently written obsolete histories.
+Under unrecovered quota pressure, exact `cgpt-size-meter-v2101:` ownership and an
+explicit namespace allowlist now select superseded `attempts-v218` through
+`attempts-v222` histories regardless of their age or legacy format. This includes
+obsolete versions for the current chat; its active V2.23 history stays intact.
+
+Obsolete attempts precede rebuildable snapshot/diag/lifecycle-v216..v222 caches;
+within each category non-current chats precede current legacy histories, then
+older known activity precedes newer activity. Non-current source caches can be
+reclaimed without an age gate only when no active/pending/unfinalized V2.23
+attempt, unmatched recent send intent, active MAX episode, or unknown/corrupt
+V2.23 ownership needs them. Undated/malformed/future source caches fail closed.
+Both on-disk and in-memory owners are checked, with values/owners rechecked
+before deletion to avoid observed cross-tab changes.
+
+The current/writing chat's snapshot, lifecycle and diagnostics are protected.
+All V2.23 attempt and MAX-episode stores, settings, positions, verified-MAX
+samples, manual MAX settings, notification keys and unknown namespaces are
+retained. Closed historical V2.23 attempt/episode identity, outcome, confirmation
+and attached metric evidence remain stored even when redundant external source
+caches are reclaimed. Unrelated ChatGPT keys and lookalike prefixes are never
+deleted; their values are not read by the meter audit/cleanup.
+
+Each pass removes at most 12 keys and stops after reaching a 512 KiB UTF-8 target
+(one large key can exceed this target). One recovery coordinates up to four
+passes (48 keys maximum). Its subsequent passes bypass the 30-second cooldown;
+a new recovery still observes that cooldown. Cleanup occurs only after quota
+failure remains unrecovered by lossless compaction. No background age-based
+purge was added.
+
+Recovery retries **all four required current keys**: attempts, snapshot,
+lifecycle and diagnostics; an existing/active MAX episode key is also required.
+The writing chat and current URL chat are both covered when different. Pending
+writes retain their latest logical state. Successful setters must pass readback;
+missing or failed required keys keep overall `finalSaveResult=failed` and
+`lastSaveSuccessful=false`. A later successful single write cannot hide an older
+failed key. Failures, compact recovery and quota recovery remain visible.
+
+Storage health includes origin totals (`meterOwnedKeyCount`, `meterOwnedBytes`,
+`meterOwnedUtf16Bytes`, `meterOwnedNamespaces`, `lastAuditAt`), cumulative
+`bytesReclaimed`/`reclaimedNamespaceTotals`, last-pass `cleanupAt`, eligibility,
+removed counts/bytes, `cleanupNamespaceTotals` and exact bounded `cleanupEntries`.
+`recoveryPasses` and `recoveryNamespaceTotals` identify every removed key/category
+and its UTF-8/UTF-16 bytes across the last bounded recovery. `requiredCurrentKeys`,
+`saveResultsByKey`, `unsavedKeyCount`, `pendingWriteCount`, `recoveryPassCount`,
+`recoveryBytesReclaimed` and `finalSaveResult` distinguish complete recovery from
+partial writes. Counters are session-scoped; totals are refreshed on reload.
+
+The lossless storage codec and bounded attempt/event histories are unchanged.
+No new raw request, stream or response payload is persisted. This is a retention
+repair, not a new compression format or a reduction of required research fields.
+
+## Verification
+
+**77/77 complete synthetic tests PASS**: the existing suite plus seven new tests
+for a recent multi-megabyte 65-key origin, current-chat obsolete versions,
+active/closed V2.23 source dependencies, cleanup order, bounded exhaustion,
+partial failure followed by all-key retry, silent setters and externally missing
+keys. Old GC expectations were updated to the requested eligibility policy.
+Quota compaction tests now budget for the entire required working set and verify
+complete save success instead of only the most recently written key.
+
+The recent-origin fixture began at 3,384,875 meter-owned UTF-8 bytes / 6,769,750
+UTF-16 bytes. Unrelated app storage occupied another ~3.4 MB UTF-16. With a
+synthetic 5,500,000-byte UTF-16 origin budget, current writes initially exceeded
+quota. Three bounded passes reclaimed these recently created histories:
+
+| Namespace | Keys | UTF-8 bytes (key + value) | UTF-16 bytes |
+| --- | ---: | ---: | ---: |
+| attempts-v218 | 1 | 150115 | 300230 |
+| attempts-v219 | 1 | 499115 | 998230 |
+| attempts-v220 | 1 | 323115 | 646230 |
+| attempts-v221 | 1 | 402115 | 804230 |
+| attempts-v222 | 1 | 1130115 | 2260230 |
+| **Total** | **5** | **2504575** | **5009150** |
+
+All five required current keys then saved, with `unsavedKeyCount=0`,
+`pendingWriteCount=0` and overall success. Origin totals ended at 60 meter-owned
+keys / 890,164 UTF-8 bytes / 1,780,328 UTF-16 bytes, including newly saved captures.
+The orphan snapshot remained because further reclamation was unnecessary.
+Attempt/MAX IDs, outcome evidence, settings, verified metadata and active
+other-chat state survived; unrelated app values were byte-unchanged. A fresh VM
+reloaded the saved DIRECT/BATCH state, full snapshot and attempt/MAX evidence.
+Current value sizes were attempts 4439, snapshot 7141, lifecycle 1584, diag 277,
+MAX episodes 1330 bytes. These fixture sizes are not native measurements.
+
+Representative codec sizes remain: ten attempts 259873 original JSON / 37807
+packed / 17706 compact retry bytes; one attempt 60295 / 25466 / 11258 bytes.
+The required research data roundtrips losslessly.
+
+- 66,862 protected parser/extraction/topology/profiler bytes match immutable V2.22.
+- 8,807 send/correlation bytes match validated `4b14425`.
+- 15,435 source cache/capture/static-vector/diagnostic bytes match `3be6a30`.
+  The copied diagnostic header still says V2.23.2 to preserve those bytes; the
+  userscript metadata and `storageHealth.candidateVersion` identify 2.23.3.
+- `scripts/verify-baseline.sh` and candidate/harness/verifier/baseline
+  `node --check`: PASS. Baseline: 289994 bytes,
+  SHA-256 `08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696`.
+- Two ZIP builds are byte-identical; the sole JS member equals the LF source.
+  Complete commands/results are recorded in `VALIDATION.txt`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| JS | 295749 | `1d5de3edec497ad35bbd74c0a8d97062d45622d87425604d4bbd85170a83adc0` |
+| ZIP | 65904 | `781e023afc4142026f36df9dad2580dd1c0bc3554091dbf5e37f19585d527524` |
+
+Changed files: release JS/ZIP, SHA256SUMS, VALIDATION.txt, this report,
+`scripts/test-v223.js`, `scripts/verify-v223-protected.js`.
+
+## Exact next native browser retest
+
+1. Keep the existing quota-pressure origin intact. Save its previous diagnostics
+   externally and record a read-only storage inventory of owned categories and
+   unrelated key/value hashes. Close other meter-enabled ChatGPT tabs so older
+   script copies cannot repopulate the obsolete namespaces during this test.
+2. Install this ZIP's JS as version 2.23.3 and disable older copies. Hard-reload
+   the same V2.23.2 test conversation. Do not submit a new prompt yet. Let normal
+   full conversation loading finish, then Copy diagnostics. Retry Capture may
+   refresh DIRECT; wait for an actual app BATCH response if needed, rather than
+   claiming an invented BATCH observation.
+3. Verify `candidateVersion=2.23.3`; valid DIRECT/BATCH state, full snapshot,
+   topology and retained profiler; and zero new generation attempts on reload.
+   Check cleanup timestamps, eligible counts, exact namespace/key lists and
+   reclaimed bytes against the before/after inventory. Recent v218-v222 histories
+   should be eligible; unrelated values and settings/position/verified metadata
+   must be unchanged. Current attempt/MAX identity and outcomes must survive.
+4. Require `finalSaveResult=saved`, `lastSaveSuccessful=true`,
+   `unsavedKeyCount=0`, `pendingWriteCount=0`, and every `requiredCurrentKeys`
+   entry marked saved. That must include attempts, diag, snapshot, lifecycle and
+   any existing/active MAX episode key. A historical `lastError`/failure counter
+   can remain after recovery; it must not be mistaken for the final result.
+   If four passes exhaust headroom, retain the failure diagnostics and retest
+   after the 30-second cooldown; do not manually delete unrelated storage.
+5. Hard-reload again. Confirm saved snapshots, DIRECT/BATCH metrics and research
+   identity/outcome evidence reload durably. Copy diagnostics again. Any new
+   attempt must correspond to an actual subsequent generation, not this reload.
+6. In a healthy isolated test chat send `Reply with one short sentence.` once by
+   button, wait for SUCCESS and Copy diagnostics; send the same prompt once by
+   Enter, wait for SUCCESS and Copy again. Require one new intent/attempt per
+   submission, explicit method, dispatch correlation, latency, SUCCESS and all
+   required saves successful after each. No giant prompt is needed.
+
+Native browser quota accounting, cross-tab timing and the original site's exact
+working set are not reproduced by the VM. Native cleanup and durability therefore
+remain unvalidated until this sequence passes. The synthetic UTF-16 budget is a
+controlled test model, not an assertion of a universal browser quota. Quota
+occupied by unrelated storage or protected meter evidence can still produce a
+visible unrecovered failure; four-pass exhaustion remains bounded and honest.
+
+---
+
+## Historical V2.23.2 report (3be6a30; not this child build)
+
 # V2.23.2 candidate — Shared-origin storage and static publication
 
 Prepared 2026-09-30 on `codex/v223-storage-static-state-fixes`, directly from
