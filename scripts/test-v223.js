@@ -11,10 +11,16 @@ const dispatchURL = '/backend-api/f/conversation';
 const phrase = "You've reached the maximum length for this conversation";
 const body = (extra={}) => JSON.stringify({action:'next',parent_message_id:'parent-a',model:'test-model',conversation_id:'chat-a',messages:[{id:'u',author:{role:'user'},content:{content_type:'text',parts:['hello']}}],...extra});
 const response = (text='',status=200,type='application/json') => ({ok:status<400,status,headers:{get:()=>type},clone(){return {text:async()=>text};}});
+function successfulStreamResponse() {
+  const text='data: [DONE]\n\n';let read=0;
+  const resp=response(text,200,'text/event-stream');
+  resp.clone=()=>({text:async()=>text,body:{getReader:()=>({read:async()=>read++===0?{done:false,value:new TextEncoder().encode(text)}:{done:true}})}});
+  return resp;
+}
 function environment() {
   let now = 1000000, counter = 0;
   const timers = new Map(), storage = new Map(), listeners = {}, fetches = [];
-  const state = {banners:[],stop:false,turns:[],composer:'small prompt',quota:false,fetch:async()=>response('{}'),clipboard:null};
+  const state = {banners:[],stop:false,turns:[],composer:'small prompt',quota:false,quotaBytes:Infinity,failedWrites:0,fetch:async()=>response('{}'),clipboard:null};
   const location = {origin:'https://chatgpt.com',pathname:'/c/chat-a',href:'https://chatgpt.com/c/chat-a'};
   class FakeDate extends Date { static now(){return now;} }
   const document = {body:null,querySelectorAll(selector) {
@@ -28,11 +34,16 @@ function environment() {
   },addEventListener(name,fn){(listeners[name] ||= []).push(fn);}};
   class WS {constructor(url){this.url=url;this.events={};}send(){}addEventListener(n,fn){this.events[n]=fn;}}
   class XHR {constructor(){this.events={};this.status=200;this.responseText='';}open(){}send(){}addEventListener(n,f){this.events[n]=f;}getResponseHeader(){return 'application/json';}}
-  const page = {fetch:async(...args)=>{fetches.push(args);return state.fetch(...args);},WebSocket:WS,XMLHttpRequest:XHR};
+  const page = {fetch:async(...args)=>{fetches.push(args);return state.fetch(...args);},WebSocket:WS,XMLHttpRequest:XHR,
+    addEventListener(name,fn,capture){assert.equal(capture,true);(listeners[name] ||= []).push(fn);}};
   const context = {document,location,unsafeWindow:page,window:page,URL,TextEncoder,TextDecoder,ArrayBuffer,
-    Request,Blob,Date:FakeDate,console,performance:{getEntriesByType:()=>[]},
+    Request,Blob,btoa,atob,Date:FakeDate,console,performance:{getEntriesByType:()=>[]},
     getComputedStyle:el=>({display:el.hidden?'none':'block',visibility:'visible',opacity:'1'}),
-    localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>{if(state.quota)throw Error('QuotaExceededError');storage.set(k,v);},removeItem:k=>storage.delete(k)},
+    localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>{
+      const used=[...storage].filter(([key])=>key!==k).reduce((sum,[key,value])=>sum+Buffer.byteLength(value),0);
+      if(state.quota || used+Buffer.byteLength(v)>state.quotaBytes){state.failedWrites++;throw Error('QuotaExceededError');}
+      storage.set(k,v);
+    },removeItem:k=>storage.delete(k)},
     navigator:{clipboard:{writeText:async text=>{state.clipboard=text;}}},alert:()=>{},
     setTimeout(fn,ms){const id=++counter;timers.set(id,{fn,time:now+ms});return id;},clearTimeout:id=>timers.delete(id),
     setInterval:()=>++counter,clearInterval:()=>{},MutationObserver:class{observe(){}}};
@@ -60,9 +71,23 @@ function environment() {
     now=end;await flush();
   }
   const navigate=id=>{location.pathname='/c/'+id;location.href=location.origin+location.pathname;};
+  function composerForm(options={}) {
+    const form={getAttribute:()=>null,querySelectorAll:()=>[editable]};
+    const editable={tagName:options.textarea?'TEXTAREA':'DIV',id:'',isConnected:true,
+      getAttribute:k=>k==='aria-label'?'Ask ChatGPT':k==='contenteditable'?'true':k==='role'?'textbox':null,
+      getBoundingClientRect:()=>({width:200,height:40}),
+      closest:selector=>selector==='form'?form:selector.startsWith('textarea')?editable:null};
+    Object.defineProperty(editable,options.textarea?'value':'innerText',{get:()=>state.composer});
+    const button={type:options.buttonType || 'button',form,disabled:!!options.disabled,
+      getAttribute:k=>k==='aria-label'?(options.buttonLabel || 'Send prompt'):null,
+      closest:selector=>selector==='form'?form:selector.startsWith('button')?button:null};
+    const icon={closest:selector=>selector.startsWith('button')?button:null};
+    return {form,editable,button,icon};
+  }
+  const fire=(name,event)=>{for(const fn of listeners[name] || [])fn(event);};
   const start=extra=>test.attemptInspectOutgoingRequest(dispatchURL,'POST',body(extra));
   const chunk=(a,text)=>test.attemptRecordStreamChunk('chat-a',dispatchURL,response('',200,'text/event-stream'),Buffer.byteLength(text),text,a.id);
-  return {test,state,page,context,document,storage,fetches,listeners,banner,flush,advance,navigate,start,chunk,now:()=>now};
+  return {test,state,page,context,document,storage,fetches,listeners,banner,flush,advance,navigate,start,chunk,composerForm,fire,now:()=>now};
 }
 const cases=[];
 const check=(name,fn)=>cases.push([name,fn]);
@@ -302,11 +327,12 @@ check('send followed by dispatch records latency and cannot become blocked',asyn
   assert.equal(a.sendIntentToDispatchMs,100);assert.equal(h.test.loadAttemptState('chat-a').sendIntents[0].blockedBeforeDispatch,false);
 });
 check('send listeners ignore Shift Enter, IME, modifiers and non-composer keys',()=>{
-  const h=environment();h.test.installSendIntentHook();const composer={closest:()=>({})};
+  const h=environment();h.test.installSendIntentHook();const composer=h.composerForm().editable;
   const listener=h.listeners.keydown[0];
-  for(const extra of [{shiftKey:true},{isComposing:true},{ctrlKey:true},{repeat:true}])listener({key:'Enter',target:composer,...extra});
+  for(const extra of [{shiftKey:true},{isComposing:true},{keyCode:229},{ctrlKey:true},{altKey:true},{metaKey:true},{repeat:true}])listener({key:'Enter',target:composer,...extra});
   listener({key:'Enter',target:{closest:()=>null}});assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
-  listener({key:'Enter',target:composer});assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,1);
+  listener({key:'Enter',target:composer});assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
+  h.start();assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,1);
 });
 check('coalesced Retry clicks use one internal workflow during generation',async()=>{
   const h=environment(),a=h.start();let release;h.state.fetch=()=>new Promise(resolve=>release=resolve);
@@ -364,6 +390,157 @@ check('unclassified conversation POST prevents a false blocked-before-dispatch l
   h.test.attemptInspectOutgoingRequest(dispatchURL,'POST','{"action":"new-unknown-variant"}');await h.advance(2500);
   assert.equal(h.test.eventActiveEpisode('chat-a').blockedBeforeDispatch,false);
   assert.match(h.test.loadAttemptState('chat-a').sendIntents[0].correlationIncomplete,/unresolved/);
+});
+
+check('native button icon click and tap submit correlate once, before body/UI initialization',async()=>{
+  for(const detail of [1,0]) {
+    const h=environment(),c=h.composerForm();assert.equal(h.listeners.click.length,1);
+    h.state.composer='Reply with one short sentence.';
+    h.state.fetch=async()=>successfulStreamResponse();
+    // Current contenteditable lacks the old prompt-textarea id/testid. SVG target.
+    h.fire('click',{target:c.icon,composedPath:()=>[c.icon,c.button,c.form],detail});
+    h.fire('submit',{target:c.form});await h.advance(37);
+    await h.page.fetch(dispatchURL,{method:'POST',body:body({messages:[{author:{role:'user'},content:{parts:[h.state.composer]}}]})});await h.flush();
+    const a=h.test.loadAttemptState('chat-a').last;assert.equal(a.requestPromptChars,30);
+    const intents=h.test.loadAttemptState('chat-a').sendIntents;
+    assert.equal(intents.length,1);assert.equal(intents[0].submissionMethod,'button');
+    assert.equal(intents[0].composerChars,h.state.composer.length);assert.equal(intents[0].conversationId,'chat-a');
+    assert.equal(intents[0].attemptId,a.id);assert.equal(intents[0].intentToDispatchMs,37);assert.equal(a.sendIntentToDispatchMs,37);
+    assert.equal(a.outcome,'success');assert(a.transportClosedAt);
+  }
+});
+check('native contenteditable Enter dispatch, form submit and implicit click produce one intent',async()=>{
+  for(const submitFirst of [true,false]) {
+    const h=environment(),c=h.composerForm(),event={key:'Enter',target:c.editable,defaultPrevented:false};
+    h.state.composer='Reply with one short sentence.';
+    h.state.fetch=async()=>successfulStreamResponse();
+    h.fire('keydown',event);assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
+    event.defaultPrevented=true; // React handles key without stopping our window capture.
+    if(submitFirst)h.fire('submit',{target:c.form});
+    await h.advance(64);
+    await h.page.fetch(dispatchURL,{method:'POST',body:body({messages:[{author:{role:'user'},content:{parts:[h.state.composer]}}]})});await h.flush();
+    const a=h.test.loadAttemptState('chat-a').last;assert.equal(a.requestPromptChars,30);
+    h.fire('click',{target:c.icon,detail:0});h.fire('submit',{target:c.form});
+    const intents=h.test.loadAttemptState('chat-a').sendIntents;
+    assert.equal(intents.length,1);assert.equal(intents[0].submissionMethod,'enter');
+    assert.equal(intents[0].composerChars,h.state.composer.length);assert.equal(intents[0].sendIntentAt,1000000);
+    assert.equal(intents[0].attemptId,a.id);assert.equal(intents[0].intentToDispatchMs,64);
+    assert.equal(a.submissionMethod,'enter');assert.equal(a.outcome,'success');assert(a.transportClosedAt);
+  }
+});
+check('Enter newline, ignored key and excluded search fields never become intents',async()=>{
+  for(const inputType of ['insertParagraph','insertLineBreak','literal','ignored']) {
+    const h=environment(),c=h.composerForm();h.fire('keydown',{key:'Enter',target:c.editable});
+    if(inputType==='literal')h.fire('input',{target:c.editable,data:'\n'});
+    else if(inputType!=='ignored')h.fire('beforeinput',{target:c.editable,inputType});
+    await h.advance(5001);h.start();assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
+  }
+  const h=environment(),c=h.composerForm();c.editable.getAttribute=()=> 'Search messages';
+  h.fire('keydown',{key:'Enter',target:c.editable});h.fire('click',{target:c.button});h.fire('submit',{target:c.form});h.start();
+  assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
+});
+check('disabled and unrelated composer controls are ignored; default submit semantics work',()=>{
+  for(const options of [{disabled:true},{buttonLabel:'Start Voice'},{buttonLabel:'Dictate'},{buttonLabel:'Stop generating'},{buttonLabel:'Add files and more'}]) {
+    const h=environment(),c=h.composerForm(options);h.fire('click',{target:c.icon});assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,0);
+  }
+  const h=environment(),c=h.composerForm({buttonLabel:'Arrow',buttonType:'submit',textarea:true});h.fire('click',{target:c.icon});
+  assert.equal(h.test.loadAttemptState('chat-a').sendIntents.length,1);
+});
+check('handled Enter followed by native MAX stays blocked without inventing a dispatch',async()=>{
+  const h=environment(),c=h.composerForm(),event={key:'Enter',target:c.editable};h.fire('keydown',event);event.defaultPrevented=true;
+  h.state.banners=[h.banner()];h.test.eventPollMax('chat-a');await h.advance(2500);
+  const store=h.test.loadAttemptState('chat-a');assert.equal(store.sendIntents.length,1);
+  assert.equal(store.sendIntents[0].submissionMethod,'enter');assert.equal(store.sendIntents[0].blockedBeforeDispatch,true);
+  assert.equal(store.attempts.length,0);assert.equal(h.test.eventActiveEpisode('chat-a').blockedBeforeDispatch,true);
+});
+check('native Enter composer clear confirms original length; navigation cancels provisional key',()=>{
+  const h=environment(),c=h.composerForm(),event={key:'Enter',target:c.editable};h.fire('keydown',event);event.defaultPrevented=true;
+  h.state.composer='';h.fire('input',{target:c.editable,data:null});
+  assert.equal(h.test.loadAttemptState('chat-a').sendIntents[0].composerChars,12);h.start();
+  const other=environment(),d=other.composerForm();other.fire('keydown',{key:'Enter',target:d.editable});other.navigate('chat-b');
+  other.test.attemptInspectOutgoingRequest(dispatchURL,'POST',body({conversation_id:'chat-b'}));
+  assert.equal(other.test.loadAttemptState('chat-b').sendIntents.length,0);
+});
+
+function persistenceFixture(h,count=10) {
+  // Real attempt/observation constructors, filled with deterministic scalar metrics.
+  const life=h.test.loadLifecycle('chat-a');
+  for(const family of ['direct','batch'])life.families[family].lastStable={time:h.now(),fullCapturedAt:h.now(),source:family,sourceFamily:family,
+    retainedBytes:180000+count,activeBranchBytes:92000,mappingBytes:155000,branchNodes:85,messageNodes:90,userMessages:20,
+    assistantMessages:20,toolResults:15,toolResultBytes:73000,hot128:128,hot256:256,toolCalls:15,strongContextMarkers:3,
+    systemRoleNodes:2,displayLikeTokens:2000,payloadBytes:210000};
+  h.test.saveLifecycle('chat-a',life);
+  const row=(i,type)=>({time:h.now()+i,url:dispatchURL,sourceFamily:'direct',bytes:100+i,status:200,kind:type});
+  for(let i=0;i<count;i++) {
+    const a=h.start();a.networkEvents=Array.from({length:75},(_,j)=>row(j,'HTTP'));
+    a.transportEvents=Array.from({length:75},(_,j)=>row(j,'WebSocket'));
+    for(const family of ['direct','batch']) {
+      const obs={...a.pre[family],time:h.now()+i+1};
+      a.firstCaptureByFamily[family]=obs;a.peakRetainedByFamily[family]=obs;a.peakActiveByFamily[family]=obs;a.lastCaptureByFamily[family]=obs;
+      a.postCorrelation.snapshotsByFamily[family]=obs;
+    }
+    h.chunk(a,'data: [DONE]\n\n');h.test.attemptFinishStream('chat-a',dispatchURL,response(),null,a.id);
+  }
+  const store=h.test.loadAttemptState('chat-a');
+  for(const field of ['appStateNetwork','meterCaptureNetwork','uncorrelatedWebSocket'])store[field]=Array.from({length:55},(_,i)=>row(i,field));
+  h.test.saveAttemptState('chat-a',store);return store;
+}
+check('lossless storage compaction roundtrips repeated snapshots, nulls and Unicode',()=>{
+  const h=environment(),store=persistenceFixture(h),plain=JSON.stringify(store),packed=h.test.eventStorageText(store),retry=h.test.eventStorageRetryText(packed);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.test.eventStorageParse(packed))),JSON.parse(plain));
+  assert.deepEqual(JSON.parse(JSON.stringify(h.test.eventStorageParse(retry))),JSON.parse(plain));
+  assert(packed.length<plain.length*0.55);assert(retry.length<packed.length);
+  const misc={text:'é漢字😀',nothing:null,list:[null,false,0,[],{value:'é'}]};
+  assert.equal(JSON.stringify(h.test.eventStorageParse(h.test.eventStorageRetryText(h.test.eventStorageText(misc)))),JSON.stringify(misc));
+  console.log(`STORAGE representative 10-attempt fixture: original JSON ${Buffer.byteLength(plain)}; compact ${Buffer.byteLength(packed)}; quota retry ${Buffer.byteLength(retry)} bytes`);
+  const single=environment(),one=persistenceFixture(single,1),oneText=single.test.eventStorageText(one);
+  console.log(`STORAGE representative 1-attempt fixture: original JSON ${Buffer.byteLength(JSON.stringify(one))}; compact ${Buffer.byteLength(oneText)}; quota retry ${Buffer.byteLength(single.test.eventStorageRetryText(oneText))} bytes`);
+});
+check('quota pressure bounds traces, recovers losslessly and retains attempt/MAX identity and outcomes',()=>{
+  const h=environment(),store=persistenceFixture(h,15),key=h.test.attemptKey('chat-a');
+  for(const field of ['sendIntents','unclassifiedConversationPosts','preflightHistory'])store[field]=Array.from({length:35},(_,i)=>({id:i+1,conversationId:'chat-a',time:h.now()+i}));
+  for(const a of store.attempts)a.streamStats.recentEvents=Array.from({length:55},(_,i)=>({time:h.now()+i,type:'message_delta'}));
+  h.test.saveAttemptState('chat-a',store);
+  const packed=h.test.eventStorageText(store),retry=h.test.eventStorageRetryText(packed);
+  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(retry)+1;h.test.saveAttemptState('chat-a',store);
+  assert.equal(h.state.failedWrites,1);const health=h.test.storageHealth.get('chat-a');
+  assert.equal(health.lastSaveSuccessful,true);assert.match(health.lastError,/QuotaExceeded/);assert.equal(health.compactRetryCount,1);assert(health.compactRetryRecoveredAt);
+  const decoded=h.test.eventStorageParse(h.storage.get(key));assert.equal(decoded.attempts.length,10);
+  assert.deepEqual(JSON.parse(JSON.stringify(decoded)),JSON.parse(JSON.stringify(store)));
+  assert.equal(decoded.attempts[0].id,6);assert.equal(decoded.attempts.at(-1).outcome,'success');
+  assert.equal(decoded.attempts.at(-1).pre.direct.retainedBytes,180015);
+  for(const a of decoded.attempts){assert.equal(a.networkEvents.length,60);assert.equal(a.transportEvents.length,60);}
+  assert.equal(decoded.preflightHistory.length,10);assert.equal(decoded.sendIntents.length,20);assert.equal(decoded.unclassifiedConversationPosts.length,20);
+  for(const a of decoded.attempts)assert.equal(a.streamStats.recentEvents.length,40);
+  for(const field of ['appStateNetwork','meterCaptureNetwork','uncorrelatedWebSocket'])assert.equal(decoded[field].length,40);
+  h.storage.clear();h.state.quotaBytes=Infinity;
+  for(let i=0;i<15;i++) {
+    const e=h.test.eventOpenEpisode('chat-a','structured transport MAX',i+1);e.blockedBeforeDispatch=i%2===0;
+    e.captureHistory=Array.from({length:40},(_,j)=>({episodeId:e.id,capturedAt:h.now()+j,conversationId:'chat-a',retainedBytes:12000+j,sourceFamily:'direct'}));
+    e.direct=e.captureHistory.at(-1);h.test.eventSaveEpisodes('chat-a');e.active=false;
+  }
+  const state=h.test.eventEpisodes('chat-a'),episodeKey='cgpt-size-meter-v2101:max-episodes-v223:chat-a';
+  const full=h.test.eventStorageText(state),small=h.test.eventStorageRetryText(full);assert(small.length<full.length);
+  h.storage.clear();h.state.quotaBytes=Buffer.byteLength(small)+1;h.test.eventSaveEpisodes('chat-a');
+  const episodes=h.test.eventStorageParse(h.storage.get(episodeKey));assert.equal(episodes.episodes.length,10);
+  assert.deepEqual(JSON.parse(JSON.stringify(episodes)),JSON.parse(JSON.stringify(state)));
+  const last=episodes.episodes.at(-1);assert.equal(last.id,15);assert.equal(last.relatedRealAttemptId,15);assert.equal(last.blockedBeforeDispatch,true);
+  assert.equal(last.confirmationSource,'structured transport MAX');assert.equal(last.captureHistory.length,30);assert.equal(last.direct.retainedBytes,12039);
+  h.state.quotaBytes=1;h.test.eventSaveEpisodes('chat-a');assert.equal(health.lastSaveSuccessful,false);
+  assert.equal(h.test.eventEpisodes('chat-a').episodes.at(-1).id,15); // failed writes cannot erase memory evidence
+});
+check('compact saved attempts, episodes, lifecycle, snapshot and diagnostics reload through production readers',()=>{
+  const h=environment(),store=persistenceFixture(h,2),fresh=environment();
+  const key=h.test.attemptKey('chat-a');fresh.storage.set(key,h.test.eventStorageRetryText(h.test.eventStorageText(store)));
+  const loaded=fresh.test.loadAttemptState('chat-a');assert.equal(loaded.last.id,store.last.id);assert.equal(loaded.last.outcome,'success');assert.equal(loaded.last.pre.batch.retainedBytes,180002);
+  const e=h.test.eventOpenEpisode('chat-a','UI MAX banner',2);h.test.eventSaveEpisodes('chat-a');
+  const episodeKey='cgpt-size-meter-v2101:max-episodes-v223:chat-a';fresh.storage.set(episodeKey,h.storage.get(episodeKey));
+  assert.equal(fresh.test.eventEpisodes('chat-a').episodes[0].id,e.id);
+  h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',300);
+  h.test.saveDiagnostic('chat-a',{lastObservedURL:'/backend-api/conversation/chat-a'});
+  for(const [k,v] of h.storage)if(!k.includes('attempts-v223')&&!k.includes('max-episodes'))fresh.storage.set(k,v);
+  assert.equal(fresh.test.loadSnapshot('chat-a').full,true);assert(fresh.test.loadLifecycle('chat-a').families.direct.lastStable);
+  assert.equal(fresh.test.loadDiagnostic('chat-a').lastObservedURL,'https://chatgpt.com/backend-api/conversation/chat-a');
 });
 
 (async()=>{

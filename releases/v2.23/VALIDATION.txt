@@ -1,13 +1,31 @@
-V2.23 validation — 2026-09-30; Node v24.19.0 Policy commit b15e7fd618ed6aee9020aa25cde20efdf45a3ca3; implementation parent is this commit.
-PASS baseline size 289994 bytes
+V2.23.1 native-validation fixes; synthetic verification only
+Branch: codex/v223-native-validation-fixes
+Exact parent checkpoint: ab2b19bfec736dc03cbdd2d1ad3c363bfe87b67a
+Native diagnostic files were unavailable in the checkout; user findings supplied the regression requirements.
+Live browser audit was read-only DOM inspection, not candidate runtime validation.
+
+$ C:/Program Files/Git/bin/bash.exe --noprofile --norc -c export PATH=/usr/bin:/bin:$PATH; bash scripts/verify-baseline.sh
 PASS: V2.22 baseline SHA-256 matches: 08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696
 PASS: node --check
-PASS node --check candidate, harness and protected verifier
+exit 0
+
+$ node --check releases\v2.23\chatgpt_chat_size_meter_v223_event_model_cleanup.js
+
+exit 0
+
+$ node --check scripts/test-v223.js
+
+exit 0
+
+$ node scripts/verify-v223-protected.js
 PASS protected region function normalizeRole( (64982 bytes)
 PASS protected region function mergeRecordsForChat( (1190 bytes)
 PASS protected region function inspectJSON( (282 bytes)
 PASS protected region function inspectRequestBody( (408 bytes)
 PASS 66862 protected bytes; baseline identity and capture-lineage markers
+exit 0
+
+$ node scripts/test-v223.js
 PASS 1 short SUCCESS confirms immediately; archived telemetry continues
 PASS 2/7 long assistant stream quotes MAX without false outcomes
 PASS 3/10 repeated visible MAX at load creates one episode and zero attempts
@@ -53,7 +71,30 @@ PASS historical V2.22 synthetic attempts are neither migrated nor relabelled
 PASS rendered event sections and copied diagnostics omit predictive bands and tokens
 PASS late dispatch corrects provisional blocked-before-dispatch classification
 PASS unclassified conversation POST prevents a false blocked-before-dispatch label
-45/45 synthetic harness tests passed; native-browser validation not performed
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 272063 bytes; SHA-256 deff5a557eed8836e3cb996c09332741de0f7c417c9fb8902f96713fca0f0836
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 59316 bytes; SHA-256 bc6c97cfe16e4f2e0b3095a99edce9ee6f297e56709246c9808a17ee9096145e
-PASS deterministic ZIP regeneration; exactly one member; extracted JS bytes match release
+PASS native button icon click and tap submit correlate once, before body/UI initialization
+PASS native contenteditable Enter dispatch, form submit and implicit click produce one intent
+PASS Enter newline, ignored key and excluded search fields never become intents
+PASS disabled and unrelated composer controls are ignored; default submit semantics work
+PASS handled Enter followed by native MAX stays blocked without inventing a dispatch
+PASS native Enter composer clear confirms original length; navigation cancels provisional key
+STORAGE representative 10-attempt fixture: original JSON 259873; compact 37807; quota retry 17691 bytes
+STORAGE representative 1-attempt fixture: original JSON 60295; compact 25466; quota retry 11243 bytes
+PASS lossless storage compaction roundtrips repeated snapshots, nulls and Unicode
+PASS quota pressure bounds traces, recovers losslessly and retains attempt/MAX identity and outcomes
+PASS compact saved attempts, episodes, lifecycle, snapshot and diagnostics reload through production readers
+54/54 synthetic harness tests passed; native-browser validation not performed
+exit 0
+
+$ python scripts/package-v223.py
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 281660 bytes; SHA-256 5040718bbd964b33a80b33757c64cdfb0697962fe537bd36f6130c38458134f5
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 62182 bytes; SHA-256 26ee7bc9a7cf8d548e7303ffc9b21f5e45d9e45bf25104ee768d7d5f81ca827d
+exit 0
+
+$ python scripts/package-v223.py
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 281660 bytes; SHA-256 5040718bbd964b33a80b33757c64cdfb0697962fe537bd36f6130c38458134f5
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 62182 bytes; SHA-256 26ee7bc9a7cf8d548e7303ffc9b21f5e45d9e45bf25104ee768d7d5f81ca827d
+exit 0
+
+PASS deterministic ZIP: two builds byte-identical; one JS member matching source bytes.
+PASS release JS has LF only.
+Native browser validation of this candidate has not been performed.

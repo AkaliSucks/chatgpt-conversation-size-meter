@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP
 // @namespace    local.chatgpt.size.v2101
-// @version      2.23.0
+// @version      2.23.1
 // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
 // @match        https://chatgpt.com/*
 // @grant        unsafeWindow
@@ -90,6 +90,8 @@ const captureJobs = new Map();
 let meterFetch = null;
 let activeCaptureBinding = null; // synchronous parser-to-event handoff only
 let sendIntentHooked = false;
+let pendingComposerEnter = null;
+let lastComposerSubmission = null;
 
 
 
@@ -177,7 +179,7 @@ function loadSnapshot(id = chatIdFromURL()) {
   if (!k) return blankSnapshot();
 
   try {
-    const parsed = JSON.parse(localStorage.getItem(k));
+    const parsed = eventStorageParse(localStorage.getItem(k));
     if (parsed && Array.isArray(parsed.records)) {
       return {
         ...blankSnapshot(),
@@ -198,7 +200,7 @@ function saveDiagnostic(id, diag) {
   const key = diagKey(id);
   if (!key) return;
   let previous = {};
-  try { previous = JSON.parse(localStorage.getItem(key)) || {}; }
+  try { previous = eventStorageParse(localStorage.getItem(key)) || {}; }
   catch (error) { eventStorageError(id,error); }
   const value = {...previous,...diag,time:Date.now()};
   for (const field of ['lastObservedURL','lastSourceURL']) {
@@ -212,7 +214,7 @@ function loadDiagnostic(id = chatIdFromURL()) {
   if (!k) return null;
 
   try {
-    return JSON.parse(localStorage.getItem(k));
+    return eventStorageParse(localStorage.getItem(k));
   } catch {
     return null;
   }
@@ -3335,7 +3337,7 @@ function loadLifecycle(id = chatIdFromURL()) {
   if (!k) return blankLifecycle();
 
   try {
-    const x = JSON.parse(localStorage.getItem(k));
+    const x = eventStorageParse(localStorage.getItem(k));
 
     if (!x || typeof x !== 'object') {
       return blankLifecycle();
@@ -3767,25 +3769,116 @@ function eventStorageError(id, error) {
   storageHealth.set(id,health);
 }
 
+// Lossless storage codec: intern field names and repeated nested observations.
+// Logical in-memory/exported schemas stay unchanged; old plain JSON still loads.
+function eventStorageText(data) {
+  const plain = JSON.stringify(data), keys = [], keyMap = new Map(), values = [], seen = new Map();
+  function encode(value) {
+    if (!value || typeof value !== 'object') return value;
+    const signature = JSON.stringify(value);
+    if (signature.length >= 160 && seen.has(signature)) return [2,seen.get(signature)];
+    let node;
+    if (Array.isArray(value)) node = [1,...value.map(encode)];
+    else {
+      node = [0];
+      for (const [key,item] of Object.entries(value)) {
+        if (item === undefined) continue;
+        if (!keyMap.has(key)) { keyMap.set(key,keys.length); keys.push(key); }
+        node.push(keyMap.get(key),encode(item));
+      }
+    }
+    if (signature.length >= 160) {
+      const index = values.length; values.push(node); seen.set(signature,index);
+      return [2,index];
+    }
+    return node;
+  }
+  const root = encode(data);
+  const packed = JSON.stringify({encoding:'v223-key-table-1',keys,values,root});
+  return packed.length < plain.length ? packed : plain;
+}
+
+// A second, lossless compression tier is reserved for quota pressure. No attempt,
+// episode, source metric or trace row is removed to make the retry fit.
+function eventStorageRetryText(text) {
+  const bytes = new TextEncoder().encode(text), dict = new Map(), codes = [];
+  let next = 256, word = '';
+  for (const byte of bytes) {
+    const char = String.fromCharCode(byte), joined = word+char;
+    if (word === '' || dict.has(joined)) { word = joined; continue; }
+    codes.push(word.length === 1 ? word.charCodeAt(0) : dict.get(word));
+    if (next < 65536) dict.set(joined,next++);
+    word = char;
+  }
+  if (word) codes.push(word.length === 1 ? word.charCodeAt(0) : dict.get(word));
+  let binary = '';
+  for (const code of codes) binary += String.fromCharCode(code >> 8,code & 255);
+  const compressed = JSON.stringify({encoding:'v223-lzw-1',data:btoa(binary)});
+  return compressed.length < text.length ? compressed : text;
+}
+
+function eventStorageParse(text) {
+  let data = JSON.parse(text);
+  if (data?.encoding === 'v223-lzw-1') {
+    const binary = atob(data.data), dict = [], output = [];
+    let next = 256, previous = '';
+    for (let i=0;i<256;i++) dict[i] = String.fromCharCode(i);
+    for (let i=0;i<binary.length;i+=2) {
+      const code = (binary.charCodeAt(i)<<8) | binary.charCodeAt(i+1);
+      const word = dict[code] ?? (code === next && previous ? previous+previous[0] : null);
+      if (word == null) throw new Error('Invalid compact storage code');
+      output.push(word);
+      if (previous && next < 65536) dict[next++] = previous+word[0];
+      previous = word;
+    }
+    const bytes = Uint8Array.from(output.join(''),c=>c.charCodeAt(0));
+    data = JSON.parse(new TextDecoder().decode(bytes));
+  }
+  if (data?.encoding !== 'v223-key-table-1') return data;
+  function decode(node) {
+    if (!Array.isArray(node)) return node;
+    if (node[0] === 2) return decode(data.values[node[1]]);
+    if (node[0] === 1) return node.slice(1).map(decode);
+    const object = {};
+    for (let i=1;i<node.length;i+=2) object[data.keys[node[i]]] = decode(node[i+1]);
+    return object;
+  }
+  return decode(data.root);
+}
+
 function eventSave(id, key, data) {
   const health = storageHealth.get(id) || {};
-  try {
-    const text = JSON.stringify(data);
-    // Health is independent of the saved trace, so a quota failure cannot hide it.
-    health.serializedBytesByKey = {...health.serializedBytesByKey,[key]:new TextEncoder().encode(text).length};
+  storageHealth.set(id,health);
+  function save(text, retry) {
+    const bytes = new TextEncoder().encode(text).length;
+    health.serializedBytesByKey = {...health.serializedBytesByKey,[key]:bytes};
     health.serializedBytes = Object.values(health.serializedBytesByKey).reduce((a,b)=>a+b,0);
     localStorage.setItem(key,text);
     health.lastSaveSuccessful = true;
     health.lastSavedAt = Date.now();
-    storageHealth.set(id,health);
-  } catch (error) { storageHealth.set(id,health); eventStorageError(id,error); }
+    if (retry) { health.compactRetryRecoveredAt = Date.now(); health.compactRetryBytes = bytes; }
+  }
+  let text;
+  try { text = eventStorageText(data); save(text,false); }
+  catch (error) {
+    eventStorageError(id,error);
+    health.failedSaveCount = (health.failedSaveCount || 0)+1;
+    health.lastFailedSaveAt = Date.now();
+    if (!text) return;
+    try {
+      const compact = eventStorageRetryText(text);
+      if (compact.length >= text.length) return;
+      health.compactRetryCount = (health.compactRetryCount || 0)+1;
+      save(compact,true);
+    } catch (retryError) { eventStorageError(id,retryError); }
+  }
 }
 
 function eventEpisodes(id) {
   if (!id) return {nextId:1,episodes:[],activeId:null};
   if (!episodeCache.has(id)) {
     let data = null;
-    try { data = JSON.parse(localStorage.getItem(`${P}:max-episodes-v223:${id}`)); }
+    try { data = eventStorageParse(localStorage.getItem(`${P}:max-episodes-v223:${id}`)); }
     catch (error) { eventStorageError(id,error); }
     episodeCache.set(id,{nextId:1,episodes:[],activeId:null,...(data || {})});
   }
@@ -3829,6 +3922,7 @@ function eventPollMax(id) {
   if (id !== chatIdFromURL()) return;
   const detection = detectMaxBanner(), e = eventActiveEpisode(id);
   if (detection) {
+    if (pendingComposerEnter?.event.defaultPrevented && !pendingComposerEnter.bannerBefore) confirmComposerEnter('handled Enter followed by native MAX');
     attemptMarkMax(id,'UI MAX banner');
   } else if (e?.bannerEverVisible) {
     e.active = false; e.bannerClearedAt = Date.now();
@@ -3907,14 +4001,40 @@ function eventCapture(id, obs, binding) {
   eventSaveEpisodes(id);
 }
 
-function recordSendIntent(kind) {
-  const id = chatIdFromURL();
-  if (!id) return;
-  const store = loadAttemptState(id), now = Date.now();
-  if (store.sendIntents.at(-1)?.sendIntentAt > now-300) return;
-  const composer = document.querySelector('#prompt-textarea, textarea[data-testid="prompt-textarea"]');
-  const intent = {sendIntentAt:now,conversationId:id,kind,
-    composerChars:composer ? String(composer.value ?? composer.innerText ?? '').length : null,
+function sendComposer(target) {
+  const editable = target?.closest?.('textarea, [contenteditable="true"], [role="textbox"]');
+  if (!editable || editable.closest(`[data-message-author-role], article, #${P}`)) return null;
+  const form = editable.closest('form');
+  if (!form || editable.isConnected === false || editable.disabled || editable.getAttribute('aria-disabled') === 'true') return null;
+  const rect = editable.getBoundingClientRect(), style = getComputedStyle(editable);
+  if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || editable.closest('[hidden], [aria-hidden="true"]')) return null;
+  // A visible composer form on the conversation page, not a search/login field.
+  const label = [editable.getAttribute('aria-label'),editable.getAttribute('placeholder'),
+    editable.getAttribute('data-placeholder'),editable.id,form.getAttribute('data-type')].join(' ');
+  if (!/ask|prompt|message|chat|composer/i.test(label) || /search|find|login|sign.in/i.test(label) || form.getAttribute('role') === 'search') return null;
+  return {editable,form};
+}
+
+function sendFormComposer(form) {
+  for (const editable of form?.querySelectorAll?.('textarea, [contenteditable="true"], [role="textbox"]') || []) {
+    const composer = sendComposer(editable);
+    if (composer && composer.form === form) return composer;
+  }
+  return null;
+}
+
+function sendComposerChars(editable) {
+  try { return String(editable.value ?? editable.innerText ?? editable.textContent ?? '').length; }
+  catch { return null; }
+}
+
+function recordSendIntent(kind, observation = {}) {
+  const id = observation.conversationId || chatIdFromURL();
+  if (!id || id !== chatIdFromURL()) return null;
+  const store = loadAttemptState(id), now = observation.time ?? Date.now();
+  const method = /enter/i.test(kind) ? 'enter' : /button/i.test(kind) ? 'button' : kind;
+  const intent = {sendIntentAt:now,conversationId:id,kind:method,submissionMethod:method,
+    composerChars:observation.chars ?? null,confirmedBy:observation.confirmedBy || 'observed submit control',
     dispatchAt:null,attemptId:null,blockedBeforeDispatch:false};
   store.sendIntents.push(intent); saveAttemptState(id,store);
   setTimeout(() => {
@@ -3928,19 +4048,71 @@ function recordSendIntent(kind) {
     e.blockedBeforeDispatch = true; e.sendIntentAt = intent.sendIntentAt;
     intent.blockedBeforeDispatch = true; intent.maxEpisodeId = e.id;
     eventSaveEpisodes(id); saveAttemptState(id,store); scheduleUpdate();
-  },2500);
+  },Math.max(0,now+2500-Date.now()));
+  return intent;
+}
+
+function confirmComposerEnter(reason, form = null) {
+  const candidate = pendingComposerEnter;
+  if (!candidate || (form && candidate.form !== form)) return null;
+  pendingComposerEnter = null;
+  if (candidate.conversationId !== chatIdFromURL() || Date.now()-candidate.time > 5000) return null;
+  const intent = recordSendIntent('enter',{...candidate,confirmedBy:reason});
+  lastComposerSubmission = {form:candidate.form,time:candidate.time,intent};
+  return intent;
 }
 
 function installSendIntentHook() {
   if (sendIntentHooked) return;
   sendIntentHooked = true;
-  document.addEventListener('click', ev => {
-    const target = ev.target?.closest?.('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]');
-    if (target && !target.closest(`#${P}`)) recordSendIntent('send button');
+  // Window capture runs before React/document bubble handlers can stop propagation.
+  const surface = page.addEventListener ? page : document;
+  surface.addEventListener('click', ev => {
+    const target = (ev.composedPath?.()[0] || ev.target)?.closest?.('button, [role="button"], input[type="submit"]');
+    if (!target || target.disabled || target.getAttribute('aria-disabled') === 'true' || target.closest(`#${P}`)) return;
+    const form = target.form || target.closest('form'), composer = sendFormComposer(form);
+    if (!composer) return;
+    const label = [target.getAttribute('aria-label'),target.getAttribute('data-testid'),target.getAttribute('title')].join(' ');
+    const submit = target.type === 'submit' || /^(?:send|submit)(?:\b|-)/i.test(label.trim());
+    if (!submit || /stop|voice|dictat/i.test(label)) return;
+    if (pendingComposerEnter?.form === form) { confirmComposerEnter('submit control activation',form); return; }
+    // Implicit keyboard activation can follow the key's dispatch/submit callback.
+    if (ev.detail === 0 && lastComposerSubmission?.form === form && lastComposerSubmission.intent?.submissionMethod === 'enter' && Date.now()-lastComposerSubmission.time < 500) return;
+    const intent = recordSendIntent('button',{chars:sendComposerChars(composer.editable)});
+    lastComposerSubmission = {form,time:Date.now(),intent};
   },true);
-  document.addEventListener('keydown', ev => {
-    if (ev.key !== 'Enter' || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey || ev.isComposing || ev.repeat) return;
-    if (ev.target?.closest?.('#prompt-textarea, textarea[data-testid="prompt-textarea"]')) recordSendIntent('composer Enter');
+  surface.addEventListener('submit', ev => {
+    const form = ev.target, composer = sendFormComposer(form);
+    if (!composer) return;
+    if (pendingComposerEnter?.form === form) { confirmComposerEnter('composer form submit',form); return; }
+    if (lastComposerSubmission?.form === form && Date.now()-lastComposerSubmission.time < 500) return;
+    const intent = recordSendIntent('form',{chars:sendComposerChars(composer.editable),confirmedBy:'composer form submit'});
+    lastComposerSubmission = {form,time:Date.now(),intent};
+  },true);
+  surface.addEventListener('keydown', ev => {
+    pendingComposerEnter = null;
+    if (ev.key !== 'Enter' || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey || ev.isComposing || ev.keyCode === 229 || ev.repeat) return;
+    const composer = sendComposer(ev.composedPath?.()[0] || ev.target);
+    if (!composer) return;
+    const candidate = {...composer,time:Date.now(),conversationId:chatIdFromURL(),
+      chars:sendComposerChars(composer.editable),event:ev,bannerBefore:!!detectMaxBanner()};
+    pendingComposerEnter = candidate;
+    // Plain Enter is provisional: only actual submit/dispatch or a newly visible
+    // native MAX after the app handled Enter proves submission. Newline cancels it.
+    setTimeout(() => {
+      if (pendingComposerEnter !== candidate) return;
+      if (candidate.event.defaultPrevented && !candidate.bannerBefore && detectMaxBanner()) confirmComposerEnter('handled Enter followed by native MAX');
+      else pendingComposerEnter = null;
+    },5000);
+  },true);
+  surface.addEventListener('beforeinput', ev => {
+    if (/insertParagraph|insertLineBreak/.test(ev.inputType || '') && sendComposer(ev.target)?.form === pendingComposerEnter?.form) pendingComposerEnter = null;
+  },true);
+  surface.addEventListener('input', ev => {
+    // Covers browsers that omit beforeinput for a literal newline insertion.
+    if (ev.data?.includes('\n') && sendComposer(ev.target)?.form === pendingComposerEnter?.form) pendingComposerEnter = null;
+    const candidate = pendingComposerEnter;
+    if (candidate?.event.defaultPrevented && candidate.chars > 0 && sendComposer(ev.target)?.form === candidate.form && sendComposerChars(candidate.editable) === 0) confirmComposerEnter('handled Enter cleared composer');
   },true);
 }
 
@@ -4035,7 +4207,7 @@ function loadAttemptState(id = chatIdFromURL()) {
   if (!id) return blankAttemptState();
   if (!attemptCache.has(id)) {
     let x = null;
-    try { x = JSON.parse(localStorage.getItem(attemptKey(id))); }
+    try { x = eventStorageParse(localStorage.getItem(attemptKey(id))); }
     catch (error) { eventStorageError(id, error); }
     const store = {...blankAttemptState(), ...(x || {})};
     attemptCache.set(id, store);
@@ -4070,6 +4242,7 @@ function saveAttemptState(id, x) {
   for (const a of [x.current, x.last, ...x.attempts].filter(Boolean)) {
     a.networkEvents = (a.networkEvents || []).slice(-60);
     a.transportEvents = (a.transportEvents || []).slice(-60);
+    if (a.streamStats) a.streamStats.recentEvents = (a.streamStats.recentEvents || []).slice(-40);
   }
   attemptCache.set(id, x);
   eventSave(id, attemptKey(id), x);
@@ -6299,6 +6472,7 @@ function attemptApplyRequestMeta(id, meta) {
 
 function attemptStartFromNetwork(id, meta) {
   if (!id) return null;
+  if (id === chatIdFromURL()) confirmComposerEnter('generation dispatch');
   const previous = loadAttemptState(id).current;
   if (previous) attemptFinalizeUnknownCurrent(id, 'superseded by newer real dispatch');
   attemptStart(id, 'network-generation-dispatch');
@@ -6313,6 +6487,8 @@ function attemptStartFromNetwork(id, meta) {
     intent.dispatchAt = Date.now(); intent.attemptId = a.id;
     a.sendIntentAt = intent.sendIntentAt;
     a.sendIntentToDispatchMs = intent.dispatchAt-intent.sendIntentAt;
+    intent.intentToDispatchMs = a.sendIntentToDispatchMs;
+    a.submissionMethod = intent.submissionMethod;
     if (intent.blockedBeforeDispatch) {
       intent.initialBlockedObservationAt = intent.sendIntentAt + 2500;
       intent.blockedBeforeDispatch = false;
@@ -6638,6 +6814,7 @@ function installNetworkHooks() {
 }
 
 installNetworkHooks();
+installSendIntentHook();
 
 
 // ============================================================

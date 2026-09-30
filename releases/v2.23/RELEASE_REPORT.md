@@ -1,3 +1,157 @@
+# V2.23.1 candidate — Native validation fixes
+
+Prepared 2026-09-30 on `codex/v223-native-validation-fixes`, directly from
+`ab2b19bfec736dc03cbdd2d1ad3c363bfe87b67a`. The original checkpoint remains
+unchanged on `codex/v223-event-model-cleanup`. The new candidate is the child
+commit containing this report. No merge to main, V2.24 work, push or PR.
+
+The two new native diagnostic files were absent from this checkout; the user's
+reported failures supplied the regression requirements. A read-only live DOM
+inspection found a DIV with `contenteditable="true"`, `role="textbox"`, and
+`aria-label="Ask ChatGPT"` inside a form, without the old composer ID/test ID.
+The empty composer showed file/model/dictation/voice controls, so active Send
+markup was not established. No candidate browser runtime validation was performed.
+
+## Repair and storage audit
+
+The old observer used obsolete composer selectors, narrow Send selectors and
+late UI boot. Observation now uses window capture at document-start, semantic
+visible composer/form detection and semantic submit controls, including nested
+SVG click targets. Disabled/voice/Stop/meter controls, turns and search fields
+are excluded. No handler prevents submission or changes the composer.
+
+Enter remains provisional until form submission, submit-control activation,
+classified generation dispatch, handled Enter that clears the composer, or
+handled Enter followed by a newly visible native MAX. Newline input cancels it;
+modifiers, repeats and IME/keyCode 229 do not stage it. Provisional keys expire
+after five seconds and cannot attach across navigation. Submit/click callbacks
+share one intent. Intent fields include original timestamp, conversation ID,
+safe text length, explicit method, confirmation evidence, dispatch/attempt ID
+and latency. Existing 2.5-second blocked classification, unresolved-POST gating
+and correction after late dispatch remain intact.
+
+Plain JSON duplicated `last` with the latest attempt and repeated pre/first/peak/
+last/post source observations and event field names. Array bounds alone did not
+make the serialized store small. Lossless field-name and nested-value interning
+now stores these once. On failure, a smaller lossless LZW/base64 encoding is
+tried once where useful. The error/failure count stay visible after recovery;
+recovery adds timestamp/bytes/count. Unrecovered failure remains
+`lastSaveSuccessful:false`, with tracking continuing in memory. No retained
+attempt, episode, metric or trace row is discarded by compaction or retry.
+
+Bounds: ten full attempts/episodes/preflights; twenty intents/unclassified POSTs;
+forty app/meter/unowned-WebSocket rows; sixty per-attempt network/transport rows;
+forty recent SSE events; thirty episode capture rows. The SSE-event bound is
+also enforced at save time. Raw bodies/stream text, composer text, auth tokens
+and WebSocket previews are not added. Matching readers cover attempt, episode,
+lifecycle, snapshot and diagnostic keys; old plain JSON still loads and copied
+diagnostics retain their logical schema.
+
+Identical synthetic logical states, using real constructors, DIRECT/BATCH scalar
+metrics, repeated snapshot slots, sixty network/transport rows per attempt and
+forty app/meter/unowned-WebSocket rows. Original means the checkpoint's plain JSON
+format; these are not measurements of the unavailable native files.
+
+| Fixture | Original bytes | Compact bytes | Quota retry bytes |
+| --- | ---: | ---: | ---: |
+| One completed attempt with bounded traces | 60,295 | 25,466 | 11,243 |
+| Ten completed attempts with bounded traces | 259,873 | 37,807 | 17,691 |
+
+The ten-attempt store is 85.5% smaller normally and 93.2% smaller on retry.
+Other ChatGPT, conversation and historical meter allocations share origin quota;
+they were neither measured nor cleared. No headroom guarantee is claimed.
+
+## Current verification and artifacts
+
+- **54/54 synthetic tests PASS**: all existing 45 cases plus nine cases covering
+  native-style button/tap/Enter paths, duplicate callbacks, newline/modifier/IME/
+  search exclusions, blocked MAX, clear/navigation, lossless sizes/roundtrip,
+  quota pressure and reload through production readers.
+- Quota tests prove every history bound, deep equality of all retained fields,
+  attempt/MAX identity/outcome and DIRECT/BATCH metrics, visible failure,
+  recovered retry, and unrecovered failure without losing memory evidence.
+- Candidate/harness `node --check`, baseline verifier and baseline syntax: PASS.
+- All four protected regions: **66,862 bytes identical** (64,982 extraction/
+  topology/profiler; 1,190 merge; 282 inspectJSON; 408 inspectRequestBody).
+  Baseline is **289,994 bytes**, SHA-256
+  `08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696`.
+- Release JS is LF-only; two ZIP builds are byte-identical. One member, with
+  exact release JS bytes. Complete output: `VALIDATION.txt`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `chatgpt_chat_size_meter_v223_event_model_cleanup.js` | 281660 | `5040718bbd964b33a80b33757c64cdfb0697962fe537bd36f6130c38458134f5` |
+| `chatgpt_chat_size_meter_v223_event_model_cleanup.zip` | 62182 | `26ee7bc9a7cf8d548e7303ffc9b21f5e45d9e45bf25104ee768d7d5f81ca827d` |
+
+Changed files: release JS, ZIP, `SHA256SUMS`, `VALIDATION.txt`, this report and
+`scripts/test-v223.js`. No baseline/protected parser, UI layout, spec, package
+script or line-ending policy changes.
+
+## Exact next native browser retest
+
+1. Replace the existing meter entry with **2.23.1** from this ZIP and run only
+   one meter. Preserve storage. Open an established healthy `/c/<id>` test chat,
+   hard reload, and copy diagnostics before sending. Record version, timestamp,
+   chat label/ID, attempt/intent counts and storage health. Enable Network Preserve
+   log locally; do not export secrets.
+2. **A, button:** enter exactly `Reply with one short sentence.` (30 characters),
+   click the real Send arrow once, wait for SUCCESS/stream closure, then copy
+   before another send. Expect exactly one new `button` intent and one generation
+   `/backend-api/f/conversation` attempt. Verify original timestamp/length/chat,
+   `dispatchAt`, matching `attemptId`, nonnegative `intentToDispatchMs` equal to
+   attempt `sendIntentToDispatchMs`, no duplicate, and successful storage health.
+3. **B, Enter:** use the same prompt and plain Enter once. Wait/copy separately.
+   Expect exactly one further `enter` intent and one further attempt, same field
+   checks, no implicit-click/form duplicate. If touch is available, repeat A with
+   one tap as a separately labelled sample.
+4. **Negative keys:** type `line one`, Shift+Enter, `line two`. Confirm a newline,
+   no dispatch and unchanged intent count after over five seconds. Test modifier
+   keys that do nothing/insert newline in this browser, and IME if available.
+   Record actual behavior: a modifier that really submits may produce an explicit
+   form intent. Clear unsent text; verify one plain Enter submission still works.
+5. **Persistence:** complete twelve small sends, alternating button and Enter.
+   Record counts/health after each; await closure and 1.2/3.2-second post-captures.
+   Expect ten retained attempts with IDs/outcomes/timing/source metrics and bounded
+   traces. Copy, reload, copy again; evidence must survive. If retry occurs, retain
+   error/failure count and recovery timestamp/bytes. Do not clear storage to hide a
+   failure. Preserve any unrecovered error and locally inspect origin occupancy
+   without copying other app contents/tokens.
+6. **Blocked MAX:** open the established MAX-prone chat and copy before sending.
+   Prefer a banner-cleared start. Send one ordinary small prompt by button, wait
+   at least three seconds and copy before Retry. No dispatch plus native MAX after
+   intent must mean blocked-before-dispatch with an episode ID and no fake attempt.
+   A classified dispatch means a real attempt; unknown POST means correlation
+   incomplete. If possible repeat with Enter from a banner-cleared start, keeping
+   separate samples. An already-visible banner and ignored Enter alone are not
+   submission proof.
+7. Retry Capture once; wait 2–3 seconds and copy. Verify unchanged episode identity,
+   fresh DIRECT and separate meter traffic. BATCH must arrive naturally or remain
+   pending. Expand/collapse through updates: no flooded attempts/episodes. Reload
+   and verify episode IDs/linkage/blocked evidence survive. Banner clearance alone
+   is not confirmed recovery; a later real SUCCESS is required.
+8. Retain prior transport checks: a longer healthy response quoting
+   `You've reached the maximum length for this conversation` must stay SUCCESS
+   without a quote-induced MAX. Navigate immediately after completion to check
+   canceled old capture jobs. Preserve naturally occurring post-completion clone
+   abort evidence as benign SUCCESS; do not manufacture it by stopping generation.
+
+Copy each controlled sample before the next send/upload; ordinary discussion and
+diagnostic-upload turns are separate real attempts, not controlled A/B cases.
+
+Candidate native validation remains open: active Send markup, real React timing,
+blocked Enter, touch/IME, shared-origin quota headroom and compression cost,
+natural BATCH/WebSocket ownership need browser evidence. New-chat routes without
+`/c/<id>` still cannot own event traces. Older builds cannot decode packed storage;
+export diagnostics before rollback and preserve the original checkpoint as
+history. No native MAX or browser quota recovery is claimed from this harness.
+
+---
+
+## Historical original checkpoint report (ab2b19b; not this child build)
+
+The remaining text records the original checkpoint, including its original
+hashes, 45-test count and original manual sequence. Current results are above.
+
 # V2.23 candidate — Event Model Cleanup
 
 Prepared 2026-09-30. Candidate for manual browser validation; not merged to main.
