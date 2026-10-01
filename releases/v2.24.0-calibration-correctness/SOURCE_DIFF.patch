@@ -1,0 +1,202 @@
+diff --git a/releases/v2.24.0/chatgpt_chat_size_meter_v224_empirical_pressure.js "b/releases\\v2.24.0-calibration-correctness\\chatgpt_chat_size_meter_v2240_calibration_correctness.js"
+index 486988e..a3c3100 100644
+--- a/releases/v2.24.0/chatgpt_chat_size_meter_v224_empirical_pressure.js
++++ "b/releases\\v2.24.0-calibration-correctness\\chatgpt_chat_size_meter_v2240_calibration_correctness.js"
+@@ -1,5 +1,5 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24 EMPIRICAL PRESSURE
++// @name         ChatGPT Conversation Size Meter V2.24 CALIBRATION CORRECTNESS
+ // @namespace    local.chatgpt.size.v2101
+ // @version      2.24.0
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+@@ -3784,7 +3784,10 @@ function pressureLabel(value) {
+   return typeof value === 'string' && value.trim() ? value.trim().slice(0,120) : null;
+ }
+ function pressureEffort(value) {
+-  return pressureLabel(value)?.toLowerCase().replace(/\s+/g,' ') || null;
++  const effort=pressureLabel(value)?.toLowerCase().replace(/\s+/g,' ') || null;
++  // Demonstrated UI/backend alias: Extra High / requestEffort=max. No guesses
++  // for Thinking, xhigh, or other labels without paired repository evidence.
++  return effort==='extra high' ? 'max' : effort;
+ }
+ function pressureVector(obs, role, before = Infinity, after = 0) {
+   if (!obs || !['direct','batch'].includes(obs.sourceFamily)) return null;
+@@ -3802,7 +3805,7 @@ function pressureBest(vectors) {
+ function pressureOrder(a,b) {
+   return a.timestamp-b.timestamp || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+ }
+-function pressureCleanRow(row) {
++function pressureCleanRow(row, preserveEffort = false) {
+   if (!row || !['success','max'].includes(row.outcome) || !pressureLabel(row.conversationId) ||
+       !Number.isSafeInteger(row.eventId) || row.eventId < 1 || !(pressureNumber(row.timestamp)>0)) return null;
+   const conversationId = pressureLabel(row.conversationId), outcome = row.outcome;
+@@ -3814,12 +3817,13 @@ function pressureCleanRow(row) {
+   if (!canonical || outcome === 'success' && canonical.snapshotRole !== 'pre-dispatch') return null;
+   return {key:JSON.stringify([conversationId,outcome,row.eventId]),conversationId,eventId:row.eventId,outcome,
+     timestamp:row.timestamp,attemptId:Number.isSafeInteger(row.attemptId)?row.attemptId:null,
+-    episodeId:outcome==='max'?row.eventId:null,model:pressureLabel(row.model),effort:pressureEffort(row.effort),
++    episodeId:outcome==='max'?row.eventId:null,model:pressureLabel(row.model),
++    effort:preserveEffort ? (typeof row.effort==='string' ? row.effort.slice(0,120) : null) : pressureEffort(row.effort),
+     identitySource:pressureLabel(row.identitySource),confirmationSource:pressureLabel(row.confirmationSource),
+     provenance:row.provenance==='v223-migration'?'v223-migration':'v224-observed',canonical,postMax};
+ }
+ function pressureBlank() {
+-  return {schemaVersion:1,modelVersion:'v224-display-ratio-1',samples:[],watermark:null,
++  return {schemaVersion:1,modelVersion:'v224-display-ratio-2',samples:[],watermark:null,
+     retentionCount:0,migration:{done:false,examinedKeys:0,skippedKeys:0,admittedEvents:0},lastError:null};
+ }
+ function pressureLoad() {
+@@ -3833,7 +3837,7 @@ function pressureLoad() {
+     if (data?.schemaVersion !== 1 || !Array.isArray(data.samples) || data.samples.length > PRESSURE_CAP)
+       throw Error('Unsupported pressure schema');
+     const unique = new Map();
+-    for (const raw of data.samples) {const row=pressureCleanRow(raw);if(row)unique.set(row.key,row);}
++    for (const raw of data.samples) {const row=pressureCleanRow(raw,true);if(row)unique.set(row.key,row);}
+     pressureStore.samples = [...unique.values()].sort(pressureOrder);
+     if (pressureNumber(data.watermark?.timestamp)>0 && typeof data.watermark.key==='string')
+       pressureStore.watermark = {timestamp:data.watermark.timestamp,key:data.watermark.key.slice(0,400)};
+@@ -3950,15 +3954,66 @@ function pressureCurrent(id) {
+   const effort=hint || (model===a?.requestModel ? pressureEffort(a?.requestEffort) : null);
+   return {model,effort,identitySource:hint?'snapshot/request model + UI effort hint':'snapshot/request model + last matching request effort',canonical};
+ }
++function pressureEffectiveMax(rows) {
++  const settings=new Map();
++  for(const row of rows) {
++    if(row.outcome!=='max' || !pressureLabel(row.conversationId) || !(row.canonical?.displayLikeTokens>0))continue;
++    const key=JSON.stringify([row.conversationId,pressureLabel(row.model),pressureEffort(row.effort)]);
++    const group=settings.get(key) || {conversationId:row.conversationId,effort:pressureEffort(row.effort),rows:[]};
++    group.rows.push(row);settings.set(key,group);
++  }
++  const byChat=new Map(),lex=(a,b)=>a<b?-1:a>b?1:0;
++  for(const group of settings.values()) {
++    const pre=group.rows.filter(s=>s.canonical.snapshotRole==='pre-dispatch');
++    // Supporting postMax is never another observation. Fallback canonical state
++    // is eligible only when this setting has no canonical pre-MAX vector.
++    const selected=pre.length ? pre : group.rows;
++    const distinct=new Map();
++    for(const row of selected) {
++      const signature=JSON.stringify([row.canonical.sourceFamily,...PRESSURE_FIELDS.map(k=>row.canonical[k]??null)]);
++      if(!distinct.has(signature) || pressureOrder(row,distinct.get(signature).row)<0)distinct.set(signature,{row,signature});
++    }
++    const states=[...distinct.values()].sort((a,b)=>a.row.canonical.displayLikeTokens-b.row.canonical.displayLikeTokens || lex(a.signature,b.signature));
++    const chat=byChat.get(group.conversationId) || {conversationId:group.conversationId,groups:[]};
++    chat.groups.push({effort:group.effort,rawEpisodes:group.rows.length,distinctPreVectorCount:pre.length?states.length:0,
++      distinctFallbackVectorCount:pre.length?0:states.length,preDisplayLikeRange:pre.length?
++        {min:states[0].row.canonical.displayLikeTokens,max:states.at(-1).row.canonical.displayLikeTokens}:null,
++      representative:states[0].row});
++    byChat.set(group.conversationId,chat);
++  }
++  const observations=[],summary=[];
++  for(const chat of [...byChat.values()].sort((a,b)=>lex(a.conversationId,b.conversationId))) {
++    chat.groups.sort((a,b)=>lex(JSON.stringify(a.effort),JSON.stringify(b.effort)));
++    const pre=chat.groups.filter(g=>g.representative.canonical.snapshotRole==='pre-dispatch');
++    // Even same-model effort pooling cannot give one chat multiple statistical
++    // votes. Preserve setting/state variation in the compact summary instead.
++    const group=(pre.length?pre:chat.groups).slice().sort((a,b)=>
++      a.representative.canonical.displayLikeTokens-b.representative.canonical.displayLikeTokens ||
++      lex(JSON.stringify(a.effort),JSON.stringify(b.effort)))[0];
++    observations.push(group.representative);
++    summary.push({conversationId:chat.conversationId,canonicalEfforts:chat.groups.slice(0,8).map(g=>g.effort),
++      settingGroupCount:chat.groups.length,settingGroupsOmittedCount:Math.max(0,chat.groups.length-8),
++      rawMaxEpisodeCount:chat.groups.reduce((n,g)=>n+g.rawEpisodes,0),
++      distinctPreVectorCount:chat.groups.reduce((n,g)=>n+g.distinctPreVectorCount,0),
++      selectedCanonicalEffort:group.effort,selectedRole:group.representative.canonical.snapshotRole,
++      selectedSourceFamily:group.representative.canonical.sourceFamily,anchorContribution:group.representative.canonical.displayLikeTokens,
++      settings:chat.groups.slice(0,8).map(g=>({canonicalEffort:g.effort,rawEpisodes:g.rawEpisodes,
++        distinctPreVectorCount:g.distinctPreVectorCount,distinctFallbackVectorCount:g.distinctFallbackVectorCount,
++        preDisplayLikeRange:g.preDisplayLikeRange}))});
++  }
++  return {observations,summary};
++}
+ function pressureCompute(samples, current, activeMax = false) {
+-  const vector=current?.canonical,model=current?.model,effort=current?.effort;
+-  const same=samples.filter(s=>s.model===model && s.canonical?.displayLikeTokens>0);
+-  const exact=effort ? same.filter(s=>s.effort===effort) : [];
+-  const maxCount=rows=>rows.filter(s=>s.outcome==='max').length;
+-  // One exact MAX gives a transparent low-confidence anchor; >=2 are preferred.
++  const vector=current?.canonical,model=pressureLabel(current?.model),effort=pressureEffort(current?.effort);
++  const same=samples.filter(s=>pressureLabel(s.model)===model && s.canonical?.displayLikeTokens>0);
++  const exact=effort ? same.filter(s=>pressureEffort(s.effort)===effort) : [];
++  const maxCount=rows=>pressureEffectiveMax(rows).observations.length;
++  // Exact tier selection also uses independent conversations, never retries.
+   const useExact=effort && (maxCount(exact)>=2 || maxCount(same)<2 && maxCount(exact)>0);
+   const rows=useExact?exact:same,tier=!model || !maxCount(rows)?'insufficient':useExact?'exact-model-effort':'same-model';
+-  const maxima=rows.filter(s=>s.outcome==='max'),successes=rows.filter(s=>s.outcome==='success');
++  const rawMaxima=rows.filter(s=>s.outcome==='max'),successes=rows.filter(s=>s.outcome==='success');
++  const effective=pressureEffectiveMax(rows),maxima=effective.observations;
++  const successConversations=new Set(successes.map(s=>s.conversationId));
+   const values=maxima.map(s=>s.canonical.displayLikeTokens).sort((a,b)=>a-b),n=values.length;
+   // n<=4: minimum. n>=5: nearest-rank lower quartile (ceil(.25*n)-1).
+   const anchor=n ? values[n<5?0:Math.ceil(n*.25)-1] : null;
+@@ -3970,29 +4025,35 @@ function pressureCompute(samples, current, activeMax = false) {
+     const xs=maxima.map(s=>s.canonical[field]).filter(x=>pressureNumber(x)!=null);
+     secondary[field]={current:vector?.[field]??null,min:xs.length?Math.min(...xs):null,max:xs.length?Math.max(...xs):null};
+   }
+-  let confidence='low',confidenceReason='Fewer than 2 comparable MAX events';
++  let confidence='low',confidenceReason='Fewer than 2 independent comparable MAX conversations';
+   if(n>=2) {
+     confidenceReason='MAX spread exceeds 10%, fallback/source mismatch, or effort pooled';
+     if(spread<=.10 && !fallback && !mixedSource && tier==='exact-model-effort') {
+-      confidence='medium';confidenceReason='At least 2 exact model/effort pre-MAX events; spread <=10%';
+-      if(n>=5 && successes.length>=10 && spread<=.05) {
+-        confidence='high';confidenceReason='At least 5 exact pre-MAX and 10 success events; spread <=5%';
++      confidence='medium';confidenceReason='At least 2 independent exact model/effort pre-MAX conversations; spread <=10%';
++      if(n>=5 && successConversations.size>=10 && spread<=.05) {
++        confidence='high';confidenceReason='At least 5 independent exact pre-MAX and 10 success conversations; spread <=5%';
+       }
+     }
+   }
+   const reason=!vector?'No valid current parser vector':!model?'Current model unknown':!anchor?'No comparable empirical MAX anchor':null;
+   const ratio=anchor && vector ? vector.displayLikeTokens/anchor : null;
+-  const contradictorySuccessCount=anchor?successes.filter(s=>s.canonical.displayLikeTokens>=anchor).length:0;
+-  if(contradictorySuccessCount){confidence='low';confidenceReason='Comparable SUCCESS at/above MAX anchor; threshold overlap';}
++  const contradictory=anchor?successes.filter(s=>s.canonical.displayLikeTokens>=anchor):[];
++  const contradictorySuccessCount=contradictory.length,effectiveContradictorySuccessConversationCount=new Set(contradictory.map(s=>s.conversationId)).size;
++  if(effectiveContradictorySuccessConversationCount){confidence='low';confidenceReason='Comparable SUCCESS conversation at/above MAX anchor; threshold overlap';}
+   const currentExceedsAnchorWhileAlive=!activeMax && ratio!=null && ratio>=1;
+   if(currentExceedsAnchorWhileAlive){confidence='low';confidenceReason='Current non-MAX state at/above empirical anchor';}
+-  return {modelVersion:'v224-display-ratio-1',state:activeMax?'current-max':reason?'calibrating':'scored',
++  return {modelVersion:'v224-display-ratio-2',state:activeMax?'current-max':reason?'calibrating':'scored',
+     score:activeMax || reason ? null : Math.max(0,Math.min(99,Math.round(ratio*100))),confidence,confidenceReason,
+     currentSourceVector:vector || null,currentDisplayLikeTokens:vector?.displayLikeTokens??null,
+-    model:model || null,effort:effort || null,comparisonTier:tier,comparableMaxCount:n,comparableSuccessCount:successes.length,
++    model:model || null,effort:effort || null,canonicalEffort:effort || null,comparisonTier:tier,
++    comparableMaxCount:n,comparableSuccessCount:successConversations.size,
++    rawComparableMaxEpisodeCount:rawMaxima.length,effectiveMaxObservationCount:n,uniqueMaxConversationCount:n,
++    rawComparableSuccessCount:successes.length,effectiveSuccessObservationCount:successConversations.size,uniqueSuccessConversationCount:successConversations.size,
++    anchorContributionSummary:effective.summary.slice(0,16),anchorContributionSummaryOmittedCount:Math.max(0,effective.summary.length-16),
+     empiricalMaxAnchor:anchor,anchorRange:range,anchorSpread:spread,anchorRule:'min for 1-4; nearest-rank lower quartile for >=5',
+     ratioBeforeClamping:ratio,secondaryMetricComparison:secondary,currentExceedsAnchorWhileAlive,
+-    contradictorySuccessCount,postMaxFallbackPresent:fallback,sourceFamilyMismatch:mixedSource,unscoredReason:activeMax?null:reason};
++    contradictorySuccessCount,rawContradictorySuccessCount:contradictorySuccessCount,effectiveContradictorySuccessConversationCount,
++    postMaxFallbackPresent:fallback,sourceFamilyMismatch:mixedSource,unscoredReason:activeMax?null:reason};
+ }
+ function pressureResult(id) {
+   const current=pressureCurrent(id),active=!!eventActiveEpisode(id),key=JSON.stringify([pressureRevision,current,active]);
+@@ -4003,7 +4064,7 @@ function pressureResult(id) {
+ }
+ function pressureSummary() {
+   const store=pressureLoad(),rows=store.samples,groups=Object.create(null);
+-  for(const row of rows){const key=JSON.stringify([row.model,row.effort]);const g=groups[key] ||= {success:0,max:0};g[row.outcome]++;}
++  for(const row of rows){const key=JSON.stringify([pressureLabel(row.model),pressureEffort(row.effort)]);const g=groups[key] ||= {success:0,max:0};g[row.outcome]++;}
+   return {schemaVersion:1,totalSamples:rows.length,totalVectors:rows.reduce((n,s)=>n+!!s.canonical+!!s.postMax,0),
+     successSamples:rows.filter(s=>s.outcome==='success').length,uniqueMaxEvents:rows.filter(s=>s.outcome==='max').length,
+     pendingMaxVectors:rows.filter(s=>s.outcome==='max' && !s.canonical).length,groupedByModelEffort:groups,
+@@ -4638,7 +4699,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24 EMPIRICAL PRESSURE',
++  return ['ChatGPT Conversation Size Meter V2.24 CALIBRATION CORRECTNESS',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -9311,7 +9372,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24 EMPIRICAL PRESSURE',
++    'Candidate userscript: V2.24 CALIBRATION CORRECTNESS',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
