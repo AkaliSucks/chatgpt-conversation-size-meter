@@ -36,7 +36,7 @@ function environment(candidateSource=source) {
   const page = {fetch:async(...args)=>{fetches.push(args);return state.fetch(...args);},WebSocket:WS,XMLHttpRequest:XHR,
     addEventListener(name,fn,capture){assert.equal(capture,true);(listeners[name] ||= []).push(fn);}};
   const context = {document,location,unsafeWindow:page,window:page,URL,TextEncoder,TextDecoder,ArrayBuffer,
-    Request,Blob,btoa,atob,Date:FakeDate,console,performance:{getEntriesByType:()=>[]},
+    Request,Blob,AbortController,btoa,atob,Date:FakeDate,console,performance:{getEntriesByType:()=>state.resources || []},
     getComputedStyle:el=>({display:el.hidden?'none':'block',visibility:'visible',opacity:'1'}),
     localStorage:{get length(){return storage.size;},key:i=>[...storage.keys()][i] ?? null,getItem:k=>storage.get(k)||null,setItem:(k,v)=>{
       const size=(key,value)=>state.quotaUtf16?2*(key.length+value.length):Buffer.byteLength(value);
@@ -51,7 +51,7 @@ function environment(candidateSource=source) {
   // Test instrumentation stays outside the shipped artifact. Suppress UI boot,
   // retaining and exercising the actual early hook installation.
   const exposed=[...candidateSource.matchAll(/^(?:async )?function (\w+)\(/gm)].map(x=>x[1]);
-  vm.runInContext(candidateSource.replace('\nstartUI();',`\nglobalThis.test = {${exposed.join(',')},storageHealth,setLatest: x => latest=x,setUI: () => {panel={querySelector:()=>({style:{}})};compact={};detail={};},ui:()=>({panel,compact,detail})};`),context);
+  vm.runInContext(candidateSource.replace('\nstartUI();',`\nglobalThis.test = {${exposed.join(',')},storageHealth,setLatest: x => latest=x,setUI: () => {panel={querySelector:()=>({style:{}})};compact={};detail={};},setQuickUI:x=>panel=x,quick:()=>quickActionState,ui:()=>({panel,compact,detail})};`),context);
   document.body = {innerText:'',contains:()=>false};
   const test = context.test;
   function banner(options={}) {
@@ -837,6 +837,218 @@ check('silent storage write loss and externally missing keys cannot produce over
   h.context.localStorage.setItem=save;h.storage.delete(h.test.lifecycleKey('chat-a'));
   h.test.saveAttemptState('chat-a',h.test.loadAttemptState('chat-a'));
   assert.equal(health.finalSaveResult,'saved');assert.equal(health.unsavedKeyCount,0);assert(h.storage.has(h.test.lifecycleKey('chat-a')));
+});
+
+const tinyCapture=JSON.stringify({detail:'no full conversation mapping'}).padEnd(168,' ');
+async function observedCapture(h,url,text,init) {
+  h.state.fetch=async()=>response(text);
+  await h.page.fetch(url,init);await h.flush();
+}
+function activeMax(h) {h.state.banners=[h.banner()];h.test.eventPollMax('chat-a');return h.test.eventActiveEpisode('chat-a');}
+function lastRetry(h) {return h.test.loadDiagnostic('chat-a').lastRetry;}
+function quickSurface(h) {
+  const handlers={},node=(label='')=>({textContent:label,disabled:false,attributes:{},classList:{add(){},remove(){}},setAttribute(k,v){this.attributes[k]=v;},addEventListener(){}});
+  const copy=node('Copy diagnostics'),retry=node('Retry capture'),status=node(),hdr=node();
+  const surface={querySelector(selector){return selector==='[data-action="copy"]'?copy:selector==='[data-action="retry"]'?retry:selector==='[data-quick-status]'?status:hdr;},
+    addEventListener(name,fn){handlers[name]=fn;}};
+  h.test.setQuickUI(surface);return {copy,retry,status,handlers};
+}
+check('Retry audits 168-byte singular failure then accepts an observed plural full mapping for existing episode #2',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversation/chat-a',JSON.stringify(mapping()));
+  await observedCapture(h,'/backend-api/conversations/chat-a',JSON.stringify({conversation_id:'chat-a',title:'metadata'}).padEnd(72000,' '));
+  h.state.banners=[h.banner()];const a=h.start();h.chunk(a,'data: {"type":"error","error":{"code":"conversation_too_long"}}\n\n');
+  h.test.attemptFinishStream('chat-a',dispatchURL,response(),null,a.id);
+  h.state.banners=[];h.test.eventPollMax('chat-a');
+  const b=h.start();h.state.banners=[h.banner()];h.chunk(b,'data: {"type":"error","error":{"code":"conversation_too_long"}}\n\n');
+  h.test.attemptFinishStream('chat-a',dispatchURL,response(),null,b.id);h.test.eventPollMax('chat-a');
+  const e=h.test.eventActiveEpisode('chat-a'),store=h.test.loadAttemptState('chat-a');assert.equal(e.id,2);assert.equal(e.captureHistory.length,0);
+  const requests=h.fetches.length,attemptCount=store.attempts.length,episodes=h.test.eventEpisodes('chat-a').nextId;
+  h.state.fetch=async(input)=>response(new URL(typeof input==='string'?input:input.url,h.context.location.origin).pathname==='/backend-api/conversation/chat-a'?tinyCapture:JSON.stringify(mapping()).padEnd(72123,' '));
+  assert.equal(await h.test.retryCapture(),true);
+  const trace=lastRetry(h);assert.equal(trace.result,'captured');assert.equal(trace.requests.length,2);
+  assert.equal(trace.requests[0].path,'/backend-api/conversation/chat-a');assert.equal(trace.requests[0].responseBytes,168);assert.equal(trace.requests[0].acceptedFull,false);
+  assert.equal(trace.requests[1].path,'/backend-api/conversations/chat-a');assert.equal(trace.requests[1].acceptedFull,true);assert.equal(trace.requests[1].status,200);assert.equal(trace.requests[1].contentType,'application/json');assert.equal(trace.sourceFamily,'direct');
+  assert.equal(h.fetches.length-requests,2);assert.equal(e.captureHistory.length,1);assert.equal(e.direct.episodeId,2);assert.equal(e.direct.payloadBytes,72123);assert.equal(e.batch,null);
+  assert.equal(h.test.eventEpisodes('chat-a').nextId,episodes);assert.equal(store.attempts.length,attemptCount);assert.equal(store.current,null);assert.equal(e.relatedRealAttemptId,b.id);
+  assert.equal(store.meterCaptureNetwork.length,2);assert.equal(store.appStateNetwork.length,2);
+  assert(store.attempts.every(row=>row.networkMaxBytes!==72123));
+  assert(h.test.eventDiagnostics('chat-a').some(line=>line.startsWith('Fresh DIRECT: {') && line.includes('"episodeId":2')));
+});
+check('repeated successful Retry on one active episode appends one capture per accepted response without changing identity',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversations/chat-a',JSON.stringify(mapping()));
+  const e=activeMax(h),store=h.test.loadAttemptState('chat-a'),next=h.test.eventEpisodes('chat-a').nextId;
+  h.state.fetch=async()=>response(JSON.stringify(mapping()));
+  for(let i=1;i<=3;i++){assert.equal(await h.test.retryCapture(),true);assert.equal(e.captureHistory.length,i);assert.equal(lastRetry(h).requests.length,1);assert.equal(e.direct.episodeId,e.id);}
+  assert.equal(h.test.eventActiveEpisode('chat-a'),e);assert.equal(h.test.eventEpisodes('chat-a').nextId,next);assert.equal(store.attempts.length,0);assert.equal(store.nextId,1);assert.equal(store.meterCaptureNetwork.length,3);
+});
+check('72KB metadata is not automatically full; one proven natural POST BATCH form can supply fresh episode state',async()=>{
+  const h=environment(),payload=JSON.stringify({conversations:[mapping()]}),requestBody=JSON.stringify({conversation_ids:['chat-a']});
+  await observedCapture(h,'/backend-api/conversations/chat-a',JSON.stringify({conversation_id:'chat-a',title:'metadata'}).padEnd(72000,' '));
+  await observedCapture(h,'/backend-api/conversations/batch',payload,{method:'POST',body:requestBody,credentials:'include',headers:{Authorization:'Bearer CREDENTIAL_SECRET','Content-Type':'application/json'}});
+  const e=activeMax(h),store=h.test.loadAttemptState('chat-a');assert.equal(e.captureHistory.length,0);
+  const calls=[];h.state.fetch=async(input,init)=>{
+    const url=typeof input==='string'?input:input.url,path=new URL(url,h.context.location.origin).pathname;
+    calls.push(path);
+    if(path==='/backend-api/conversations/batch'){
+      assert.equal(input.method,'POST');assert.equal(await input.clone().text(),requestBody);assert.equal(input.headers.get('Authorization'),'Bearer CREDENTIAL_SECRET');
+      return response(payload.padEnd(20260000,' '));
+    }
+    return response(path==='/backend-api/conversations/chat-a'?JSON.stringify({title:'metadata'}).padEnd(72000,' '):tinyCapture);
+  };
+  assert.equal(await h.test.retryCapture(),true);const trace=lastRetry(h);
+  assert.equal(calls.filter(p=>p.endsWith('/batch')).length,1);assert.equal(trace.requests.length,3);
+  assert.equal(trace.requests[0].acceptedFull,false);assert.equal(trace.requests[1].responseBytes,168);assert.equal(trace.requests[2].method,'POST');
+  assert.equal(trace.sourceFamily,'batch');assert.equal(trace.responseBytes,20260000);assert.equal(e.captureHistory.length,1);assert.equal(e.batch.episodeId,e.id);assert.equal(e.batch.payloadBytes,20260000);assert.equal(e.direct,null);
+  assert.equal(trace.observedRoutes.find(r=>r.path==='/backend-api/conversations/chat-a').parserAcceptedFull,false);
+  assert.equal(trace.observedRoutes.find(r=>r.path==='/backend-api/conversations/batch').parserAcceptedFull,true);
+  assert.equal(store.attempts.length,0);assert.equal(h.test.eventEpisodes('chat-a').episodes.length,1);assert.equal(store.meterCaptureNetwork.length,3);assert.equal(store.appStateNetwork.length,2);
+  assert(![...h.storage.values()].join('\n').includes('CREDENTIAL_SECRET'));assert(![...h.storage.values()].join('\n').includes('conversation_ids'));
+  assert(h.test.eventDiagnostics('chat-a').some(line=>line.startsWith('Fresh BATCH: {') && line.includes('"episodeId":1')));
+  console.log(`ROUTE fixture: metadata 72000 B not full; singular 168 B not full; one observed POST BATCH ${trace.responseBytes} B full; same MAX episode #${e.id}, one capture, zero attempts`);
+});
+check('resource URL alone never invents a BATCH request and background captures never replay large BATCH',async()=>{
+  const h=environment();h.state.resources=[{name:'https://chatgpt.com/backend-api/conversations/batch'}];h.state.fetch=async()=>response(tinyCapture);
+  assert.equal(await h.test.retryCapture(),false);assert(h.fetches.every(([input])=>!String(input?.url || input).includes('/batch')));
+  await observedCapture(h,'/backend-api/conversations/batch',JSON.stringify({conversations:[mapping()]}),{method:'POST',body:'{"conversation_ids":["chat-a"]}'});
+  const before=h.fetches.length;h.state.fetch=async()=>response(tinyCapture);
+  assert.equal(await h.test.retryCapture({chatId:'chat-a',reason:'background capture'}),false);
+  assert(h.fetches.slice(before).every(([input])=>!String(input?.url || input).includes('/batch')));
+});
+check('BATCH that never yielded a parser-valid current-chat mapping is not replayed',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversations/batch',JSON.stringify({conversations:[mapping('other-chat')]}),{method:'POST',body:'{}'});
+  assert.equal(h.test.loadSnapshot('chat-a').full,false);h.state.fetch=async()=>response(tinyCapture);
+  assert.equal(await h.test.retryCapture(),false);assert.equal(lastRetry(h).requests.length,1);assert.equal(lastRetry(h).requests[0].responseBytes,168);
+});
+check('failed Retry cannot reuse an old full snapshot or a concurrent natural app capture as success',async()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',600);const e=activeMax(h);
+  let resolve;h.state.fetch=()=>new Promise(r=>resolve=r);const retry=h.test.retryCapture();await h.flush();
+  h.test.inspectJSON(mapping(),'/backend-api/conversations/chat-a',900);assert.equal(e.captureHistory.length,1);
+  resolve(response(tinyCapture));assert.equal(await retry,false);
+  const trace=lastRetry(h);assert.equal(trace.result,'no fresh mapping');assert.equal(trace.sourceFamily,null);assert.equal(trace.requests[0].acceptedFull,false);assert.equal(e.captureHistory.length,1);
+  assert.equal(h.test.loadSnapshot('chat-a').full,true);assert.equal(h.test.loadAttemptState('chat-a').attempts.length,0);
+});
+check('navigation during Retry body read cancels parser writes and attachment to both chats',async()=>{
+  const h=environment(),e=activeMax(h);let resolve;
+  h.state.fetch=async()=>({status:200,ok:true,headers:{get:()=> 'application/json'},clone:()=>({text:()=>new Promise(r=>resolve=r)})});
+  const retry=h.test.retryCapture();await h.flush();h.navigate('chat-b');resolve(JSON.stringify(mapping()));assert.equal(await retry,false);
+  assert.equal(e.captureHistory.length,0);assert.equal(e.direct,null);assert.equal(h.test.loadSnapshot('chat-a').full,false);assert.equal(h.test.loadSnapshot('chat-b').full,false);
+  assert.equal(h.test.loadAttemptState('chat-b').attempts.length,0);assert.equal(h.test.eventEpisodes('chat-b').episodes.length,0);
+  const trace=h.test.loadDiagnostic('chat-a').lastRetry;assert.equal(trace.result,'cancelled');assert.equal(trace.requests[0].reason,'binding cancelled');
+});
+check('an episode replacement during delayed Retry cannot receive the earlier episode response',async()=>{
+  const h=environment(),old=activeMax(h);let resolve;h.state.fetch=()=>new Promise(r=>resolve=r);
+  const retry=h.test.retryCapture();await h.flush();h.state.banners=[];h.test.eventPollMax('chat-a');const current=activeMax(h);assert.equal(current.id,2);
+  resolve(response(JSON.stringify(mapping())));assert.equal(await retry,false);assert.equal(old.captureHistory.length,0);assert.equal(current.captureHistory.length,0);assert.equal(h.test.loadSnapshot('chat-a').full,false);
+  assert.equal(lastRetry(h).result,'cancelled');assert.equal(h.test.eventEpisodes('chat-a').episodes.length,2);
+});
+check('HTTP error with mapping-shaped body and partial message array both remain failed retries',async()=>{
+  for(const error of [true,false]){
+    const h=environment(),e=activeMax(h);h.state.fetch=async()=>error?response(JSON.stringify(mapping()),403):response(JSON.stringify({messages:[mapping().mapping.u.message]}));
+    assert.equal(await h.test.retryCapture(),false);assert.equal(lastRetry(h).requests[0].acceptedFull,false);assert.equal(lastRetry(h).result,'no fresh mapping');assert.equal(e.captureHistory.length,0);
+    assert.equal(h.test.loadAttemptState('chat-a').attempts.length,0);assert.equal(h.test.eventEpisodes('chat-a').episodes.length,1);
+  }
+});
+check('Retry has a thirty-second total deadline; a late full response cannot be accepted',async()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',500);const sequence=h.test.loadAttemptState('chat-a').captureSequence;
+  let resolve;h.state.fetch=()=>new Promise(r=>resolve=r);const retry=h.test.retryCapture();await h.flush();await h.advance(30001);
+  assert.equal(await retry,false);assert.equal(lastRetry(h).requests[0].reason,'retry deadline exceeded');
+  resolve(response(JSON.stringify(mapping())));await h.flush();assert.equal(h.test.loadAttemptState('chat-a').captureSequence,sequence);assert.equal(lastRetry(h).result,'cancelled');
+  assert.equal(h.test.loadAttemptState('chat-a').meterCaptureNetwork.length,1); // Late completion cannot duplicate the timed-out meter request.
+});
+check('route plan remains bounded, de-duplicates absolute/relative URLs and never invents include_messages',async()=>{
+  const h=environment();for(let i=0;i<15;i++)await observedCapture(h,'/backend-api/conversations/chat-a?observed='+i,JSON.stringify({title:'metadata'}));
+  const plan=h.test.captureRetryRoutes('chat-a',true);assert.equal(plan.length,2);assert(plan.every(r=>r.kind==='direct'));assert(plan.every(r=>!r.url.includes('include_messages')));
+  h.state.resources=[{name:'https://chatgpt.com/backend-api/conversation/chat-a'}];
+  const blank=environment();blank.state.resources=h.state.resources;assert.equal(blank.test.captureRetryRoutes('chat-a',true).length,1);
+  assert.equal(h.test.captureObserveRequest('https://other.example/backend-api/conversations/chat-a','GET',null,{},'chat-a'),null);
+  assert.equal(h.test.captureObserveRequest('/backend-api/conversations/chat-a','POST',null,{body:'{}'},'chat-a'),null);
+  assert.equal(h.test.captureObserveRequest(dispatchURL,'POST',null,{body:body()},'chat-a'),null);
+});
+check('Copy UI reports running/success, survives rerender and restores label without network or storage changes',async()=>{
+  const h=environment();h.test.setLatest(h.test.calculateStats());const ui=quickSurface(h),before=[...h.storage],fetches=h.fetches.length;
+  let resolve;h.context.navigator.clipboard.writeText=()=>new Promise(r=>resolve=r);
+  const copy=h.test.runQuickAction('copy');assert.equal(ui.copy.textContent,'Copying…');assert.equal(ui.copy.disabled,true);assert.match(ui.status.textContent,/Copying diagnostics/);
+  assert.equal(await h.test.runQuickAction('copy'),false);resolve();assert.equal(await copy,true);assert.equal(ui.copy.textContent,'Copied ✓');assert.equal(ui.copy.disabled,false);assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+  assert(h.test.quickActionsMarkup().includes('aria-live="polite"'));assert(h.test.quickActionsMarkup().includes('Copied ✓'));
+  await h.advance(2201);assert.equal(ui.copy.textContent,'Copy diagnostics');assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+  assert.equal(h.fetches.length,fetches);assert.deepEqual([...h.storage],before);assert.equal(h.test.loadAttemptState('chat-a').attempts.length,0);
+});
+check('Copy failure is persistent and restores its normal label without extra requests or evidence',async()=>{
+  const h=environment();h.test.setLatest(h.test.calculateStats());const ui=quickSurface(h);h.context.navigator.clipboard.writeText=async()=>{throw Error('clipboard denied');};
+  h.context.alert=()=>assert.fail('copy failure should use the persistent status, without a diagnostics modal');
+  assert.equal(await h.test.runQuickAction('copy'),false);assert.equal(ui.copy.textContent,'Copy failed ✕');assert.match(ui.status.textContent,/Copy failed ✕/);
+  await h.advance(2201);assert.equal(ui.copy.textContent,'Copy diagnostics');assert.match(ui.status.textContent,/Copy failed ✕/);assert.equal(h.fetches.length,0);assert.equal(h.storage.size,0);
+});
+check('Retry UI disables repeats, reports accepted DIRECT bytes and keeps completion after label restoration',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversations/chat-a',JSON.stringify(mapping()));const e=activeMax(h),ui=quickSurface(h);
+  await h.advance(251); // Drain the pre-existing automatic new-MAX job before testing manual UI effects.
+  let resolve;h.state.fetch=()=>new Promise(r=>resolve=r);const requests=h.fetches.length,job=h.test.runQuickAction('retry');await h.flush();
+  assert.equal(ui.retry.textContent,'Capturing…');assert.equal(ui.retry.disabled,true);assert.equal(ui.retry.attributes['aria-busy'],'true');assert(h.test.quickActionsMarkup().includes('Capturing…'));
+  assert.equal(await h.test.runQuickAction('retry'),false);assert.equal(h.fetches.length-requests,1);
+  resolve(response(JSON.stringify(mapping()).padEnd(1234,' ')));assert.equal(await job,true);assert.equal(ui.retry.textContent,'Captured ✓');assert.match(ui.status.textContent,/Fresh DIRECT captured ✓ · 1,234B/);
+  const captured=e.captureHistory.length,stored=[...h.storage];await h.advance(2201);assert.equal(ui.retry.textContent,'Retry capture');assert.match(ui.status.textContent,/Fresh DIRECT captured ✓/);
+  assert.equal(e.captureHistory.length,captured);assert.deepEqual([...h.storage],stored);assert.equal(h.fetches.length-requests,1);assert.equal(h.test.loadAttemptState('chat-a').attempts.length,0);
+});
+check('Retry UI reports failure despite HTTP 200 and an old full snapshot',async()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',800);const ui=quickSurface(h);h.state.fetch=async()=>response(tinyCapture);
+  assert.equal(await h.test.runQuickAction('retry'),false);assert.equal(ui.retry.textContent,'No fresh mapping ✕');assert.equal(ui.retry.disabled,false);assert.match(ui.status.textContent,/No fresh mapping ✕/);
+  const count=h.fetches.length;await h.advance(2201);assert.equal(ui.retry.textContent,'Retry capture');assert.match(ui.status.textContent,/No fresh mapping ✕/);assert.equal(h.fetches.length,count);
+});
+check('later quick action owns persistent status when an earlier capture finishes asynchronously',async()=>{
+  const h=environment();h.test.setLatest(h.test.calculateStats());const ui=quickSurface(h);let resolve;
+  h.state.fetch=()=>new Promise(r=>resolve=r);const retry=h.test.runQuickAction('retry');await h.flush();
+  assert.equal(await h.test.runQuickAction('copy'),true);assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+  resolve(response(JSON.stringify(mapping())));assert.equal(await retry,true);assert.equal(ui.retry.textContent,'Captured ✓');assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+});
+check('production click binding uses persistent quick feedback and retains tactile pointer animation',async()=>{
+  const h=environment();h.test.setLatest(h.test.calculateStats());const ui=quickSurface(h);h.test.bindUI();
+  let flashes=0;ui.copy.classList.add=()=>flashes++;ui.copy.dataset={action:'copy'};
+  const event={target:{closest:()=>ui.copy}};ui.handlers.pointerdown(event);assert.equal(flashes,1);
+  await ui.handlers.click(event);assert.equal(ui.copy.textContent,'Copied ✓');assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+  assert.equal(h.fetches.length,0);assert.equal(h.storage.size,0);
+});
+check('Retry UI gives accepted BATCH completion and Copy includes bounded route proof/failure diagnostics',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversations/batch',JSON.stringify({conversations:[mapping()]}),{method:'POST',body:'{}'});
+  const ui=quickSurface(h),calls=[];h.state.fetch=async(input)=>{
+    const path=new URL(input?.url || input,h.context.location.origin).pathname;calls.push(path);
+    return response(path.endsWith('/batch')?JSON.stringify({conversations:[mapping()]}).padEnd(20260,' '):tinyCapture);
+  };
+  assert.equal(await h.test.runQuickAction('retry'),true);assert.equal(ui.retry.textContent,'Captured ✓');assert.match(ui.status.textContent,/Fresh BATCH captured ✓ · 20.3kB/);
+  assert.equal(calls.filter(path=>path.endsWith('/batch')).length,1);
+  h.test.setLatest(h.test.calculateStats());assert.equal(await h.test.runQuickAction('copy'),true);assert.match(ui.status.textContent,/Diagnostics copied ✓/);
+  assert.match(h.state.clipboard,/RETRY CAPTURE/);assert.match(h.state.clipboard,/"observedRoutes"/);assert.match(h.state.clipboard,/"responseBytes":168/);assert.match(h.state.clipboard,/"result":"captured"/);
+  assert.match(h.state.clipboard,/OBSERVED CAPTURE ROUTES/);assert.match(h.state.clipboard,/"parserAcceptedFull":true/);
+  assert(h.state.clipboard.startsWith('Candidate userscript: V2.23.4'));
+  const count=h.fetches.length;await h.advance(2201);assert.equal(ui.retry.textContent,'Retry capture');assert.match(ui.status.textContent,/Diagnostics copied ✓/);assert.equal(h.fetches.length,count);
+});
+check('large observed request bodies and expired forms do not produce unbounded BATCH replay',async()=>{
+  const h=environment();await observedCapture(h,'/backend-api/conversations/batch',JSON.stringify({conversations:[mapping()]}),{method:'POST',body:' '.repeat(16385)});
+  const count=h.fetches.length;h.state.fetch=async()=>response(tinyCapture);assert.equal(await h.test.retryCapture(),false);
+  assert.equal(h.fetches.length-count,1);assert.equal(lastRetry(h).requests.at(-1).reason,'observed request form unavailable');
+  h.setNow(h.now()+600001);assert(h.test.captureRetryRoutes('chat-a',true).every(r=>r.kind==='direct'));assert.equal(h.test.captureRouteDiagnostics('chat-a').length,0);
+});
+check('rejected capture fetches and failed body reads are recorded once as meter traffic with visible failure',async()=>{
+  for(const bodyFailure of [false,true]){
+    const h=environment();h.state.fetch=async()=>{
+      if(!bodyFailure)throw Error('network unavailable');
+      return {status:200,headers:{get:()=> 'application/json'},clone:()=>({text:async()=>{throw Error('body unavailable');}})};
+    };
+    assert.equal(await h.test.retryCapture(),false);const store=h.test.loadAttemptState('chat-a'),trace=lastRetry(h);
+    assert.equal(store.meterCaptureNetwork.length,1);assert.equal(store.meterCaptureNetwork[0].bytes,null);assert.equal(store.appStateNetwork.length,0);assert.equal(store.attempts.length,0);
+    assert.equal(trace.result,'no fresh mapping');assert.equal(trace.requests[0].acceptedFull,false);
+    assert.equal(trace.requests[0].reason,bodyFailure?'response read failed':'capture request failed');
+  }
+});
+check('source-family extension preserves legacy classification and only adds plural per-chat full sources',()=>{
+  const h=environment(),family=h.test.lifecycleSourceFamily;
+  assert.equal(family('/backend-api/conversation/chat-a'),'direct');assert.equal(family('/backend-api/conversation/chat-a/details'),'direct');
+  assert.equal(family('/backend-api/conversations/chat-a'),'direct');assert.equal(family('/backend-api/conversations/chat-a?observed=1'),'direct');
+  assert.equal(family('/backend-api/conversations/chat-a/details'),'other');assert.equal(family('/backend-api/conversations'),'other');assert.equal(family('/backend-api/conversations/batch'),'batch');
+});
+check('empty app responses retain checkpoint generation behavior; empty meter responses are explicit failed captures',async()=>{
+  const h=environment();h.state.fetch=async()=>response('',503);await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+  const a=h.test.loadAttemptState('chat-a').current;assert(a);assert.equal(a.outcome,null);assert.equal(a.networkEvents.length,0);
+  h.state.fetch=async()=>response('');assert.equal(await h.test.retryCapture(),false);assert.equal(lastRetry(h).requests[0].responseBytes,0);assert.equal(lastRetry(h).requests[0].acceptedFull,false);assert.equal(h.test.loadAttemptState('chat-a').meterCaptureNetwork.length,1);assert.equal(a.outcome,null);
 });
 
 (async()=>{

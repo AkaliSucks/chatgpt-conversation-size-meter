@@ -1,3 +1,198 @@
+# V2.23.4 candidate — Route-aware Retry Capture and completion feedback
+
+Prepared 2026-09-30 on `codex/v234-route-aware-retry`, directly from preserved
+checkpoint `ccdd1b97485d59cdc7d4f92735cca5b1ada7e431`. The commit containing this
+report is the V2.23.4 child candidate. No merge, PR, push or V2.24 work.
+
+The user reports native Lian Li MAX validation of V2.23.3: two real MAX attempts
+created episodes #1/#2; attempt #2 had generation dispatch, structured SSE MAX
+and independent native UI confirmation. Retry did not create another attempt or
+episode, but its singular-route requests returned ~168 bytes and supplied no
+fresh episode snapshot. Current app traffic included a ~72 KB plural per-chat
+response and a ~20.26 MB BATCH response. These are user-reported native findings.
+No new native response bodies/request forms were in this repository; only the
+older false-MAX regression diagnostics were present. Their sizes alone cannot
+establish which response is a parser-valid full mapping.
+
+## Route audit and repair
+
+The former retry tried only `/backend-api/conversation/<id>`, an invented
+`include_messages=true` variant, and singular resource URLs. Its HTTP result
+was not proof of a full capture. The new implementation observes same-origin
+read routes through the existing early fetch hook, including exact singular and
+plural per-chat GET forms and GET/POST BATCH forms. Request forms stay ephemeral
+in memory, with at most twelve entries and a ten-minute replay eligibility
+window. POST forms exceeding 16,384 characters are unavailable for replay.
+Bodies, headers and credentials are never serialized into diagnostics/storage.
+
+Normal app responses still run through the unchanged parser/candidate path.
+A route proof records whether that specific response actually advanced full
+capture publication for the bound current chat, along with status, bytes,
+content type and published source family. Copy Diagnostics exposes a live
+`OBSERVED CAPTURE ROUTES` audit; every Retry stores a bounded, body/header-free
+`lastRetry` result with the observed proofs and each attempted path/method,
+status, response bytes/type, acceptance, resulting family and final result.
+Paths omit query values. No response bodies are persisted.
+
+Parser-accepted, successful observed forms are preferred. A retry tries at most
+two distinct per-chat GET paths, then at most one observed BATCH form. A BATCH
+replay requires a naturally observed 2xx response that the unchanged parser
+accepted as a full snapshot for this chat. It preserves the observed method,
+body and request headers in memory; it does not invent a BATCH POST schema or
+parameters. Resource timing alone cannot supply a BATCH method/body. Per-chat
+resource URLs and one legacy singular GET remain bounded fallbacks. The
+`include_messages` guess and duplicate singular resource retries are removed.
+
+BATCH replay is **manual-only**. Initial, SPA, new-MAX, post-outcome and background
+capture reasons cannot replay BATCH; the background timer now uses its explicit
+reason and existing controlled-workflow coalescing. Repeated timers cannot cause
+repeated large meter BATCH fetches. Every retry has a thirty-second total deadline,
+with cancellation/abort and a 64 MiB accepted-response ceiling. HTTP failures,
+empty/small metadata, partial messages, read errors and rejected requests remain
+failed captures, and fallback continues within these bounds.
+
+Success requires an attributable **new parser-valid full snapshot** produced by
+that retry response, with a new capture sequence and full-capture time at/after
+the retry start. An old full snapshot or a concurrent app capture cannot supply
+success. The response-body await rechecks chat and active episode identity before
+parser writes. Navigation, episode replacement and timeout cancel attachment;
+a late response cannot become a successful fresh capture. The unchanged
+`recordLifecycleFullCapture -> eventCapture` path attaches each accepted source
+observation once to the existing episode. Requests use the original unwrapped
+fetch and are recorded once in METER CAPTURE NETWORK, including failures/timeouts;
+late completion cannot duplicate a timed-out row. Generation/app telemetry is
+not inflated, and no real attempt or MAX episode is fabricated.
+
+One narrowly demonstrated dependency changed: `lifecycleSourceFamily` previously
+returned OTHER for `/backend-api/conversations/<id>`, even after the parser
+accepted its mapping. It now recognizes that exact plural per-chat source as
+DIRECT. All old singular/BATCH classifications are preserved. This is source
+labelling after parser acceptance, not a rule that a 72 KB response is full.
+The mapping parser, candidate selection and publication functions are unchanged.
+
+## Completion UI
+
+Copy and Retry retain the existing press animation and now have a compact sticky
+`Last action` status beside their quick-action buttons, with `aria-live=polite`.
+Running labels are `Copying…` / `Capturing…`; repeat clicks are disabled. Completed
+labels are `Copied ✓`, `Copy failed ✕`, `Captured ✓` or `No fresh mapping ✕`.
+After 2.2 seconds the normal labels return while the persistent result remains.
+Successful capture status identifies DIRECT/BATCH and response bytes; HTTP
+completion alone never produces a success cue.
+
+Quick-action state survives ordinary panel redraws. UI state/timer updates patch
+only the button/status nodes: they do not call lifecycle polling/render feedback,
+make requests, create events/captures, or write storage. Copy failure uses this
+status instead of opening a large diagnostic alert. A newer quick action owns
+the persistent status if an older action completes asynchronously.
+
+Copy begins with an explicit V2.23.4 identity line and includes live route proofs
+and the last retry result. The protected core diagnostic header and storage
+health candidateVersion still contain their inherited 2.23.2 / 2.23.3 labels;
+those regions were preserved byte-for-byte. Use userscript metadata, Copy's first
+line and `lastRetry.version=2.23.4` to identify this candidate.
+
+## Verification and artifacts
+
+**99/99 synthetic tests PASS**: all 77 V2.23.3 tests plus 22 new cases covering
+168-byte singular failure, full plural fallback, episode #2 identity, repeated
+retry dedup, a non-full 72 KB response followed by one observed POST BATCH,
+no invented BATCH form, manual-only BATCH, wrong-chat rejection, old/concurrent
+snapshot rejection, navigation/episode cancellation, HTTP/partial/empty failures,
+timeout and late-response safety, bounded route selection/request forms,
+credential exclusion, and Copy/Retry success/failure/persistent UI states.
+Production click handlers and retained tactile animation are exercised in the VM.
+
+The heavy synthetic fixture rejected 72,000-byte metadata and a 168-byte singular
+payload, then accepted one 20,260,000-byte BATCH response into the same active MAX
+episode: one capture-history observation and zero new attempts/episodes. The
+large response contains a synthetic valid mapping plus padding; this is not a
+native ChatGPT payload or native topology validation. A separate fixture accepts
+72,123 bytes from a full plural mapping into existing episode #2. Size is never
+the acceptance criterion.
+
+Byte verification passes independently for:
+
+- 66,862 immutable V2.22 parser/extraction/topology/profiler bytes.
+- 8,807 validated send/correlation bytes against `4b14425`.
+- 15,435 source cache/capture/static-vector/diagnostic bytes against `3be6a30`.
+- 72,454 storage retention, MAX episode, generation classifier/transport and
+  acceptance bytes against `ccdd1b9`; some independent check regions overlap.
+- The source-family classifier differs only by its explicit plural per-chat
+  extension, verified against the checkpoint's expected expression.
+
+Baseline verification and candidate/harness/verifier/baseline `node --check` pass.
+Baseline remains 289994 bytes, SHA-256
+`08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696`.
+Two deterministic ZIP builds match exactly; the sole member equals the LF source.
+Complete commands/results are in `VALIDATION.txt`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| JS | 306017 | `892f728202e785baab8ccb4b020759c28a2f293fa747558474ba2d115a0ac771` |
+| ZIP | 69016 | `00ddc8dd95da1af068f6c783d971b10ac96c4c26c986e55924d33143734eb8c2` |
+
+Changed files: release JS/ZIP, SHA256SUMS, VALIDATION.txt, this report,
+`scripts/test-v223.js` and `scripts/verify-v223-protected.js`. Spec, baseline,
+line-ending policy and package builder are unchanged.
+
+## Exact next native browser sequence
+
+1. Preserve the V2.23.3 Lian Li diagnostics and existing origin storage. Install
+   this ZIP's JS as 2.23.4, disable older copies and hard-reload the same MAX chat.
+   Do not send another prompt. Let its normal per-chat/BATCH app-state traffic
+   finish. Retest within ten minutes of those naturally observed forms.
+2. Expand the meter and Copy diagnostics. Confirm `Copying…`, then `Copied ✓`,
+   then the normal label after ~2.2 seconds; `Last action: Diagnostics copied ✓`
+   must remain. Verify the copied first line identifies V2.23.4. Inspect live
+   OBSERVED CAPTURE ROUTES: method/path, 2xx status and parserAcceptedFull establish
+   route viability. The ~72 KB route may be metadata; only actual parser
+   acceptance makes it full. A BATCH form must show parserAcceptedFull=true and
+   replayEligible=true before it can be replayed. If unavailable, retain that
+   diagnostic; do not invent a BATCH body/parameters.
+3. Record current attempt IDs/outcomes, active episode ID (#2 if still active)
+   and capture-history count C. Natural reload captures may already have
+   increased C; distinguish those app observations from the manual retry.
+4. While the native MAX alert remains visible, click Retry Capture once. Verify
+   `Capturing…`, disabled repeat clicks, and completion within the bounded
+   workflow. A successful result must show `Captured ✓` and persistent
+   `Fresh DIRECT/BATCH captured ✓ · <bytes>`; the normal label returns after
+   ~2.2 seconds. No-fresh-mapping results must stay visibly failed.
+5. Copy diagnostics. Require a new lastRetry started/finished time, acceptedFull
+   only for the actual new full response, correct source family/bytes, and final
+   result captured. The same episode must have one new corresponding fresh
+   source/capture-history record per accepted observation, with capture time
+   at/after retry start. Account separately for any concurrent natural app
+   capture. Attempt IDs/counts, episode ID/counts and structured/native MAX
+   outcome evidence must remain unchanged. All meter requests belong to METER
+   CAPTURE NETWORK; generation/app counters must exclude those requests.
+6. Repeat Retry once on the same visibly active episode. Require unchanged
+   identity and one additional accepted-source record, without a new attempt or
+   episode. Inspect Network/lastRetry: at most two distinct per-chat GET paths
+   and one manual BATCH request per action. Observe for at least one background
+   timer interval: it must not issue a meter BATCH poll.
+7. During a separate retry, navigate away before its response finishes. Require
+   cancellation/no attachment to the destination chat or another episode. On
+   any HTTP/error/metadata-only failure, require No fresh mapping and a failed
+   lastRetry, even if an older full snapshot remains displayed. Do not submit
+   a new MAX attempt just to exercise this capture repair.
+8. Verify storage health still reports complete saves for required current keys.
+   Hard-reload and check durability of accepted episode evidence. Copy failure
+   feedback can be checked by temporarily denying clipboard permission; it must
+   show Copy failed and remain visible without another network request.
+
+Native route schemas, authentication/header replay and the real 20.26 MB mapping
+shape have not been validated for this child. A fresh naturally observed BATCH
+form may be absent/expired, or its response may fail the unchanged current-chat
+candidate selection; those conditions remain explicit failures. The VM does not
+validate browser clipboard permissions, actual layout/readability, server timing,
+large native topology performance or cross-tab timing. Native validation of this
+candidate remains open until the sequence above passes.
+
+---
+
+## Historical V2.23.3 report (ccdd1b9; not this child build)
+
 # V2.23.3 candidate — Version-aware meter retention
 
 Prepared 2026-09-30 on `codex/v223-version-aware-retention`, directly from

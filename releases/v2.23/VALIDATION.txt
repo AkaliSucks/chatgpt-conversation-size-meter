@@ -86,7 +86,30 @@ PASS cleanup prioritizes obsolete non-current histories, then current legacy his
 PASS unrecoverable quota stops at four twelve-key passes and preserves every current key in memory
 PASS cleanup success cannot mask a remaining required-key failure and later recovery retries every key
 PASS silent storage write loss and externally missing keys cannot produce overall save success
-77/77 synthetic harness tests passed; native-browser validation not performed
+PASS Retry audits 168-byte singular failure then accepts an observed plural full mapping for existing episode #2
+PASS repeated successful Retry on one active episode appends one capture per accepted response without changing identity
+ROUTE fixture: metadata 72000 B not full; singular 168 B not full; one observed POST BATCH 20260000 B full; same MAX episode #1, one capture, zero attempts
+PASS 72KB metadata is not automatically full; one proven natural POST BATCH form can supply fresh episode state
+PASS resource URL alone never invents a BATCH request and background captures never replay large BATCH
+PASS BATCH that never yielded a parser-valid current-chat mapping is not replayed
+PASS failed Retry cannot reuse an old full snapshot or a concurrent natural app capture as success
+PASS navigation during Retry body read cancels parser writes and attachment to both chats
+PASS an episode replacement during delayed Retry cannot receive the earlier episode response
+PASS HTTP error with mapping-shaped body and partial message array both remain failed retries
+PASS Retry has a thirty-second total deadline; a late full response cannot be accepted
+PASS route plan remains bounded, de-duplicates absolute/relative URLs and never invents include_messages
+PASS Copy UI reports running/success, survives rerender and restores label without network or storage changes
+PASS Copy failure is persistent and restores its normal label without extra requests or evidence
+PASS Retry UI disables repeats, reports accepted DIRECT bytes and keeps completion after label restoration
+PASS Retry UI reports failure despite HTTP 200 and an old full snapshot
+PASS later quick action owns persistent status when an earlier capture finishes asynchronously
+PASS production click binding uses persistent quick feedback and retains tactile pointer animation
+PASS Retry UI gives accepted BATCH completion and Copy includes bounded route proof/failure diagnostics
+PASS large observed request bodies and expired forms do not produce unbounded BATCH replay
+PASS rejected capture fetches and failed body reads are recorded once as meter traffic with visible failure
+PASS source-family extension preserves legacy classification and only adds plural per-chat full sources
+PASS empty app responses retain checkpoint generation behavior; empty meter responses are explicit failed captures
+99/99 synthetic harness tests passed; native-browser validation not performed
 EXIT 0
 
 $ node scripts/verify-v223-protected.js
@@ -97,6 +120,8 @@ PASS protected region function inspectRequestBody( (408 bytes)
 PASS 66862 protected bytes; baseline identity and capture-lineage markers
 PASS 8807 validated send/correlation bytes unchanged from 4b14425
 PASS 15435 validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30
+PASS 72454 storage retention/MAX episode/generation classifier/transport/acceptance bytes unchanged from ccdd1b9
+PASS source-family classifier has only the demonstrated plural per-chat route extension
 EXIT 0
 
 $ node --check releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js
@@ -112,13 +137,13 @@ $ node --check src/baseline/chatgpt_chat_size_meter_v222_sse_outcome_post_correl
 EXIT 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 295749 bytes; SHA-256 1d5de3edec497ad35bbd74c0a8d97062d45622d87425604d4bbd85170a83adc0
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 65904 bytes; SHA-256 781e023afc4142026f36df9dad2580dd1c0bc3554091dbf5e37f19585d527524
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 892f728202e785baab8ccb4b020759c28a2f293fa747558474ba2d115a0ac771
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 00ddc8dd95da1af068f6c783d971b10ac96c4c26c986e55924d33143734eb8c2
 EXIT 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 295749 bytes; SHA-256 1d5de3edec497ad35bbd74c0a8d97062d45622d87425604d4bbd85170a83adc0
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 65904 bytes; SHA-256 781e023afc4142026f36df9dad2580dd1c0bc3554091dbf5e37f19585d527524
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 892f728202e785baab8ccb4b020759c28a2f293fa747558474ba2d115a0ac771
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 00ddc8dd95da1af068f6c783d971b10ac96c4c26c986e55924d33143734eb8c2
 EXIT 0
 
 PASS two builds byte-identical; ZIP sole member equals LF source; no native-browser validation performed

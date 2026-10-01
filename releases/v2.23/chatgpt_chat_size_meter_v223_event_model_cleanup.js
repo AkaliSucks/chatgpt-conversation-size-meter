@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP
 // @namespace    local.chatgpt.size.v2101
-// @version      2.23.3
+// @version      2.23.4
 // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
 // @match        https://chatgpt.com/*
 // @grant        unsafeWindow
@@ -95,6 +95,9 @@ const meterStorageTotals = {meterOwnedKeyCount:null,meterOwnedBytes:null,meterOw
 const streamBuffers = new Map(); // ephemeral framing only, never persisted
 const captureJobs = new Map();
 let meterFetch = null;
+const captureRoutes = new Map(); // session-only request forms; never serialized
+const retryTraces = new Map(); // bounded, body/header-free results
+let retrySerial = 0;
 let activeCaptureBinding = null; // synchronous parser-to-event handoff only
 let sendIntentHooked = false;
 let pendingComposerEnter = null;
@@ -3158,8 +3161,9 @@ function lifecycleSourceFamily(source) {
   }
 
   if (
-    /\/backend-api\/conversation\/[^/?#]+/i.test(s) &&
-    !s.includes('/backend-api/conversations/')
+    (/\/backend-api\/conversation\/[^/?#]+/i.test(s) &&
+    !s.includes('/backend-api/conversations/')) ||
+    /\/backend-api\/conversations\/[^/?#]+(?:[?#]|$)/i.test(s)
   ) {
     return 'direct';
   }
@@ -5053,30 +5057,53 @@ function interestingURL(url) {
 }
 
 async function inspectResponse(response, url, binding = {chatId:chatIdFromURL()}, category = 'app') {
+  const result = {path:attemptRequestPath(url),status:response.status ?? null,responseBytes:null,
+    contentType:String(response.headers.get('content-type') || '').slice(0,120),acceptedFull:false,sourceFamily:null};
   try {
-    if (!interestingURL(url)) return;
+    if (!interestingURL(url)) return result;
     const text = await response.clone().text();
-    if (!text) return;
     const id = binding.chatId, bytes = new TextEncoder().encode(text).length;
-    attemptRecordNetworkEvent(id,url,bytes,response.headers.get('content-type') || '',binding,category);
+    result.responseBytes = bytes;
+    if (!text && category !== 'meter') return result; // Preserve validated empty app-response behavior.
+    if (category === 'meter') captureMeterNetwork(binding,url,bytes,result.contentType);
+    else attemptRecordNetworkEvent(id,url,bytes,result.contentType,binding,category);
     if (category !== 'meter') {
       attemptObservePreflightResponse(id,url,response,text,bytes,binding.preflightId);
       attemptObserveGenerationResponse(id,url,response,text,bytes,binding);
     }
-    // URL binding is checked again after await, before any parser writes.
-    if (id !== chatIdFromURL()) return;
-    saveDiagnostic(id,{lastObservedURL:sanitizeURL(url),lastObservedBytes:bytes,lastObservedCharacters:text.length,lastObservedType:response.headers.get('content-type') || ''});
+    // Recheck chat AND episode after the body await, before any parser writes.
+    if (id !== chatIdFromURL() || (category === 'meter' &&
+        (!eventBindingValid(binding) || binding.retryToken?.cancelled ||
+         (binding.retryToken && (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId)))) {
+      result.reason = 'binding cancelled'; return result;
+    }
+    if (category === 'meter' && (result.status < 200 || result.status >= 300 || bytes > 64*1024*1024)) {
+      result.reason = 'HTTP error or oversized capture'; return result;
+    }
+    saveDiagnostic(id,{lastObservedURL:sanitizeURL(url),lastObservedBytes:bytes,lastObservedCharacters:text.length,lastObservedType:result.contentType});
+    const sequence = loadAttemptState(id).captureSequence || 0;
     const previous = activeCaptureBinding;
     activeCaptureBinding = binding;
     try {
       const trimmed = text.trim();
+      let json = false;
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        try { inspectJSON(JSON.parse(trimmed),sanitizeURL(url),bytes); return; } catch {}
+        try { const parsed = JSON.parse(trimmed); inspectJSON(parsed,sanitizeURL(url),bytes); json = true; } catch {}
       }
-      inspectSSE(text,sanitizeURL(url));
+      if (!json) inspectSSE(text,sanitizeURL(url));
     } finally { activeCaptureBinding = previous; }
-  } catch (error) {
-    if (category === 'meter') eventStorageError(binding.chatId, 'capture read error: '+error.message);
+    // The unchanged parser/candidate path must actually publish a NEW full capture.
+    const snap = loadSnapshot(id), obs = loadLifecycle(id).lastObservation;
+    result.acceptedFull = !!(snap.full && snap.records.length && snap.structure &&
+      (loadAttemptState(id).captureSequence || 0) > sequence &&
+      (!binding.retryToken || snap.fullCapturedAt >= binding.retryToken.startedAt));
+    if (result.acceptedFull) result.sourceFamily = obs?.sourceFamily ?? null;
+    result.reason = result.acceptedFull ? 'new parser-valid full snapshot' : 'no parser-valid full snapshot';
+    if (category === 'app' && binding.captureRoute) binding.captureRoute.result = {...result};
+    return result;
+  } catch {
+    if (category === 'meter') captureMeterNetwork(binding,url,null,result.contentType);
+    result.reason = 'response read failed'; return result;
   }
 }
 
@@ -6944,10 +6971,11 @@ function installNetworkHooks() {
           This runs synchronously before originalFetch.
         */
         const requestChatId = chatIdFromURL();
+        const captureRoute = captureObserveRequest(url,method,requestObject,args[1],requestChatId);
         const detected = attemptInspectOutgoingRequest(url,method,body,requestObject,requestChatId);
         const bindingPromise = Promise.resolve(detected).then(a => ({
           chatId:requestChatId, attemptId:a?.id ?? null,
-          preflightId:a?.preflightId ?? null
+          preflightId:a?.preflightId ?? null, captureRoute
         }));
 
         /*
@@ -7075,75 +7103,155 @@ installSendIntentHook();
 // Direct capture attempts
 // ============================================================
 
-async function tryDirectURL(url, binding = {chatId:chatIdFromURL()}) {
-  if (!meterFetch || binding.chatId !== chatIdFromURL()) return false;
+function captureRouteKind(url, id) {
   try {
-    const resp = await meterFetch(url,{method:'GET',credentials:'include',cache:'no-store',headers:{Accept:'application/json, text/plain, */*'}});
-    await inspectResponse(resp,url,binding,'meter');
-    return resp.ok;
-  } catch { return false; }
+    const u = new URL(url,location.origin);
+    if (u.origin !== location.origin || u.username || u.password || u.hash) return null;
+    const encoded = encodeURIComponent(id);
+    if (u.pathname === `/backend-api/conversation/${encoded}` || u.pathname === `/backend-api/conversations/${encoded}`) return 'direct';
+    if (u.pathname === '/backend-api/conversations/batch') return 'batch';
+  } catch {}
+  return null;
+}
+
+function captureObserveRequest(url, method, request, init, id) {
+  const kind = id && captureRouteKind(url,id);
+  if (!kind || !['GET','POST'].includes(method) || (kind === 'direct' && method !== 'GET')) return null;
+  try {
+    const u = new URL(url,location.origin);
+    const template = request?.clone ? new Request(request.clone(),init || {}) : new Request(u.href,{...init,method});
+    // Retain only read-route request forms, in memory for ten minutes / twelve routes.
+    // No body/header/credential is copied into diagnostics or localStorage.
+    const ready = (async()=>{
+      if (method === 'POST' && (await template.clone().text()).length > 16384) return null;
+      return template;
+    })().catch(()=>null);
+    const route = {id,url:u.href,method,kind,seenAt:Date.now(),ready,result:null};
+    const key = `${id}:${method}:${u.href}`;
+    captureRoutes.delete(key); captureRoutes.set(key,route);
+    for (const [name,value] of captureRoutes) if (Date.now()-value.seenAt > 600000) captureRoutes.delete(name);
+    while (captureRoutes.size > 12) captureRoutes.delete(captureRoutes.keys().next().value);
+    return route;
+  } catch { return null; }
+}
+
+function captureRetryKey(binding) {
+  return `${binding.chatId}:${binding.attemptId ?? ''}:${binding.episodeId ?? ''}`;
+}
+
+function captureMeterNetwork(binding, url, bytes, contentType) {
+  if (binding.meterRequest?.recorded) return;
+  if (binding.meterRequest) binding.meterRequest.recorded = true;
+  attemptRecordNetworkEvent(binding.chatId,url,bytes,contentType,binding,'meter');
+}
+
+function captureObservedFull(route) {
+  return !!(route.result?.acceptedFull && route.result.status >= 200 && route.result.status < 300);
+}
+
+function captureRouteDiagnostics(id) {
+  return [...captureRoutes.values()].filter(r=>r.id === id && Date.now()-r.seenAt <= 600000).map(r=>({
+    path:attemptRequestPath(r.url),method:r.method,seenAt:r.seenAt,
+    status:r.result?.status ?? null,responseBytes:r.result?.responseBytes ?? null,
+    contentType:r.result?.contentType ?? '',parserAcceptedFull:r.result?.acceptedFull ?? null,
+    sourceFamily:r.result?.sourceFamily ?? null,
+    replayEligible:r.kind === 'direct' || captureObservedFull(r)
+  }));
+}
+
+function captureRetryRoutes(id, manual) {
+  const direct = [], batch = [], seen = new Set();
+  const add = route=>{
+    const key = `${route.method}:${new URL(route.url,location.origin).href}`;
+    if (seen.has(key)) return;
+    seen.add(key); (route.kind === 'batch' ? batch : direct).push(route);
+  };
+  const observed = [...captureRoutes.values()].filter(r=>r.id === id && Date.now()-r.seenAt <= 600000);
+  // A naturally observed parser-accepted form beats URL/size guesses. A BATCH
+  // replay additionally requires proof that this exact form yielded this chat.
+  observed.sort((a,b)=>Number(!captureObservedFull(a))-Number(!captureObservedFull(b)) || b.seenAt-a.seenAt);
+  for (const r of observed) if (r.kind === 'direct' || (manual && captureObservedFull(r))) add(r);
+  // Resource timing proves the per-chat URL, but not a BATCH method or POST body.
+  // Never synthesize a BATCH form from timing alone.
+  try {
+    for (const item of performance.getEntriesByType('resource').slice(-30).reverse()) {
+      if (captureRouteKind(item.name,id) === 'direct') add({url:item.name,method:'GET',kind:'direct',provenance:'observed resource URL'});
+    }
+  } catch {}
+  // Backwards-compatible single GET only; no undocumented include_messages query.
+  add({url:`/backend-api/conversation/${encodeURIComponent(id)}`,method:'GET',kind:'direct',provenance:'legacy fallback'});
+  const paths = new Set(), choices = [];
+  for (const route of direct) {
+    const path = new URL(route.url,location.origin).pathname;
+    if (paths.has(path)) continue;
+    paths.add(path); choices.push(route);
+  }
+  return [...choices.slice(0,2),...batch.slice(0,1)];
+}
+
+async function tryDirectURL(url, binding = {chatId:chatIdFromURL()}, route = {method:'GET'}) {
+  binding = {...binding,meterRequest:{recorded:false,dispatched:false}};
+  const token = binding.retryToken;
+  const failure = reason=>({path:attemptRequestPath(url),method:route.method,status:null,responseBytes:null,contentType:'',acceptedFull:false,sourceFamily:null,reason});
+  if (!meterFetch || !eventBindingValid(binding) || token?.cancelled) return failure('binding cancelled or fetch unavailable');
+  let timer;
+  const controller = new AbortController();
+  try {
+    const remaining = token ? Math.max(0,token.deadline-Date.now()) : 30000;
+    if (!remaining) return failure('retry deadline exceeded');
+    const work = (async()=>{
+      const request = route.ready ? await route.ready : null;
+      if (route.ready && !request) return failure('observed request form unavailable');
+      if (token?.cancelled || !eventBindingValid(binding)) return failure('binding cancelled');
+      binding.meterRequest.dispatched = true;
+      const resp = request
+        ? await meterFetch(request.clone(),{signal:controller.signal,cache:'no-store'})
+        : await meterFetch(url,{method:'GET',credentials:'include',cache:'no-store',signal:controller.signal});
+      return {...await inspectResponse(resp,url,binding,'meter'),method:route.method};
+    })();
+    return await Promise.race([work,new Promise(resolve=>{
+      timer = setTimeout(()=>{
+        if (token) token.cancelled = true;
+        if (binding.meterRequest.dispatched) captureMeterNetwork(binding,url,null,'');
+        controller.abort();resolve(failure('retry deadline exceeded'));
+      },remaining);
+    })]);
+  } catch {
+    if (binding.meterRequest.dispatched) captureMeterNetwork(binding,url,null,'');
+    return failure('capture request failed');
+  }
+  finally { clearTimeout(timer); }
 }
 
 async function retryCapture(binding = null) {
   const id = chatIdFromURL();
   if (!id || (binding?.chatId && binding.chatId !== id)) return false;
-  binding = binding || {chatId:id,episodeId:eventActiveEpisode(id)?.id ?? null,reason:'manual Retry Capture'};
+  binding = {...(binding || {chatId:id,reason:'manual Retry Capture'}),episodeId:binding?.episodeId ?? eventActiveEpisode(id)?.id ?? null};
   if (!eventBindingValid(binding)) return false;
-
-  const before = loadSnapshot(id);
-  const beforeSequence = loadAttemptState(id).captureSequence || 0;
-
-  function freshFullSnapshot() {
-    const snap = loadSnapshot(id);
-
-    return Boolean(
-      snap.full &&
-      (loadAttemptState(id).captureSequence || 0) > beforeSequence
-    );
-  }
-
-  const encoded = encodeURIComponent(id);
-
-  const urls = [
-    `/backend-api/conversation/${encoded}`,
-    `/backend-api/conversation/${encoded}?include_messages=true`
-  ];
-
-  for (const url of urls) {
-    if (!eventBindingValid(binding)) return false;
-    await tryDirectURL(url,binding);
-
-    if (freshFullSnapshot()) {
-      scheduleUpdate();
-      return true;
-    }
-  }
-
+  const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+  binding.retryToken = token;
+  const trace = {version:'2.23.4',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+    startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+  retryTraces.set(captureRetryKey(binding),trace);
+  while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+  const finish = result=>{
+    trace.result = result; trace.finishedAt = Date.now();
+    saveDiagnostic(id,{lastRetry:trace});
+    return result === 'captured';
+  };
   try {
-    const resources = performance
-      .getEntriesByType('resource')
-      .map(x => x.name)
-      .filter(interestingURL);
-
-    for (const url of [...new Set(resources)].slice(-20)) {
-      if (
-        url.includes(id) &&
-        url.startsWith(location.origin) &&
-        attemptRequestPath(url) === `/backend-api/conversation/${id}`
-      ) {
-        if (!eventBindingValid(binding)) return false;
-    await tryDirectURL(url,binding);
-
-        if (freshFullSnapshot()) {
-          scheduleUpdate();
-          return true;
-        }
+    for (const route of captureRetryRoutes(id,binding.reason === 'manual Retry Capture')) {
+      if (!eventBindingValid(binding) || (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId || token.cancelled) return finish('cancelled');
+      const row = await tryDirectURL(route.url,binding,route);
+      trace.requests.push(row);
+      if (!eventBindingValid(binding) || (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId || token.cancelled) return finish('cancelled');
+      if (row.acceptedFull) {
+        trace.sourceFamily = row.sourceFamily; trace.responseBytes = row.responseBytes;
+        scheduleUpdate(); return finish('captured');
       }
     }
-  } catch {}
-
-  scheduleUpdate();
-  return false;
+    scheduleUpdate(); return finish('no fresh mapping');
+  } catch { return finish('capture failed'); }
 }
 
 
@@ -7991,6 +8099,62 @@ function statusColor(cls) {
   return '#70f3b6';
 }
 
+const quickActionState = {
+  serial:0,last:'No quick action yet',type:'muted',
+  copy:{running:false,label:'Copy diagnostics',token:0},
+  retry:{running:false,label:'Retry capture',token:0}
+};
+
+function quickActionsMarkup() {
+  const button = (action,normal)=>{
+    const state = quickActionState[action];
+    return `<button data-action="${action}" ${state.running ? 'disabled aria-busy="true"' : ''}>${esc(state.label || normal)}</button>`;
+  };
+  return `<div class="quick-actions">${button('copy','Copy diagnostics')}${button('retry','Retry capture')}
+    <div class="last-action ${esc(quickActionState.type)}" data-quick-status role="status" aria-live="polite" aria-atomic="true">Last action: ${esc(quickActionState.last)}</div></div>`;
+}
+
+function paintQuickActions() {
+  if (!panel) return;
+  for (const action of ['copy','retry']) {
+    const button = panel.querySelector(`[data-action="${action}"]`), state = quickActionState[action];
+    if (!button) continue;
+    button.textContent = state.label; button.disabled = state.running;
+    button.setAttribute?.('aria-busy',String(state.running));
+  }
+  const status = panel.querySelector('[data-quick-status]');
+  if (status) {status.textContent = 'Last action: '+quickActionState.last;status.className = 'last-action '+quickActionState.type;}
+}
+
+async function runQuickAction(action) {
+  const state = quickActionState[action];
+  if (!state || state.running) return false;
+  const serial = ++quickActionState.serial, token = ++state.token;
+  const binding = {chatId:chatIdFromURL(),episodeId:eventActiveEpisode(chatIdFromURL())?.id ?? null,reason:'manual Retry Capture'};
+  state.running = true; state.label = action === 'copy' ? 'Copying…' : 'Capturing…';
+  quickActionState.last = action === 'copy' ? 'Copying diagnostics…' : 'Capturing fresh source…';
+  quickActionState.type = 'busy'; paintQuickActions();
+  let ok = false, trace = null;
+  try {
+    ok = action === 'copy' ? await copyStats() : await controlledCapture(binding);
+    if (action === 'retry') trace = retryTraces.get(captureRetryKey(binding));
+  } catch {}
+  state.running = false;
+  state.label = action === 'copy' ? (ok ? 'Copied ✓' : 'Copy failed ✕') : (ok ? 'Captured ✓' : 'No fresh mapping ✕');
+  if (quickActionState.serial === serial) {
+    quickActionState.last = action === 'copy' ? (ok ? 'Diagnostics copied ✓' : 'Copy failed ✕') :
+      (ok ? `Fresh ${String(trace?.sourceFamily || 'source').toUpperCase()} captured ✓ · ${fmt(trace?.responseBytes)}B` :
+        `No fresh mapping ✕${trace?.result === 'cancelled' ? ' · capture cancelled' : ''}`);
+    quickActionState.type = ok ? 'ok' : 'error';
+  }
+  paintQuickActions();
+  setTimeout(()=>{
+    if (state.token !== token || state.running) return;
+    state.label = action === 'copy' ? 'Copy diagnostics' : 'Retry capture'; paintQuickActions();
+  },2200);
+  return ok;
+}
+
 let uiFeedback = {
   text: '',
   type: 'ok',
@@ -8072,10 +8236,7 @@ function render() {
   `;
 
   detail.innerHTML = `
-    <div class="quick-actions">
-      <button data-action="copy">Copy diagnostics</button>
-      <button data-action="retry">Retry capture</button>
-    </div>
+    ${quickActionsMarkup()}
 
     <div class="expanded-top">
       <div>
@@ -8900,7 +9061,10 @@ async function copyStats() {
   if (!latest) return false;
 
   const lines = [
+    'Candidate userscript: V2.23.4 ROUTE-AWARE RETRY CAPTURE',
     ...eventDiagnostics(latest.id),
+    'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+    'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
     'DEEP EXISTING DIAGNOSTICS',
     'ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP',
     '',
@@ -9094,7 +9258,6 @@ async function copyStats() {
     await navigator.clipboard.writeText(redactDiagnosticText(lines.join('\n')));
     return true;
   } catch {
-    alert(redactDiagnosticText(lines.join('\n')));
     return false;
   }
 }
@@ -9401,6 +9564,17 @@ function injectStyles() {
     rgba(0,0,0,0) 100%
   );
 }
+
+#${P} .last-action{
+  grid-column:1/-1;
+  font-size:10px;
+  font-weight:700;
+  color:var(--muted);
+  overflow-wrap:anywhere;
+}
+#${P} .last-action.ok{color:#9af8c8}
+#${P} .last-action.error{color:#ffaaaa}
+#${P} .last-action.busy{color:#d6e7ff}
 
 #${P} .quick-actions button{
   padding:7px 6px;
@@ -9831,41 +10005,13 @@ function bindUI() {
           break;
         }
 
-        case 'retry': {
-          b.textContent = 'Capturing…';
-          b.disabled = true;
-          showFeedback('Capturing fresh V2.23 source state…', 'busy', 12000);
-
-          const fresh = await controlledCapture({chatId:chatIdFromURL(),episodeId:eventActiveEpisode(chatIdFromURL())?.id ?? null,reason:'manual Retry Capture'});
-          const refreshed = calculateStats();
-
-          showFeedback(
-            fresh
-              ? (
-                  refreshed.topologyOk
-                    ? 'Fresh topology captured ✓'
-                    : 'Fresh mapping captured; topology error logged'
-                )
-              : 'No fresh full mapping received',
-            fresh
-              ? (refreshed.topologyOk ? 'ok' : 'warn')
-              : 'warn',
-            2400
-          );
-
+        case 'retry':
+          await runQuickAction('retry');
           break;
-        }
 
-        case 'copy': {
-          b.textContent = 'Copying…';
-          const ok = await copyStats();
-          showFeedback(
-            ok ? 'Diagnostics copied ✓' : 'Copy failed',
-            ok ? 'ok' : 'error',
-            1500
-          );
+        case 'copy':
+          await runQuickAction('copy');
           break;
-        }
 
         case 'save-max-sample': {
           b.textContent = 'Saving…';
@@ -9989,7 +10135,7 @@ function startUI() {
           !snap.structure ||
           !snap.structure.contextTopology
         ) {
-          retryCapture();
+          controlledCapture({chatId:id,reason:'background capture'});
         }
       }
     },

@@ -61,3 +61,25 @@ for (const [start,end] of [
   staticBytes += original.length;
 }
 console.log(`PASS ${staticBytes} validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30`);
+const validated = require('node:child_process').execFileSync('git',['show',
+  'ccdd1b97485d59cdc7d4f92735cca5b1ada7e431:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js']);
+let eventBytes = 0;
+for (const [start,end] of [
+  ['function eventStorageError(', 'function eventEpisodes('],
+  ['function eventEpisodes(', 'function sendComposer('],
+  ['function eventAttempt(', 'function eventStorageError('],
+  ['function attemptMarkMax(', 'function attemptStatusLabel('],
+  ['function acceptCandidate(', 'function inspectJSON('],
+  ['function attemptIsPreflightRequest(', 'function installNetworkHooks(']
+]) {
+  const original = region(validated,start,end);
+  assert.deepEqual(region(candidate,start,end),original,`validated storage/MAX path: ${start}`);
+  eventBytes += original.length;
+}
+console.log(`PASS ${eventBytes} storage retention/MAX episode/generation classifier/transport/acceptance bytes unchanged from ccdd1b9`);
+const oldFamily = region(validated,'function lifecycleSourceFamily(', 'function lifecycleFamilyLabel(');
+const newFamily = region(candidate,'function lifecycleSourceFamily(', 'function lifecycleFamilyLabel(');
+const allowed = oldFamily.toString().replace('/\\/backend-api\\/conversation\\/[^/?#]+/i.test(s) &&\n    !s.includes(\'/backend-api/conversations/\')',
+  '(/\\/backend-api\\/conversation\\/[^/?#]+/i.test(s) &&\n    !s.includes(\'/backend-api/conversations/\')) ||\n    /\\/backend-api\\/conversations\\/[^/?#]+(?:[?#]|$)/i.test(s)');
+assert.deepEqual(newFamily,Buffer.from(allowed),'only source-family change: accepted per-chat plural route support');
+console.log('PASS source-family classifier has only the demonstrated plural per-chat route extension');
