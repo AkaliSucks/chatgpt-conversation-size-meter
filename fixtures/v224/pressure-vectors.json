@@ -1,0 +1,12 @@
+[
+  {"name":"tiny","displayLikeTokens":500,"outcome":"success","provenance":"synthetic"},
+  {"name":"medium","displayLikeTokens":50000,"outcome":"success","provenance":"synthetic"},
+  {"name":"healthy-large","displayLikeTokens":438000,"mappingBytes":41000000,"outcome":"success","provenance":"synthetic approximate empirical control"},
+  {"name":"max-a","displayLikeTokens":840795,"activeBranchBytes":20075510,"mappingBytes":20250000,"retainedBytes":12291277,"provenance":"synthetic approximate empirical A"},
+  {"name":"max-b","displayLikeTokens":845331,"activeBranchBytes":9200000,"mappingBytes":9500000,"retainedBytes":5100000,"postTokens":847977,"provenance":"synthetic approximate empirical B"},
+  {"name":"max-b-post","displayLikeTokens":847977,"episode":"max-b","snapshotRole":"fresh-post-max","provenance":"synthetic supporting vector for same episode"},
+  {"name":"large-raw-low-display","displayLikeTokens":100000,"mappingBytes":200000000,"retainedBytes":170000000,"outcome":"success","provenance":"synthetic"},
+  {"name":"different-model-effort","displayLikeTokens":438000,"model":"other-model","effort":"medium","provenance":"synthetic"},
+  {"name":"stale-max","displayLikeTokens":1000,"historicalMax":true,"activeMax":false,"provenance":"synthetic"},
+  {"name":"current-max","displayLikeTokens":1000,"activeMax":true,"provenance":"synthetic"}
+]

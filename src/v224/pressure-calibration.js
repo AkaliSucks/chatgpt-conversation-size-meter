@@ -1,0 +1,248 @@
+// V2.24 empirical pressure, schema 1. No raw mappings, requests, or diagnostic objects.
+// 256 event rows, at most two vectors/row. Eviction watermark prevents replay of old events.
+const PRESSURE_KEY = `${P}:pressure-calibration-v224`;
+const PRESSURE_CAP = 256;
+const PRESSURE_FIELDS = ['displayLikeTokens','activeBranchBytes','mappingBytes','retainedBytes',
+  'retainedShare','toolResultBytes','hot128','hot256','strongContextMarkers','branchNodes','messageNodes'];
+let pressureStore = null, pressureRevision = 0, pressureBusy = false, pressureWriteBlocked = false;
+const pressureResults = new Map();
+
+function pressureNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function pressureLabel(value) {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0,120) : null;
+}
+function pressureEffort(value) {
+  return pressureLabel(value)?.toLowerCase().replace(/\s+/g,' ') || null;
+}
+function pressureVector(obs, role, before = Infinity, after = 0) {
+  if (!obs || !['direct','batch'].includes(obs.sourceFamily)) return null;
+  const time = pressureNumber(obs.fullCapturedAt);
+  if (!time || time > before || time < after || !(pressureNumber(obs.mappingBytes) > 0) ||
+      !(pressureNumber(obs.branchNodes) > 0) || !(pressureNumber(obs.displayLikeTokens) > 0)) return null;
+  return {sourceFamily:obs.sourceFamily,snapshotRole:role,fullCapturedAt:time,
+    ...Object.fromEntries(PRESSURE_FIELDS.map(k=>[k,pressureNumber(obs[k])]))};
+}
+function pressureBest(vectors) {
+  // Prefer complete BATCH representation, then most recent accepted observation.
+  return vectors.filter(Boolean).sort((a,b)=>Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch') ||
+    b.fullCapturedAt-a.fullCapturedAt)[0] || null;
+}
+function pressureOrder(a,b) {
+  return a.timestamp-b.timestamp || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+}
+function pressureCleanRow(row) {
+  if (!row || !['success','max'].includes(row.outcome) || !pressureLabel(row.conversationId) ||
+      !Number.isSafeInteger(row.eventId) || row.eventId < 1 || !(pressureNumber(row.timestamp)>0)) return null;
+  const conversationId = pressureLabel(row.conversationId), outcome = row.outcome;
+  const canonical = pressureVector(row.canonical,row.canonical?.snapshotRole);
+  const postMax = outcome === 'max' ? pressureVector(row.postMax,'fresh-post-max',Infinity,row.timestamp) : null;
+  if (canonical && (!['pre-dispatch','fresh-post-max-fallback'].includes(canonical.snapshotRole) ||
+      canonical.snapshotRole==='pre-dispatch' && canonical.fullCapturedAt>row.timestamp ||
+      canonical.snapshotRole==='fresh-post-max-fallback' && canonical.fullCapturedAt<row.timestamp)) return null;
+  if (!canonical || outcome === 'success' && canonical.snapshotRole !== 'pre-dispatch') return null;
+  return {key:JSON.stringify([conversationId,outcome,row.eventId]),conversationId,eventId:row.eventId,outcome,
+    timestamp:row.timestamp,attemptId:Number.isSafeInteger(row.attemptId)?row.attemptId:null,
+    episodeId:outcome==='max'?row.eventId:null,model:pressureLabel(row.model),effort:pressureEffort(row.effort),
+    identitySource:pressureLabel(row.identitySource),confirmationSource:pressureLabel(row.confirmationSource),
+    provenance:row.provenance==='v223-migration'?'v223-migration':'v224-observed',canonical,postMax};
+}
+function pressureBlank() {
+  return {schemaVersion:1,modelVersion:'v224-display-ratio-1',samples:[],watermark:null,
+    retentionCount:0,migration:{done:false,examinedKeys:0,skippedKeys:0,admittedEvents:0},lastError:null};
+}
+function pressureLoad() {
+  if (pressureStore) return pressureStore;
+  pressureStore = pressureBlank();
+  try {
+    const text = localStorage.getItem(PRESSURE_KEY);
+    if (!text) return pressureStore;
+    if (text.length > 1500000) throw Error('Oversize pressure store');
+    const data = eventStorageParse(text);
+    if (data?.schemaVersion !== 1 || !Array.isArray(data.samples) || data.samples.length > PRESSURE_CAP)
+      throw Error('Unsupported pressure schema');
+    const unique = new Map();
+    for (const raw of data.samples) {const row=pressureCleanRow(raw);if(row)unique.set(row.key,row);}
+    pressureStore.samples = [...unique.values()].sort(pressureOrder);
+    if (pressureNumber(data.watermark?.timestamp)>0 && typeof data.watermark.key==='string')
+      pressureStore.watermark = {timestamp:data.watermark.timestamp,key:data.watermark.key.slice(0,400)};
+    pressureStore.retentionCount = pressureNumber(data.retentionCount) || 0;
+    if (data.migration?.done === true) pressureStore.migration = {done:true,
+      examinedKeys:pressureNumber(data.migration.examinedKeys)||0,skippedKeys:pressureNumber(data.migration.skippedKeys)||0,
+      admittedEvents:pressureNumber(data.migration.admittedEvents)||0};
+  } catch (error) {pressureWriteBlocked=true;pressureStore.lastError=String(error.message).slice(0,200);}
+  return pressureStore;
+}
+function pressureUpsert(raw) {
+  const store = pressureLoad(), row = pressureCleanRow(raw);
+  if (!row) return false;
+  const index = store.samples.findIndex(s=>s.key===row.key), old = store.samples[index];
+  if (!old && store.watermark && pressureOrder(row,store.watermark)<=0) return false;
+  if (old) {
+    // Stable first evidence; promote fallback to pre-dispatch or DIRECT to BATCH once.
+    row.timestamp=old.timestamp;row.provenance=old.provenance;
+    row.model=old.model || row.model;row.effort=old.effort || row.effort;
+    row.identitySource=old.identitySource || row.identitySource;
+    const improve=(a,b)=>!a ? b : b && ((a.snapshotRole!=='pre-dispatch' && b.snapshotRole==='pre-dispatch') ||
+      (a.snapshotRole===b.snapshotRole && a.sourceFamily==='direct' && b.sourceFamily==='batch')) ? b : a;
+    row.canonical=improve(old.canonical,row.canonical);row.postMax=improve(old.postMax,row.postMax);
+    if (JSON.stringify(old)===JSON.stringify(row)) return false;
+    store.samples[index]=row;
+  } else store.samples.push(row);
+  store.samples.sort(pressureOrder);
+  while (store.samples.length>PRESSURE_CAP) {
+    const removed=store.samples.shift();store.watermark={timestamp:removed.timestamp,key:removed.key};store.retentionCount++;
+  }
+  pressureRevision++;pressureResults.clear();return true;
+}
+function pressureDerive(id, attempts, episodes, provenance, live = false) {
+  if (!Array.isArray(attempts?.attempts)) return 0;
+  const rows=[attempts.current,attempts.last,...attempts.attempts.slice(-10)].filter(Boolean);
+  const byId=new Map(rows.filter(a=>Number.isSafeInteger(a.id)).map(a=>[a.id,a]));
+  let changed=0;
+  const pre=a=>pressureBest(['batch','direct'].map(f=>pressureVector(a?.pre?.[f],'pre-dispatch',
+    a?.requestDetectedAt || a?.startedAt || 0)));
+  for (const a of byId.values()) {
+    if (a.conversationId!==id || a.trigger!=='network-generation-dispatch' || a.outcome!=='success' ||
+        !a.outcomeConfirmedBy || !pressureLabel(a.requestModel)) continue;
+    changed+=Number(pressureUpsert({conversationId:id,eventId:a.id,attemptId:a.id,outcome:'success',
+      timestamp:a.outcomeConfirmedAt,model:a.requestModel,effort:a.requestEffort,identitySource:'generation request',
+      confirmationSource:a.outcomeConfirmedBy,provenance,canonical:pre(a)}));
+  }
+  for (const e of (Array.isArray(episodes?.episodes)?episodes.episodes:[]).slice(-10)) {
+    if (!e || e.conversationId!==id || !['UI MAX banner','structured SSE error','HTTP generation error','blocked before dispatch']
+      .includes(e.confirmationSource)) continue;
+    const a=byId.get(e.relatedRealAttemptId), linked=a?.conversationId===id && a.trigger==='network-generation-dispatch';
+    // Unlinked historical episodes have no trustworthy model/effort identity: skip.
+    const liveIdentity=live && e.active && id===chatIdFromURL();
+    const model=linked ? a.requestModel : liveIdentity ? attemptSnapshotModel(id) : null;
+    if (!pressureLabel(model)) continue;
+    const postMax=pressureBest(['batch','direct'].map(f=>pressureVector(e[f],'fresh-post-max',Infinity,e.firstSeenAt)));
+    const canonical=linked ? pre(a) : null;
+    changed+=Number(pressureUpsert({conversationId:id,eventId:e.id,attemptId:linked?a.id:null,outcome:'max',
+      timestamp:e.firstSeenAt,model,effort:linked?a.requestEffort:attemptEffortHint(),
+      identitySource:linked?'generation request':'live MAX snapshot model / UI effort hint',
+      confirmationSource:e.confirmationSource,provenance,
+      canonical:canonical || (postMax ? {...postMax,snapshotRole:'fresh-post-max-fallback'} : null),postMax}));
+  }
+  return changed;
+}
+function pressureSave(id) {
+  const store=pressureLoad();
+  if(pressureWriteBlocked){store.lastError='Existing pressure store unreadable/unsupported; preserved, writes blocked';return;}
+  const result=meterStorageWrite(id || 'pressure-v224',PRESSURE_KEY,store);
+  store.lastError=result.saved ? null : 'Pressure calibration persistence failed; in-memory evidence retained';
+}
+function pressureMigrate() {
+  const store=pressureLoad();if(store.migration.done)return;
+  // One origin-name scan; read only V2.23 event stores, <=128 keys / 4 MiB total,
+  // <=1 MiB/key. Legacy inferred V2.22 MAX is never admitted. Old bytes untouched.
+  const groups=new Map();let budget=4*1024*1024;
+  for(let i=0;i<localStorage.length && store.migration.examinedKeys<128;i++) {
+    const key=localStorage.key(i),match=key?.match(new RegExp(`^${P}:(attempts-v223|max-episodes-v223):([^:]+)$`));
+    if(!match)continue;store.migration.examinedKeys++;
+    const text=localStorage.getItem(key);
+    if(!text || text.length>1024*1024 || text.length>budget){store.migration.skippedKeys++;continue;}
+    budget-=text.length;
+    try {
+      const data=eventStorageParse(text),group=groups.get(match[2]) || {};
+      if(match[1]==='attempts-v223' && data?.version!==3)throw Error('Unsupported historical attempt schema');
+      group[match[1]==='attempts-v223'?'attempts':'episodes']=data;groups.set(match[2],group);
+    }catch{store.migration.skippedKeys++;}
+  }
+  for(const [id,group]of groups) store.migration.admittedEvents+=pressureDerive(id,group.attempts,group.episodes,'v223-migration');
+  store.migration.done=true;
+  // An empty derivation leaves storage unchanged; its marker stays in memory
+  // until first useful evidence is persisted (a later empty reload may rescan).
+  if(store.samples.length)pressureSave(chatIdFromURL());
+}
+function pressureCollect(id) {
+  // Observation taps never control the validated lifecycle and never throw into it.
+  if(pressureBusy || !id)return;
+  pressureBusy=true;
+  try {
+    pressureMigrate();
+    const attempts=attemptCache.get(id),episodes=episodeCache.get(id);
+    if(pressureDerive(id,attempts,episodes,'v224-observed',true))pressureSave(id);
+  }catch(error){pressureLoad().lastError=String(error.message).slice(0,200);}
+  finally{pressureBusy=false;}
+}
+function pressureCurrent(id) {
+  const state=eventStaticState(id),store=loadAttemptState(id),a=store.current || store.last;
+  // Visible pressure follows the newest accepted current state; unlike event
+  // canonicalization, an older BATCH must not mask a newer DIRECT observation.
+  const canonical=['batch','direct'].map(f=>pressureVector(state[f],'current')).filter(Boolean)
+    .sort((a,b)=>b.fullCapturedAt-a.fullCapturedAt || Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch'))[0] || null;
+  const snapshotModel=pressureLabel(attemptSnapshotModel(id));
+  const model=pressureLabel(store.current?.requestModel) || snapshotModel || pressureLabel(a?.requestModel);
+  const hint=pressureEffort(attemptEffortHint());
+  const effort=hint || (model===a?.requestModel ? pressureEffort(a?.requestEffort) : null);
+  return {model,effort,identitySource:hint?'snapshot/request model + UI effort hint':'snapshot/request model + last matching request effort',canonical};
+}
+function pressureCompute(samples, current, activeMax = false) {
+  const vector=current?.canonical,model=current?.model,effort=current?.effort;
+  const same=samples.filter(s=>s.model===model && s.canonical?.displayLikeTokens>0);
+  const exact=effort ? same.filter(s=>s.effort===effort) : [];
+  const maxCount=rows=>rows.filter(s=>s.outcome==='max').length;
+  // One exact MAX gives a transparent low-confidence anchor; >=2 are preferred.
+  const useExact=effort && (maxCount(exact)>=2 || maxCount(same)<2 && maxCount(exact)>0);
+  const rows=useExact?exact:same,tier=!model || !maxCount(rows)?'insufficient':useExact?'exact-model-effort':'same-model';
+  const maxima=rows.filter(s=>s.outcome==='max'),successes=rows.filter(s=>s.outcome==='success');
+  const values=maxima.map(s=>s.canonical.displayLikeTokens).sort((a,b)=>a-b),n=values.length;
+  // n<=4: minimum. n>=5: nearest-rank lower quartile (ceil(.25*n)-1).
+  const anchor=n ? values[n<5?0:Math.ceil(n*.25)-1] : null;
+  const range=n?{min:values[0],max:values[n-1]}:null,spread=n?(range.max-range.min)/anchor:null;
+  const fallback=maxima.some(s=>s.canonical.snapshotRole!=='pre-dispatch');
+  const mixedSource=maxima.some(s=>s.canonical.sourceFamily!==vector?.sourceFamily);
+  const secondary={};
+  for(const field of PRESSURE_FIELDS.filter(k=>k!=='displayLikeTokens')) {
+    const xs=maxima.map(s=>s.canonical[field]).filter(x=>pressureNumber(x)!=null);
+    secondary[field]={current:vector?.[field]??null,min:xs.length?Math.min(...xs):null,max:xs.length?Math.max(...xs):null};
+  }
+  let confidence='low',confidenceReason='Fewer than 2 comparable MAX events';
+  if(n>=2) {
+    confidenceReason='MAX spread exceeds 10%, fallback/source mismatch, or effort pooled';
+    if(spread<=.10 && !fallback && !mixedSource && tier==='exact-model-effort') {
+      confidence='medium';confidenceReason='At least 2 exact model/effort pre-MAX events; spread <=10%';
+      if(n>=5 && successes.length>=10 && spread<=.05) {
+        confidence='high';confidenceReason='At least 5 exact pre-MAX and 10 success events; spread <=5%';
+      }
+    }
+  }
+  const reason=!vector?'No valid current parser vector':!model?'Current model unknown':!anchor?'No comparable empirical MAX anchor':null;
+  const ratio=anchor && vector ? vector.displayLikeTokens/anchor : null;
+  const contradictorySuccessCount=anchor?successes.filter(s=>s.canonical.displayLikeTokens>=anchor).length:0;
+  if(contradictorySuccessCount){confidence='low';confidenceReason='Comparable SUCCESS at/above MAX anchor; threshold overlap';}
+  const currentExceedsAnchorWhileAlive=!activeMax && ratio!=null && ratio>=1;
+  if(currentExceedsAnchorWhileAlive){confidence='low';confidenceReason='Current non-MAX state at/above empirical anchor';}
+  return {modelVersion:'v224-display-ratio-1',state:activeMax?'current-max':reason?'calibrating':'scored',
+    score:activeMax || reason ? null : Math.max(0,Math.min(99,Math.round(ratio*100))),confidence,confidenceReason,
+    currentSourceVector:vector || null,currentDisplayLikeTokens:vector?.displayLikeTokens??null,
+    model:model || null,effort:effort || null,comparisonTier:tier,comparableMaxCount:n,comparableSuccessCount:successes.length,
+    empiricalMaxAnchor:anchor,anchorRange:range,anchorSpread:spread,anchorRule:'min for 1-4; nearest-rank lower quartile for >=5',
+    ratioBeforeClamping:ratio,secondaryMetricComparison:secondary,currentExceedsAnchorWhileAlive,
+    contradictorySuccessCount,postMaxFallbackPresent:fallback,sourceFamilyMismatch:mixedSource,unscoredReason:activeMax?null:reason};
+}
+function pressureResult(id) {
+  const current=pressureCurrent(id),active=!!eventActiveEpisode(id),key=JSON.stringify([pressureRevision,current,active]);
+  const cached=pressureResults.get(id);if(cached?.key===key)return cached.result;
+  const result=pressureCompute(pressureLoad().samples,current,active);
+  if(pressureResults.size>=16)pressureResults.delete(pressureResults.keys().next().value);
+  pressureResults.set(id,{key,result});return result;
+}
+function pressureSummary() {
+  const store=pressureLoad(),rows=store.samples,groups=Object.create(null);
+  for(const row of rows){const key=JSON.stringify([row.model,row.effort]);const g=groups[key] ||= {success:0,max:0};g[row.outcome]++;}
+  return {schemaVersion:1,totalSamples:rows.length,totalVectors:rows.reduce((n,s)=>n+!!s.canonical+!!s.postMax,0),
+    successSamples:rows.filter(s=>s.outcome==='success').length,uniqueMaxEvents:rows.filter(s=>s.outcome==='max').length,
+    pendingMaxVectors:rows.filter(s=>s.outcome==='max' && !s.canonical).length,groupedByModelEffort:groups,
+    oldestTimestamp:rows[0]?.timestamp??null,newestTimestamp:rows.at(-1)?.timestamp??null,
+    retentionCap:PRESSURE_CAP,retentionCount:store.retentionCount,watermark:store.watermark,
+    dedupPolicy:'conversation + outcome + event ID; stable first evidence, fallback/source promotion only',
+    migration:store.migration,writeBlocked:pressureWriteBlocked,lastError:store.lastError};
+}
+function pressureText(result) {
+  return result.state==='current-max'?'PRESSURE MAX':result.state==='calibrating'?'PRESSURE — / 100 · CALIBRATING':
+    `PRESSURE ${result.score} / 100 · ${result.confidence.toUpperCase()}`;
+}
