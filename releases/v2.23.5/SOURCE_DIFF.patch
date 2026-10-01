@@ -1,0 +1,258 @@
+--- V2.23.4@3337f1b
++++ V2.23.5
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP
++// @name         ChatGPT Conversation Size Meter V2.23.5 RELIABILITY HOTFIX
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.23.4
++// @version      2.23.5
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -1316,32 +1316,33 @@
+ 
+ function subtreeSize(mapping, rootId, cache, visiting = null) {
+   if (!rootId || !mapping[rootId]) return 0;
+-
+-  if (cache.has(rootId)) {
+-    return cache.get(rootId);
+-  }
+-
++  if (cache.has(rootId)) return cache.get(rootId);
+   if (!visiting) visiting = new Set();
+-
+-  if (visiting.has(rootId)) {
+-    return 0;
+-  }
+-
+-  visiting.add(rootId);
+-
+-  const node = mapping[rootId];
+-  const children = Array.isArray(node?.children) ? node.children : [];
+-
+-  let size = 1;
+-
+-  for (const childId of children) {
+-    size += subtreeSize(mapping, childId, cache, visiting);
+-  }
+-
+-  visiting.delete(rootId);
+-  cache.set(rootId, size);
+-
+-  return size;
++  if (visiting.has(rootId)) return 0;
++
++  // Same ordered traversal/counts as recursion, without an ancestry depth limit.
++  const stack = [];
++  const enter = id => {
++    visiting.add(id);
++    const node = mapping[id];
++    stack.push({id,children:Array.isArray(node?.children) ? node.children : [],index:0,size:1});
++  };
++  enter(rootId);
++  while (stack.length) {
++    const frame = stack[stack.length-1];
++    if (frame.index < frame.children.length) {
++      const childId = frame.children[frame.index++];
++      if (!childId || !mapping[childId]) continue;
++      if (cache.has(childId)) frame.size += cache.get(childId);
++      else if (!visiting.has(childId)) enter(childId);
++      continue;
++    }
++    visiting.delete(frame.id);
++    cache.set(frame.id,frame.size);
++    stack.pop();
++    if (!stack.length) return frame.size;
++    stack[stack.length-1].size += frame.size;
++  }
+ }
+ 
+ function analyzeBranchPoints(mapping, activeNodes) {
+@@ -2251,56 +2252,39 @@
+ }
+ 
+ function v212SubtreeSerializedStats(mapping, rootId, cache, visiting = null) {
+-  if (!rootId || !mapping?.[rootId]) {
+-    return {
+-      nodes: 0,
+-      bytes: 0
+-    };
+-  }
+-
+-  if (cache.has(rootId)) {
+-    return cache.get(rootId);
+-  }
+-
++  if (!rootId || !mapping?.[rootId]) return {nodes:0,bytes:0};
++  if (cache.has(rootId)) return cache.get(rootId);
+   if (!visiting) visiting = new Set();
+-
+-  if (visiting.has(rootId)) {
+-    return {
+-      nodes: 0,
+-      bytes: 0
+-    };
+-  }
+-
+-  visiting.add(rootId);
+-
+-  const node = mapping[rootId];
+-  const children = Array.isArray(node?.children) ? node.children : [];
+-
+-  let nodes = 1;
+-  let bytes = utf8BytesOfJSON(node) || 0;
+-
+-  for (const childId of children) {
+-    const child = v212SubtreeSerializedStats(
+-      mapping,
+-      childId,
+-      cache,
+-      visiting
+-    );
+-
+-    nodes += child.nodes;
+-    bytes += child.bytes;
+-  }
+-
+-  visiting.delete(rootId);
+-
+-  const result = {
+-    nodes,
+-    bytes
++  if (visiting.has(rootId)) return {nodes:0,bytes:0};
++
++  // Explicit DFS frames preserve recursive child order, cache and cycle semantics.
++  const stack = [];
++  const enter = id => {
++    visiting.add(id);
++    const node = mapping[id];
++    stack.push({id,children:Array.isArray(node?.children) ? node.children : [],
++      index:0,nodes:1,bytes:utf8BytesOfJSON(node) || 0});
+   };
+-
+-  cache.set(rootId, result);
+-
+-  return result;
++  enter(rootId);
++  while (stack.length) {
++    const frame = stack[stack.length-1];
++    if (frame.index < frame.children.length) {
++      const childId = frame.children[frame.index++];
++      if (!childId || !mapping?.[childId]) continue;
++      if (cache.has(childId)) {
++        const child = cache.get(childId);
++        frame.nodes += child.nodes; frame.bytes += child.bytes;
++      } else if (!visiting.has(childId)) enter(childId);
++      continue;
++    }
++    visiting.delete(frame.id);
++    const result = {nodes:frame.nodes,bytes:frame.bytes};
++    cache.set(frame.id,result);
++    stack.pop();
++    if (!stack.length) return result;
++    const parent = stack[stack.length-1];
++    parent.nodes += result.nodes; parent.bytes += result.bytes;
++  }
+ }
+ 
+ function v212AnalyzeBranchRetention(
+@@ -4059,7 +4043,7 @@
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.23.4';
++  health.candidateVersion = '2.23.5';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4404,7 +4388,7 @@
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.23.2 EVENT MODEL CLEANUP',
++  return ['ChatGPT Conversation Size Meter V2.23.5 EVENT MODEL CLEANUP',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -5064,7 +5048,8 @@
+     const text = await response.clone().text();
+     const id = binding.chatId, bytes = new TextEncoder().encode(text).length;
+     result.responseBytes = bytes;
+-    if (!text && category !== 'meter') return result; // Preserve validated empty app-response behavior.
++    if (!text && category !== 'meter' && !(binding.attemptId != null && result.status != null &&
++        (result.status < 200 || result.status >= 300))) return result; // Empty non-2xx generations still terminate.
+     if (category === 'meter') captureMeterNetwork(binding,url,bytes,result.contentType);
+     else attemptRecordNetworkEvent(id,url,bytes,result.contentType,binding,category);
+     if (category !== 'meter') {
+@@ -5941,7 +5926,7 @@
+     return;
+   }
+ 
+-  if (done && !a.outcome) {
++  if (done && !a.outcome && !(stats.status != null && (stats.status < 200 || stats.status >= 300))) {
+     attemptGenerationEnded(id);
+     attemptScheduleSSESuccess(id);
+   }
+@@ -5969,7 +5954,10 @@
+ 
+   const key = `${id}:${a.id}`;
+   const tail = streamBuffers.get(key);
+-  if (tail) attemptRecordStreamChunk(id,url,response,0,tail+'\n',a.id);
++  if (tail) {
++    streamBuffers.delete(key); // Flush the retained tail once, without joining it to itself.
++    attemptRecordStreamChunk(id,url,response,0,tail+'\n',a.id);
++  }
+   streamBuffers.delete(key);
+   const stats = attemptEnsureStreamStats(a);
+   const now = Date.now();
+@@ -6035,6 +6023,11 @@
+ 
+   attemptUpdateStoredAttempt(store, a);
+   saveAttemptState(id, store);
++
++  if (!a.outcome && a.responseStatus != null && (a.responseStatus < 200 || a.responseStatus >= 300)) {
++    eventFinalizeError(id,a,`HTTP generation failure (${a.responseStatus})`);
++    return;
++  }
+ 
+   if (completionSignals.length && !a.outcome) {
+     attemptGenerationEnded(id);
+@@ -6878,8 +6871,8 @@
+   saveAttemptState(id,loadAttemptState(id));
+   if (attemptLooksLikeMaxErrorText(text)) {
+     attemptMarkMax(id, a.responseStatus >= 400 ? 'HTTP generation error' : 'structured SSE error', a.id);
+-  } else if (a.responseStatus >= 400) {
+-    eventFinalizeError(id,a,'HTTP generation error');
++  } else if (a.responseStatus != null && (a.responseStatus < 200 || a.responseStatus >= 300)) {
++    eventFinalizeError(id,a,`HTTP generation failure (${a.responseStatus})`);
+   } else {
+     const names = attemptSSEEventNames(text);
+     attemptRecordStreamEventNames(a.streamStats,names);
+@@ -7230,7 +7223,7 @@
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.23.4',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.23.5',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -8090,7 +8083,7 @@
+ function getStatus(s) {
+   const a = s.runtimeAttemptCurrent || s.runtimeAttemptLast;
+   return {text:a ? `Real attempt #${a.id}: ${attemptStatusLabel(a)}` : 'Real attempts: IDLE',
+-    cls:a?.outcome === 'success' ? 'normal' : a?.outcome === 'max' || a?.outcome === 'error' ? 'warning' : a ? 'warning' : 'waiting'};
++    cls:s.id === chatIdFromURL() && eventActiveEpisode(s.id) ? 'maximum' : a?.outcome === 'success' ? 'normal' : a?.outcome === 'max' || a?.outcome === 'error' ? 'warning' : a ? 'warning' : 'waiting'};
+ }
+ 
+ function statusColor(cls) {
+@@ -9061,7 +9054,7 @@
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.23.4 ROUTE-AWARE RETRY CAPTURE',
++    'Candidate userscript: V2.23.5 RELIABILITY HOTFIX',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),

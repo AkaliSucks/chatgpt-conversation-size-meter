@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname,'..');
-const source = fs.readFileSync(path.join(root,'releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js'),'utf8');
+const source = fs.readFileSync(process.argv[2] || path.join(root,'releases/v2.23.5/chatgpt_chat_size_meter_v2235_reliability_hotfix.js'),'utf8');
 const dispatchURL = '/backend-api/f/conversation';
 const phrase = "You've reached the maximum length for this conversation";
 const body = (extra={}) => JSON.stringify({action:'next',parent_message_id:'parent-a',model:'test-model',conversation_id:'chat-a',messages:[{id:'u',author:{role:'user'},content:{content_type:'text',parts:['hello']}}],...extra});
@@ -1018,7 +1018,7 @@ check('Retry UI gives accepted BATCH completion and Copy includes bounded route 
   h.test.setLatest(h.test.calculateStats());assert.equal(await h.test.runQuickAction('copy'),true);assert.match(ui.status.textContent,/Diagnostics copied ✓/);
   assert.match(h.state.clipboard,/RETRY CAPTURE/);assert.match(h.state.clipboard,/"observedRoutes"/);assert.match(h.state.clipboard,/"responseBytes":168/);assert.match(h.state.clipboard,/"result":"captured"/);
   assert.match(h.state.clipboard,/OBSERVED CAPTURE ROUTES/);assert.match(h.state.clipboard,/"parserAcceptedFull":true/);
-  assert(h.state.clipboard.startsWith('Candidate userscript: V2.23.4'));
+  assert(h.state.clipboard.startsWith('Candidate userscript: V2.23.5'));
   const count=h.fetches.length;await h.advance(2201);assert.equal(ui.retry.textContent,'Retry capture');assert.match(ui.status.textContent,/Diagnostics copied ✓/);assert.equal(h.fetches.length,count);
 });
 check('large observed request bodies and expired forms do not produce unbounded BATCH replay',async()=>{
@@ -1045,10 +1045,211 @@ check('source-family extension preserves legacy classification and only adds plu
   assert.equal(family('/backend-api/conversations/chat-a'),'direct');assert.equal(family('/backend-api/conversations/chat-a?observed=1'),'direct');
   assert.equal(family('/backend-api/conversations/chat-a/details'),'other');assert.equal(family('/backend-api/conversations'),'other');assert.equal(family('/backend-api/conversations/batch'),'batch');
 });
-check('empty app responses retain checkpoint generation behavior; empty meter responses are explicit failed captures',async()=>{
+check('empty non-2xx generation responses terminate; empty meter responses are explicit failed captures',async()=>{
   const h=environment();h.state.fetch=async()=>response('',503);await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
-  const a=h.test.loadAttemptState('chat-a').current;assert(a);assert.equal(a.outcome,null);assert.equal(a.networkEvents.length,0);
-  h.state.fetch=async()=>response('');assert.equal(await h.test.retryCapture(),false);assert.equal(lastRetry(h).requests[0].responseBytes,0);assert.equal(lastRetry(h).requests[0].acceptedFull,false);assert.equal(h.test.loadAttemptState('chat-a').meterCaptureNetwork.length,1);assert.equal(a.outcome,null);
+  const a=h.test.loadAttemptState('chat-a').last;assert(a);assert.equal(a.outcome,'error');assert.equal(a.responseBytes,0);assert.equal(h.test.loadAttemptState('chat-a').current,null);assert.equal(a.networkEvents.length,1);
+  h.state.fetch=async()=>response('');assert.equal(await h.test.retryCapture(),false);assert.equal(lastRetry(h).requests[0].responseBytes,0);assert.equal(lastRetry(h).requests[0].acceptedFull,false);assert.equal(h.test.loadAttemptState('chat-a').meterCaptureNetwork.length,1);assert.equal(a.outcome,'error');
+});
+
+
+// V2.23.5 hotfix regressions. Reference metrics come from the exact parent bytes.
+const v234Source = require('node:child_process').execFileSync('git',['show',
+  '3337f1bd41dea2577ea2e6329783b81ea7466e00:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js'],{encoding:'utf8'});
+const serialized = value => JSON.stringify(value);
+function streamedResponse(text,status=500,type='application/json',parts=[text]) {
+  const resp=response(text,status,type);
+  resp.clone=()=>{let index=0;return {text:async()=>text,body:{getReader:()=>({read:async()=>index<parts.length?
+    {done:false,value:new TextEncoder().encode(parts[index++])}:{done:true}})}};};
+  return resp;
+}
+check('V235 active verified MAX overrides orange/warning overlay; clearing restores the identical ordinary state',()=>{
+  const h=environment(),a=h.start(),before=h.test.getStatus({id:'chat-a',runtimeAttemptCurrent:a});
+  assert.equal(before.cls,'warning');h.state.banners=[h.banner()];h.test.eventPollMax('chat-a');
+  const active=h.test.getStatus({id:'chat-a',runtimeAttemptLast:a,experimentalRisk:{band:'orange'}});
+  assert.equal(active.cls,'maximum');assert.equal(active.text,'Real attempt #1: MAX');assert.equal(h.test.statusColor(active.cls),'#ff7777');
+  h.test.setUI();h.test.render();assert.equal(h.test.ui().panel.className,'theme-maximum');
+  const id=h.test.eventActiveEpisode('chat-a').id;h.state.banners=[];h.test.render();
+  assert.equal(h.test.eventActiveEpisode('chat-a'),null);assert.equal(h.test.ui().panel.className,'theme-warning');
+  assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptLast:a}).cls,before.cls);
+  assert.equal(h.test.eventEpisodes('chat-a').episodes.length,1);assert.equal(h.test.eventEpisodes('chat-a').episodes[0].id,id);
+});
+check('V235 current verified MAX without any real attempt still forces red; snapshot phase cannot override clearance',()=>{
+  const h=environment();h.state.banners=[h.banner()];h.test.eventPollMax('chat-a');
+  assert.equal(h.test.getStatus({id:'chat-a',full:false}).cls,'maximum');
+  h.state.banners=[];h.test.eventPollMax('chat-a');
+  assert.equal(h.test.getStatus({id:'chat-a',phase:'max',lifecycleCurrentPhase:'max',liveMaximum:false,experimentalRisk:{band:'orange'}}).cls,'waiting');
+  assert.equal(h.test.loadAttemptState('chat-a').attempts.length,0);
+});
+check('V235 historical MAX, quoted conversation text and streamed phrases do not force red',()=>{
+  const h=environment(),a=h.start();h.document.body.innerText=phrase;h.state.banners=[h.banner({turn:true})];
+  h.chunk(a,'data: '+JSON.stringify({type:'delta',delta:{text:phrase}})+'\n\n');h.test.eventPollMax('chat-a');
+  assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptCurrent:a,phase:'max',liveMaximum:false}).cls,'warning');
+  assert.equal(h.test.eventEpisodes('chat-a').episodes.length,0);
+  assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptLast:{id:7,outcome:'max',status:'max'},phase:'max'}).cls,'warning');
+});
+check('V235 transport-verified active MAX forces red; recovery and navigation preserve binding',()=>{
+  const h=environment(),a=h.start();h.chunk(a,'data: {"error":{"code":"conversation_too_long"}}\n\n');
+  assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptLast:a}).cls,'maximum');h.navigate('chat-b');
+  assert.notEqual(h.test.getStatus({id:'chat-a',runtimeAttemptLast:a}).cls,'maximum');
+  assert.notEqual(h.test.getStatus({id:'chat-b'}).cls,'maximum');h.navigate('chat-a');
+  const b=h.start({parent_message_id:'next'});h.setNow(h.now()+1);b.startedAt=h.now();h.chunk(b,'data: [DONE]\n\n');
+  assert.equal(b.outcome,'success');assert.equal(h.test.eventActiveEpisode('chat-a'),null);
+  assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptLast:b}).cls,'normal');
+});
+check('V235 shallow subtree counts, bytes, cache order and cycle semantics exactly match recursive parent',()=>{
+  const h=environment(),old=environment(v234Source);let seed=23;
+  const random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed;};
+  for(let fixture=0;fixture<80;fixture++) {
+    const map={},n=20+random()%60;
+    for(let i=0;i<n;i++)map['n'+i]={id:'n'+i,children:[],value:i%2?'Unicode 🐈':'plain',metadata:{order:i}};
+    for(let i=0;i<n;i++)for(let j=0;j<random()%4;j++)map['n'+i].children.push(random()%5===0?'missing':'n'+random()%n);
+    for(const method of ['subtreeSize','v212SubtreeSerializedStats']) {
+      const oldCache=new Map(),newCache=new Map(),oldVisiting=new Set(['reserved']),newVisiting=new Set(['reserved']);
+      assert.equal(serialized(h.test[method](map,'n0',newCache,newVisiting)),serialized(old.test[method](map,'n0',oldCache,oldVisiting)));
+      assert.equal(serialized([...newCache]),serialized([...oldCache]),method+' cache traversal order');
+      assert.deepEqual([...newVisiting],[...oldVisiting]);
+      assert.equal(serialized(h.test[method](map,'n0',newCache,newVisiting)),serialized(old.test[method](map,'n0',oldCache,oldVisiting)));
+    }
+  }
+});
+check('V235 missing roots, existing cache, duplicate/shared edges and caller visiting sets preserve exact metrics',()=>{
+  const h=environment(),old=environment(v234Source),map={r:{children:['a','a','b','missing']},a:{children:['shared']},b:{children:['shared','r']},shared:{children:[]}};
+  for(const method of ['subtreeSize','v212SubtreeSerializedStats'])for(const rootId of [null,'missing','r','a']) {
+    const cacheA=new Map(),cacheB=new Map(),visitA=new Set(['b']),visitB=new Set(['b']);
+    assert.equal(serialized(h.test[method](map,rootId,cacheA,visitA)),serialized(old.test[method](map,rootId,cacheB,visitB)));
+    assert.equal(serialized([...cacheA]),serialized([...cacheB]));assert.deepEqual([...visitA],[...visitB]);
+  }
+});
+function deepTree(depth=12000,branched=false) {
+  const map={};
+  for(let i=0;i<depth;i++) {
+    map['n'+i]={id:'n'+i,parent:i?'n'+(i-1):null,children:i<depth-1?['n'+(i+1)]:[],
+      message:{id:'m'+i,author:{role:i%2?'assistant':'user'},content:{content_type:'text',parts:['x']}}};
+    if(branched){map['n'+i].children.push('leaf'+i);map['leaf'+i]={id:'leaf'+i,parent:'n'+i,children:[],metadata:{value:'🧪'}};}
+  }
+  return map;
+}
+check('V235 12000-node chain completes both subtree metrics with no truncation or RangeError',()=>{
+  const h=environment(),map=deepTree(),cache=new Map();
+  const expected=Object.values(map).reduce((n,node)=>n+Buffer.byteLength(JSON.stringify(node)),0);
+  const result=h.test.v212SubtreeSerializedStats(map,'n0',cache);
+  assert.equal(result.nodes,12000);assert.equal(result.bytes,expected);assert.equal(cache.size,12000);
+  assert.equal(h.test.subtreeSize(map,'n0',new Map()),12000);
+  console.log('TOPOLOGY chain: 12000 ancestry nodes; exact '+result.bytes+' serialized bytes');
+});
+check('V235 24000-node deeply branched tree completes both metrics and preserves every leaf',()=>{
+  const h=environment(),map=deepTree(12000,true);
+  const expected=Object.values(map).reduce((n,node)=>n+Buffer.byteLength(JSON.stringify(node)),0);
+  const result=h.test.v212SubtreeSerializedStats(map,'n0',new Map());
+  assert.equal(result.nodes,24000);assert.equal(result.bytes,expected);assert.equal(h.test.subtreeSize(map,'n0',new Map()),24000);
+  console.log('TOPOLOGY branched: 12000 ancestry + 12000 leaves; exact '+result.bytes+' serialized bytes');
+});
+check('V235 full parser topology and retained profiler survive 12000-deep active AND alternate branches',()=>{
+  const h=environment(),map=deepTree();
+  for(let i=0;i<12000;i++)map['alt'+i]={id:'alt'+i,parent:i?'alt'+(i-1):'n0',children:i<11999?['alt'+(i+1)]:[],
+    message:{id:'am'+i,author:{role:'tool'},content:{content_type:'text',parts:['result']}}};
+  map.n0.children.push('alt0');const obj={conversation_id:'chat-a',current_node:'n11999',mapping:map};
+  const parsed=h.test.parseMappingConversation(obj);assert(parsed?.full);assert.equal(parsed.records.length,12000);
+  const topology=parsed.structure.contextTopology;assert.notEqual(topology.ok,false);assert(topology.retainedState);
+  assert.equal(parsed.structure.mappingNodes,24000);assert.equal(parsed.structure.alternateSubtreeNodesTotal,12000);
+  const alternateBytes=Array.from({length:12000},(_,i)=>Buffer.byteLength(JSON.stringify(map['alt'+i]))).reduce((a,b)=>a+b,0);
+  assert.equal(topology.retainedState.branchRetention.alternateSubtreeBytesTotal,alternateBytes);
+  console.log('TOPOLOGY full parser: 24000 mapping nodes; 12000 active + 12000 alternate; retained profiler valid');
+});
+check('V235 complete shallow topology/retained metrics serialize identically to parent across branched fixtures',()=>{
+  const h=environment(),old=environment(v234Source);
+  for(const depth of [2,8,32,80]) {
+    const map=deepTree(depth,true),obj={conversation_id:'chat-a',current_node:'n'+(depth-1),mapping:map};
+    assert.equal(serialized(h.test.parseMappingConversation(obj)),serialized(old.test.parseMappingConversation(obj)));
+  }
+});
+check('V235 native-style 54-byte JSON HTTP 500 stream promptly terminalizes and preserves complete evidence',async()=>{
+  const h=environment(),text=JSON.stringify({error:'server unavailable'}).padEnd(54,' '),resp=streamedResponse(text);
+  h.state.fetch=async()=>resp;assert.equal(await h.page.fetch(dispatchURL,{method:'POST',body:body()}),resp);await h.flush();
+  const store=h.test.loadAttemptState('chat-a'),a=store.last;assert(a);assert.equal(store.current,null);
+  assert.equal(a.outcome,'error');assert.equal(a.status,'error');assert.equal(a.outcomeStatus,'error');
+  assert.equal(a.outcomeConfirmedBy,'HTTP generation failure (500)');assert.equal(a.responseStatus,500);
+  assert.equal(a.responseContentType,'application/json');assert.equal(a.responseBytes,54);assert.equal(a.streamStats.totalBytes,54);
+  assert.equal(a.finalizedAt,h.now());assert.equal(a.responseCompletedAt,h.now());assert.equal(a.transportClosedAt,h.now());assert.equal(a.telemetryFinalizedAt,h.now());
+  assert(a.requestBodyBytes>0);assert.equal(a.requestModel,'test-model');assert.equal(a.requestPromptChars,5);
+  assert.equal(store.attempts.length,1);assert.equal(h.test.eventEpisodes('chat-a').episodes.length,0);
+  assert(h.test.eventDiagnostics('chat-a').join('\n').includes('HTTP generation failure (500)'));
+  assert(![...h.storage.values()].join('').includes('server unavailable'));assert.equal(h.test.eventStorageHealth('chat-a').finalSaveResult,'saved');
+});
+check('V235 successful resend after HTTP 500 is an independent real attempt; late failure cannot overwrite it',async()=>{
+  const h=environment();h.state.fetch=async()=>streamedResponse('{"error":"server"}',500);
+  await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();const failed=h.test.loadAttemptState('chat-a').last;
+  h.state.fetch=async()=>successfulStreamResponse();await h.page.fetch(dispatchURL,{method:'POST',body:body({action:'retry'})});await h.flush();
+  const store=h.test.loadAttemptState('chat-a'),success=store.last;assert.notEqual(success.id,failed.id);assert.equal(success.outcome,'success');
+  h.test.attemptFinishStream('chat-a',dispatchURL,response('',500),null,failed.id);
+  assert.equal(store.last.id,success.id);assert.equal(success.outcome,'success');assert.equal(failed.outcome,'error');
+  assert.equal(store.current,null);assert.deepEqual(Array.from(store.attempts,a=>a.outcome),['error','success']);assert.equal(h.test.eventEpisodes('chat-a').episodes.length,0);
+});
+check('V235 non-2xx completion markers never become SUCCESS; positive completion retains 2xx behavior',async()=>{
+  for(const status of [199,302,400,429,500,503])for(const stream of [false,true]) {
+    const h=environment(),text='data: {"message":{"status":"finished_successfully"}}\n\ndata: [DONE]\n\n';
+    h.state.fetch=async()=>stream?streamedResponse(text,status,'text/event-stream'):response(text,status,'text/event-stream');
+    await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+    const a=h.test.loadAttemptState('chat-a').last;assert.equal(a?.outcome,'error',status+' stream='+stream);assert.equal(a.responseStatus,status);
+    assert.equal(h.test.loadAttemptState('chat-a').current,null);assert.equal(h.test.eventEpisodes('chat-a').episodes.length,0);
+  }
+});
+check('V235 non-2xx structured MAX retains precedence and creates the same single related episode',async()=>{
+  for(const stream of [false,true]) {
+    const h=environment(),text='data: {"error":{"code":"conversation_too_long"}}\n\n';
+    h.state.fetch=async()=>stream?streamedResponse(text,400,'text/event-stream'):response(text,400,'text/event-stream');
+    await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+    const a=h.test.loadAttemptState('chat-a').last;assert.equal(a.outcome,'max');assert.equal(h.test.eventEpisodes('chat-a').episodes.length,1);
+    assert.equal(h.test.eventActiveEpisode('chat-a').relatedRealAttemptId,a.id);assert.equal(h.test.getStatus({id:'chat-a',runtimeAttemptLast:a}).cls,'maximum');
+  }
+});
+check('V235 plain JSON MAX with no newline is still recognized at stream completion',async()=>{
+  const h=environment();h.state.fetch=async()=>streamedResponse('{"error":{"code":"conversation_too_long"}}',400);
+  await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+  assert.equal(h.test.loadAttemptState('chat-a').last.outcome,'max');assert.equal(h.test.eventEpisodes('chat-a').episodes.length,1);
+});
+check('V235 delayed chunked HTTP failure stays running only until body closes, with final exact totals',async()=>{
+  const h=environment(),a=h.start(),resp=response('',500);
+  h.test.attemptRecordStreamChunk('chat-a',dispatchURL,resp,12,'{"error":"se',a.id);
+  assert.equal(a.outcome,null);await h.advance(37);
+  h.test.attemptRecordStreamChunk('chat-a',dispatchURL,resp,7,'rver"}',a.id);
+  h.test.attemptFinishStream('chat-a',dispatchURL,resp,null,a.id);
+  assert.equal(a.outcome,'error');assert.equal(a.responseBytes,19);assert.equal(a.finalizedAt,h.now());assert.equal(a.transportClosedAt,h.now());
+  assert.equal(a.streamStats.chunkCount,3);assert.equal(h.test.loadAttemptState('chat-a').current,null);
+});
+check('V235 XHR completed non-2xx uses the same terminal reason and archives status/type/bytes',async()=>{
+  const h=environment(),xhr=new h.page.XMLHttpRequest();xhr.open('POST',dispatchURL);xhr.send(body());
+  xhr.status=500;xhr.responseText='{"error":"generic"}';xhr.events.load();await h.flush();
+  const a=h.test.loadAttemptState('chat-a').last;assert.equal(a.outcome,'error');assert.equal(a.responseBytes,Buffer.byteLength(xhr.responseText));
+  assert.equal(a.outcomeConfirmedBy,'HTTP generation failure (500)');assert.equal(h.test.loadAttemptState('chat-a').current,null);
+});
+check('V235 empty non-2xx stream completes ERROR; empty successful app response retains old no-observation behavior',async()=>{
+  const h=environment();h.state.fetch=async()=>streamedResponse('',503);await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+  assert.equal(h.test.loadAttemptState('chat-a').last.outcome,'error');assert.equal(h.test.loadAttemptState('chat-a').last.responseBytes,0);
+  const good=environment();good.state.fetch=async()=>response('',200);await good.page.fetch(dispatchURL,{method:'POST',body:body()});await good.flush();
+  assert.equal(good.test.loadAttemptState('chat-a').current.outcome,null);assert.equal(good.test.loadAttemptState('chat-a').current.networkEvents.length,0);
+});
+check('V235 regression fixture reproduces both recursive helper overflows on the exact parent only',()=>{
+  const old=environment(v234Source),map=deepTree();
+  for(const method of ['subtreeSize','v212SubtreeSerializedStats']) {
+    assert.throws(()=>old.test[method](map,'n0',new Map()),error=>error.name==='RangeError' && /call stack/.test(error.message));
+  }
+});
+check('V235 generic HTTP error quoting MAX remains ERROR and preserves diagnostic distinction from unknown',async()=>{
+  const h=environment(),text=JSON.stringify({message:{author:{role:'assistant'},content:{parts:[phrase]}}});
+  h.state.fetch=async()=>streamedResponse(text,500);await h.page.fetch(dispatchURL,{method:'POST',body:body()});await h.flush();
+  const failed=h.test.loadAttemptState('chat-a').last;assert.equal(failed.outcome,'error');assert.equal(h.test.eventEpisodes('chat-a').episodes.length,0);
+  h.test.setLatest(h.test.calculateStats());await h.test.copyStats();assert(h.state.clipboard.includes('HTTP generation failure (500)'));
+  const next=h.start({parent_message_id:'next'});h.test.eventFinalizeError('chat-a',next,'correlation incomplete: page restart');
+  assert.equal(next.outcome,'unknown');assert.equal(next.outcomeConfirmedBy,'correlation incomplete: page restart');assert.equal(failed.outcome,'error');
+});
+check('V235 diagnostic versions consistently identify the hotfix without changing storage namespaces',async()=>{
+  const h=environment();h.test.inspectJSON(mapping(),'/backend-api/conversation/chat-a',1200);h.test.setLatest(h.test.calculateStats());
+  await h.test.copyStats();assert(h.state.clipboard.startsWith('Candidate userscript: V2.23.5 RELIABILITY HOTFIX'));
+  assert(h.state.clipboard.includes('ChatGPT Conversation Size Meter V2.23.5 EVENT MODEL CLEANUP'));
+  assert.equal(h.test.eventStorageHealth('chat-a').candidateVersion,'2.23.5');
+  h.state.fetch=async()=>response('{}');await h.test.retryCapture();assert.equal(lastRetry(h).version,'2.23.5');
+  assert([...h.storage.keys()].every(key=>key.startsWith('cgpt-size-meter-v2101:')));
 });
 
 (async()=>{
