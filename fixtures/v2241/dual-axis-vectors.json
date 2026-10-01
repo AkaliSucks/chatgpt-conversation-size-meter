@@ -1,0 +1,14 @@
+{
+  "provenance": "USER-REPORTED native observations from the V2.24.1 request, reproduced in synthetic tests. Only listed values are reported; the harness supplies synthetic parser-structure scaffolding for unreported mapping/node fields, and other missing metrics are null. Approximate vectors; not native validation of this candidate. No production seeding.",
+  "model": "gpt-5-6-thinking",
+  "effort": "max",
+  "maxima": [
+    {"conversationId":"text-max-a","displayLikeTokens":840795,"activeBranchBytes":20075510},
+    {"conversationId":"text-max-b","displayLikeTokens":845331,"activeBranchBytes":15320298},
+    {"conversationId":"6abc71ed-ed38-83e8-b639-82d654989677","displayLikeTokens":571806,"activeBranchBytes":27149953,"mappingBytes":27427061,"retainedBytes":21247284,"retainedShare":78.27247475270288,"toolResultBytes":20445338,"hot128":1265117,"hot256":2304736,"branchNodes":4670,"messageNodes":4669,"strongContextMarkers":null}
+  ],
+  "freshMax": {"displayLikeTokens":571836,"activeBranchBytes":27151472,"mappingBytes":27428619,"retainedBytes":21248764,"toolResultBytes":20445338},
+  "healthyEarlier": {"displayLikeTokens":453725,"activeBranchBytes":19686898,"expectedScore":73,"expectedDominant":"state","outcome":"success"},
+  "healthyNearBoundary": {"displayLikeTokens":561842,"activeBranchBytes":26245630,"expectedScore":97,"expectedDominant":"state","outcome":"success"},
+  "tinyHealthy": {"displayLikeTokens":1000,"activeBranchBytes":20000,"expectedScore":0,"outcome":"success"}
+}

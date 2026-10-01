@@ -1,0 +1,62 @@
+V2.24.1 superseding 59 cases: upper frontier, LOW policy, proportional synthetic state, and identity expectations explicitly updated; no cases skipped.
+PASS fixture tiny scores with proportional synthetic dual axes
+PASS fixture medium scores with proportional synthetic dual axes
+PASS fixture healthy-large scores with proportional synthetic dual axes
+PASS fixture large-raw-low-display scores with proportional synthetic dual axes
+PASS D/E are two MAX events and E post-MAX remains supporting evidence
+PASS repeated fresh post captures and diagnostics cannot manufacture events or change first evidence
+PASS healthy 438k SUCCESS uses pre-generation instead of giant post vector
+PASS parser-valid BATCH pre preferred over DIRECT and future/invalid vectors excluded
+PASS missing pre falls back to fresh post and lowers confidence
+PASS pre arrival promotes fallback within same event; DIRECT can promote to BATCH
+PASS stale historical MAX remains numeric and never terminal/red
+PASS verified current MAX overrides missing vector, absent anchor and any numeric estimate
+PASS ratio above 1 clamps 99 and records non-MAX exceedance
+PASS different model never borrows unrelated MAX anchors
+PASS different effort with sufficient same-model events explicitly pools and lowers confidence
+PASS exact model/effort with 2 anchors preferred over pooled effort
+PASS one exact MAX preferred when total model evidence is still sparse
+PASS one exact MAX yields to 2+ same-model anchors while effort calibration is insufficient
+PASS unknown current effort uses explicit same-model tier
+PASS effort comparison normalizes case/whitespace without inventing model or effort aliases
+PASS two recent close MAX examples retain LOW confidence
+PASS wide MAX disagreement forces low confidence
+PASS 5 close pre-MAX plus 10 successes retain LOW confidence
+PASS 5 MAX without a meaningful SUCCESS population cannot produce high confidence
+PASS success at/above anchor is retained and explicitly weakens confidence
+PASS secondary bytes do not affect score; their comparison is visible
+PASS mismatched representation lowers confidence without inventing heavy metric weights
+PASS pressure is deterministic across sample insertion order and repeated evaluations
+PASS model uses upper maximum for every independent sample count
+PASS missing/null/string/nonfinite metrics never coerce to zero or score
+PASS malformed vectors, zero/missing parser structure and other family rejected
+PASS new storage contains only allowlisted compact fields; giant diagnostic objects discarded
+PASS reload deduplicates existing event and preserves compact schema
+PASS unsupported/corrupt store fails safely without claiming calibrated pressure
+PASS unsupported existing pressure data is preserved byte-for-byte and writes fail closed
+PASS retention cap keeps newest 256 events deterministically and rejects evicted replay
+PASS same event number in separate conversations is independent evidence
+PASS migration preserves old record bytes and is idempotent across calls and reload
+PASS migration reads compressed historical records through compatible codec
+PASS migration skips legacy inferred MAX, malformed, wrong-schema and incomplete evidence
+PASS migration bounds key reads and oversize input
+PASS live SUCCESS is collected from real generation hook with its pre vector
+PASS live structured MAX links pre vector and later post capture to one event
+PASS generic ERROR, unknown and quoted MAX never enter calibration
+PASS persistence failure is visible while in-memory calibration remains usable
+PASS Copy diagnostics includes concise pressure model and summary, never raw arrays
+PASS render and diagnostics use cached model and never scan/write storage repeatedly
+PASS current source/vector changes invalidate cached pressure result
+PASS visible pressure follows newest accepted source instead of older BATCH
+PASS production pressure module has no fixture MAX values or fixed token anchors
+PASS UI keeps existing themes and shows whole-number pressure without capacity terminology
+PASS production render displays calibrating, numeric and verified MAX states with existing color
+PASS V2.24 metadata, storage health and retry trace consistently identify 2.24.0
+PASS live unlinked blocked MAX admits fresh fallback with explicit UI identity provenance
+PASS distinct MAX episodes after clearance count independently within same chat
+PASS historical episode without trustworthy request identity is skipped
+PRESSURE storage cap: 58630 serialized bytes, 256 events / 512 vectors
+PASS at full cap compact persisted store stays small and retains both MAX vectors
+PASS reversed retention order yields identical retained evidence and watermark
+PASS cross-chat pressure uses each current model and does not transfer active MAX
+59/59 V2.24 synthetic tests passed; native validation pending
