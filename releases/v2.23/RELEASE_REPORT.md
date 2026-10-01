@@ -1,3 +1,94 @@
+# Final V2.23.4 candidate — Bookkeeping and native validation closeout
+
+Prepared 2026-09-30 on `codex/v234-final-bookkeeping`, directly from preserved
+native-validation checkpoint `4cdafae0e34f4e9c68b77ba06791201e3dbe17b9`.
+The commit containing this report is the final child candidate. The checkpoint
+and `codex/v234-route-aware-retry` remain unchanged. No merge, PR, push or V2.24.
+
+The only userscript change is `storageHealth.candidateVersion` from `2.23.3`
+to `2.23.4`. An exact whole-file byte comparison against the checkpoint proves
+that all other bytes, including parser, send/correlation, MAX classification,
+retry routing, storage retention, static publication and completion UI, are
+unchanged. The protected core diagnostic header still has its inherited 2.23.2
+label; userscript metadata, Copy's first line, lastRetry.version and storage
+health identify this candidate as V2.23.4.
+
+## Capture-history and retry-result semantics
+
+MAX episode `captureHistory` includes accepted natural/app-state observations
+as well as accepted manual Retry observations. It records accepted full source
+observations attached to the episode, with one record per accepted observation;
+it is **not a manual-Retry counter**. Natural traffic can increase the history
+before or during a Retry. Compare the retry trace, source family and capture
+timestamps when attributing a particular observation to that action. The
+existing history bound is thirty observations per episode. No historical
+records were relabelled and no new origin labels were invented.
+
+`lastRetry` remains **latest-only**. A later manual or automatic retry can
+replace an earlier result, including cancellation. To retain a cancellation
+trace, copy diagnostics before another retry completes. This cleanup adds no
+retry-result history and changes no capture/classification behavior or storage
+mutations.
+
+## Native validation provenance
+
+The user reports that native validation at exact checkpoint `4cdafae` passed:
+
+- Route-aware Retry success with a fresh accepted snapshot.
+- Repeat Retry stability.
+- Navigation cancellation.
+- Persistent Copy/Retry completion feedback.
+- MAX episode identity preservation.
+- Storage durability.
+
+These are **USER-REPORTED NATIVE** results, not browser observations made by
+this assistant. No additional native timings, response sizes, source families
+or diagnostic files were supplied with this closeout. The historical report's
+open native-validation status and pending sequence below describe the earlier
+checkpoint preparation and are superseded by these reported passes. This
+child preserves all validated behavior by exact bytes, so no new behavior
+retest is introduced by the bookkeeping change. Real route availability,
+clipboard permissions and concurrent-tab/server timing remain environmental
+conditions rather than new claims from the synthetic harness.
+
+## Verification and release identity
+
+The complete existing suite passes **99/99 synthetic tests**, including native-
+style send paths, DIRECT/BATCH publication, quota-pressure retention, route-aware
+retry success/failure/cancellation, episode dedup and completion UI. The harness
+itself is unchanged. Baseline verification and `node --check` on the candidate,
+baseline, harness and byte verifier all pass. JavaScript and shell sources
+retain LF checkout policy.
+
+Byte verification passes for 66,862 baseline parser/extraction/topology/profiler
+bytes, 8,807 validated send/correlation bytes and 15,435 static-publication/cache
+bytes. The 72,454-byte storage/MAX/classifier/transport/acceptance comparison
+allows only the exact authorized version-label substitution; all other bytes
+match their validated checkpoints. The prior plural source-family extension is
+unchanged. Independently, all 306,017 candidate bytes match `4cdafae` with only
+that single-byte substitution. No protected parser function was modified.
+
+The immutable baseline remains 289,994 bytes, SHA-256
+`08bf10714deae924ced7716b5b63f873ba56b11d782289b92d55de62af343696`.
+Two deterministic package builds produce identical ZIP and checksum files;
+the ZIP contains only the exact candidate JS. Commands and complete results
+are retained in `VALIDATION.txt`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| JS | 306017 | `0148b5aa5dac3aa2743c6f6c52f3b14147acb0d29980a262ad3e38fd2c2f275f` |
+| ZIP | 69016 | `011ffa5526ad7b99e789caa143bff6e56c0b39bfdfc00cccd703bbb5df168072` |
+
+Changed files: release JS/ZIP, SHA256SUMS, VALIDATION.txt, this report and
+`scripts/verify-v223-protected.js`. Runtime diff: one byte. The verifier adds
+an exact version-label allowance and a whole-source comparison to the native
+checkpoint. The spec, baseline, regression harness, line-ending policy and
+package builder are unchanged.
+
+---
+
+## Historical V2.23.4 preparation report (4cdafae; superseded closeout status)
+
 # V2.23.4 candidate — Route-aware Retry Capture and completion feedback
 
 Prepared 2026-09-30 on `codex/v234-route-aware-retry`, directly from preserved

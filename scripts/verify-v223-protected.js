@@ -63,6 +63,13 @@ for (const [start,end] of [
 console.log(`PASS ${staticBytes} validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30`);
 const validated = require('node:child_process').execFileSync('git',['show',
   'ccdd1b97485d59cdc7d4f92735cca5b1ada7e431:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js']);
+function versionBookkeeping(bytes) {
+  const old = Buffer.from("health.candidateVersion = '2.23.3';");
+  const replacement = Buffer.from("health.candidateVersion = '2.23.4';");
+  const index = bytes.indexOf(old);
+  assert(index >= 0 && bytes.indexOf(old,index + old.length) === -1,'exactly one authorized version label');
+  return Buffer.concat([bytes.subarray(0,index),replacement,bytes.subarray(index + old.length)]);
+}
 let eventBytes = 0;
 for (const [start,end] of [
   ['function eventStorageError(', 'function eventEpisodes('],
@@ -73,13 +80,19 @@ for (const [start,end] of [
   ['function attemptIsPreflightRequest(', 'function installNetworkHooks(']
 ]) {
   const original = region(validated,start,end);
-  assert.deepEqual(region(candidate,start,end),original,`validated storage/MAX path: ${start}`);
+  const expected = start === 'function eventStorageError(' ? versionBookkeeping(original) : original;
+  assert.deepEqual(region(candidate,start,end),expected,`validated storage/MAX path: ${start}`);
   eventBytes += original.length;
 }
-console.log(`PASS ${eventBytes} storage retention/MAX episode/generation classifier/transport/acceptance bytes unchanged from ccdd1b9`);
+console.log(`PASS ${eventBytes} storage retention/MAX episode/generation classifier/transport/acceptance bytes match ccdd1b9 with only the authorized version label update`);
 const oldFamily = region(validated,'function lifecycleSourceFamily(', 'function lifecycleFamilyLabel(');
 const newFamily = region(candidate,'function lifecycleSourceFamily(', 'function lifecycleFamilyLabel(');
 const allowed = oldFamily.toString().replace('/\\/backend-api\\/conversation\\/[^/?#]+/i.test(s) &&\n    !s.includes(\'/backend-api/conversations/\')',
   '(/\\/backend-api\\/conversation\\/[^/?#]+/i.test(s) &&\n    !s.includes(\'/backend-api/conversations/\')) ||\n    /\\/backend-api\\/conversations\\/[^/?#]+(?:[?#]|$)/i.test(s)');
 assert.deepEqual(newFamily,Buffer.from(allowed),'only source-family change: accepted per-chat plural route support');
 console.log('PASS source-family classifier has only the demonstrated plural per-chat route extension');
+const nativeCheckpoint = require('node:child_process').execFileSync('git',['show',
+  '4cdafae0e34f4e9c68b77ba06791201e3dbe17b9:releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js']);
+assert.deepEqual(candidate,versionBookkeeping(nativeCheckpoint),
+  'entire validated V2.23.4 source unchanged except candidateVersion bookkeeping');
+console.log(`PASS entire ${candidate.length}-byte V2.23.4 source matches 4cdafae except the one-byte candidateVersion update`);

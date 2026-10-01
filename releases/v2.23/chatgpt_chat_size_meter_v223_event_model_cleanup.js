@@ -4059,7 +4059,7 @@ function meterStorageFinalResult(id, required) {
   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
-  health.candidateVersion = '2.23.3';
+  health.candidateVersion = '2.23.4';
   storageHealth.set(id,health);
   return health.lastSaveSuccessful;
 }

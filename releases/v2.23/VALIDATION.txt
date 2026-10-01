@@ -120,30 +120,33 @@ PASS protected region function inspectRequestBody( (408 bytes)
 PASS 66862 protected bytes; baseline identity and capture-lineage markers
 PASS 8807 validated send/correlation bytes unchanged from 4b14425
 PASS 15435 validated source cache/capture/static vector/diagnostic bytes unchanged from 3be6a30
-PASS 72454 storage retention/MAX episode/generation classifier/transport/acceptance bytes unchanged from ccdd1b9
+PASS 72454 storage retention/MAX episode/generation classifier/transport/acceptance bytes match ccdd1b9 with only the authorized version label update
 PASS source-family classifier has only the demonstrated plural per-chat route extension
+PASS entire 306017-byte V2.23.4 source matches 4cdafae except the one-byte candidateVersion update
 EXIT 0
 
-$ node --check releases/v2.23/chatgpt_chat_size_meter_v223_event_model_cleanup.js
+$ node --check releases\v2.23\chatgpt_chat_size_meter_v223_event_model_cleanup.js
 EXIT 0
 
-$ node --check scripts/test-v223.js
+$ node --check scripts\test-v223.js
 EXIT 0
 
-$ node --check scripts/verify-v223-protected.js
+$ node --check scripts\verify-v223-protected.js
 EXIT 0
 
-$ node --check src/baseline/chatgpt_chat_size_meter_v222_sse_outcome_post_correlation.js
-EXIT 0
-
-$ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 892f728202e785baab8ccb4b020759c28a2f293fa747558474ba2d115a0ac771
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 00ddc8dd95da1af068f6c783d971b10ac96c4c26c986e55924d33143734eb8c2
+$ node --check src\baseline\chatgpt_chat_size_meter_v222_sse_outcome_post_correlation.js
 EXIT 0
 
 $ python scripts/package-v223.py
-chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 892f728202e785baab8ccb4b020759c28a2f293fa747558474ba2d115a0ac771
-chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 00ddc8dd95da1af068f6c783d971b10ac96c4c26c986e55924d33143734eb8c2
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 0148b5aa5dac3aa2743c6f6c52f3b14147acb0d29980a262ad3e38fd2c2f275f
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 011ffa5526ad7b99e789caa143bff6e56c0b39bfdfc00cccd703bbb5df168072
 EXIT 0
 
-PASS two builds byte-identical; ZIP sole member equals LF source; no native-browser validation performed
+$ python scripts/package-v223.py
+chatgpt_chat_size_meter_v223_event_model_cleanup.js: 306017 bytes; SHA-256 0148b5aa5dac3aa2743c6f6c52f3b14147acb0d29980a262ad3e38fd2c2f275f
+chatgpt_chat_size_meter_v223_event_model_cleanup.zip: 69016 bytes; SHA-256 011ffa5526ad7b99e789caa143bff6e56c0b39bfdfc00cccd703bbb5df168072
+EXIT 0
+
+PASS two deterministic builds have identical ZIP and SHA256SUMS bytes; sole ZIP member equals LF source.
+
+Native validation passes for checkpoint 4cdafae are USER-REPORTED; no native browser run performed by this assistant. Final userscript differs only by candidateVersion 2.23.3 -> 2.23.4.
