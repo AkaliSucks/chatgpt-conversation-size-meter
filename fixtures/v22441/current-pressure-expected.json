@@ -1,0 +1,12 @@
+{
+  "model": "gpt-5-5-instant",
+  "effort": null,
+  "canonicalEffort": null,
+  "state": "calibrating",
+  "seedProfileCount": 0,
+  "seedMaxProfileCount": 0,
+  "seedModel": null,
+  "seedCanonicalEffort": null,
+  "seedTextFrontier": null,
+  "seedStateFrontier": null
+}

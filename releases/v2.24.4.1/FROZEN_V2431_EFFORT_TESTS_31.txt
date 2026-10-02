@@ -1,0 +1,32 @@
+PASS exact parent reproduces reported cause: High UI versus extended request rejects valid MAX pre vector
+PASS authoritative effort alias "extended" resolves to high
+PASS authoritative effort alias "High" resolves to high
+PASS authoritative effort alias "high" resolves to high
+PASS authoritative effort alias "max" resolves to max
+PASS authoritative effort alias "Extra High" resolves to max
+PASS authoritative effort alias " MAX " resolves to max
+PASS authoritative effort alias " EXTRA   HIGH " resolves to max
+PASS authoritative effort alias " EXTENDED " resolves to high
+PASS every previously supported effort label preserves parent normalization except the evidenced new alias
+PASS ingestion preserves raw effort and detected provenance and adds canonical effort separately
+PASS raw extended MAX matches current canonical high and exports exact reported pre-MAX BATCH vector
+PASS new local High MAX rows and summary groups are stored as high rather than extended
+PASS local High and max identities stay separate including raw extended history
+PASS historical extended rows normalize for read evaluation without rewriting raw rows or stored bytes
+PASS historical data needs no destructive migration and repeated migration is idempotent
+PASS necessary append preserves historical extended provenance while adding canonical high event
+PASS historical attempt lacking canonical metadata still yields High MAX without writes on export
+PASS confirmed High SUCCESS with extended backend label becomes eligible and remains non-MAX
+PASS supported max SUCCESS export is otherwise identical to parent including all metric fields
+PASS canonical export projection normalizes aliases but validation requires canonical exported identity
+PASS builder canonicalizes backend UI and canonical labels using the identical authoritative normalizer
+PASS builder normalized duplicate vectors do not create independence and SUCCESS is diagnostic only
+PASS normalization cannot scrub away private input fields or weaken recursive validator refusal
+PASS copy is read-only with unchanged counts keys and private-source exclusions
+PASS pressure diagnostics show canonical high while real attempt diagnostics keep raw extended and canonical field
+PASS registry keeps only max and immutable V2.24.2 seed source/value bytes remain exact
+PASS unsupported and fresh High/extended pressure still calibrate without local anchors or a new seed
+PASS High UI with true max backend remains mismatched and never aliases max to high
+PASS structured SSE MAX uses identical canonical match without changing native detection
+PASS four-part release identity is consistent in health Retry and copy diagnostics
+31/31 V2.24.3.1 effort-normalization synthetic tests passed; native review pending

@@ -1,0 +1,92 @@
+diff --git a/releases/v2.24.4/chatgpt_chat_size_meter_v2244_multi_effort_seeds.js b/releases/v2.24.4.1/chatgpt_chat_size_meter_v22441_current_model_identity.js
+index d2661f5..e0a6834 100644
+--- a/releases/v2.24.4/chatgpt_chat_size_meter_v2244_multi_effort_seeds.js
++++ b/releases/v2.24.4.1/chatgpt_chat_size_meter_v22441_current_model_identity.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24.4 MULTI-EFFORT ANONYMOUS SEEDS
++// @name         ChatGPT Conversation Size Meter V2.24.4.1 CURRENT MODEL IDENTITY REPAIR
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.24.4
++// @version      2.24.4.1
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -3978,16 +3978,29 @@ function pressureCollect(id) {
+   finally{pressureBusy=false;}
+ }
+ function pressureCurrent(id) {
+-  const state=eventStaticState(id),store=loadAttemptState(id),a=store.current || store.last;
++  const state=eventStaticState(id),store=loadAttemptState(id);
++  const belongs=a=>a && (!a.conversationId || a.conversationId===id) && (!a.requestConversationId || a.requestConversationId===id);
++  // Current identity follows the latest parsed real request for this chat,
++  // including completed/persisted attempts. Snapshot labels describe captured
++  // state and must not override that request after completion or refresh.
++  // Request time (then attempt ID) orders requests; completion time cannot make
++  // an older request newer. Sorting this temporary array never rewrites history.
++  const request=[store.current,store.last,...(Array.isArray(store.attempts)?store.attempts:[])]
++    .filter(a=>belongs(a) && a.conversationId===id && a.trigger==='network-generation-dispatch' && a.requestParsed===true && pressureLabel(a.requestModel))
++    .sort((a,b)=>(Number(b.requestDetectedAt || b.startedAt) || 0)-(Number(a.requestDetectedAt || a.startedAt) || 0) ||
++      (Number(b.id) || 0)-(Number(a.id) || 0))[0] || null;
++  const current=belongs(store.current)?store.current:null,last=belongs(store.last)?store.last:null,a=request || current || last;
+   // Visible pressure follows the newest accepted current state; unlike event
+   // canonicalization, an older BATCH must not mask a newer DIRECT observation.
+   const canonical=['batch','direct'].map(f=>pressureVector(state[f],'current')).filter(Boolean)
+     .sort((a,b)=>b.fullCapturedAt-a.fullCapturedAt || Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch'))[0] || null;
+   const snapshotModel=pressureLabel(attemptSnapshotModel(id));
+-  const model=pressureLabel(store.current?.requestModel) || snapshotModel || pressureLabel(a?.requestModel);
++  const model=pressureLabel(request?.requestModel) || pressureLabel(current?.requestModel) || snapshotModel || pressureLabel(last?.requestModel);
+   const hint=pressureEffort(attemptEffortHint());
+   const effort=hint || (model===a?.requestModel ? pressureEffort(a?.requestEffort) : null);
+-  return {model,effort,identitySource:hint?'snapshot/request model + UI effort hint':'snapshot/request model + last matching request effort',canonical};
++  const identitySource=request?`latest parsed current-chat generation request model + ${hint?'UI effort hint':'matching request effort'}`:
++    hint?'snapshot/request model + UI effort hint':'snapshot/request model + last matching request effort';
++  return {model,effort,identitySource,canonical};
+ }
+ function pressureEffectiveMax(rows) {
+   const settings=new Map();
+@@ -4228,7 +4241,7 @@ function anonymousSampleValid(sample) {
+ }
+ function anonymousProjectSample(identity, vector) {
+   if(!vector)return null;
+-  const sample={schemaVersion:1,candidateVersion:'2.24.4',model:identity.model,canonicalEffort:pressureEffort(identity.effort),
++  const sample={schemaVersion:1,candidateVersion:'2.24.4.1',model:identity.model,canonicalEffort:pressureEffort(identity.effort),
+     outcome:identity.outcome,snapshotRole:identity.role,sourceFamily:vector.sourceFamily,
+     ...Object.fromEntries(ANONYMOUS_SAMPLE_METRICS.map(k=>[k,typeof vector[k]==='number' && Number.isFinite(vector[k]) && vector[k]>=0?vector[k]:null])),
+     verifiedCurrentMax:identity.outcome==='max',pressureState:identity.pressureState};
+@@ -4584,7 +4597,7 @@ function meterStorageFinalResult(id, required) {
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.24.4';
++  health.candidateVersion = '2.24.4.1';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4930,7 +4943,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24.4 MULTI-EFFORT ANONYMOUS SEEDS',
++  return ['ChatGPT Conversation Size Meter V2.24.4.1 CURRENT MODEL IDENTITY REPAIR',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -7769,7 +7782,7 @@ async function retryCapture(binding = null) {
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.24.4',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.24.4.1',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -9605,7 +9618,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24.4 MULTI-EFFORT ANONYMOUS SEEDS',
++    'Candidate userscript: V2.24.4.1 CURRENT MODEL IDENTITY REPAIR',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),

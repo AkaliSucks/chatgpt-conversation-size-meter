@@ -1,0 +1,28 @@
+PASS exact parent reproduces completed and refreshed stale current model despite correct SUCCESS storage
+PASS completed latest parsed request overrides stale snapshot and matches exact native expected pressure fields
+PASS successful request survives refresh with corrected unsupported null-effort current identity
+PASS identity evaluation leaves static model metrics and persisted snapshot byte-identical
+PASS identity evaluation never rewrites historical request model effort or raw provenance
+PASS another conversation latest real request cannot override current chat identity
+PASS foreign current last and archived records in current store cannot supply model or effort
+PASS parsed request explicitly naming another conversation cannot override local snapshot
+PASS unsupported model + high after SUCCESS and refresh never borrows corresponding thinking seed
+PASS returning to thinking high restores exact registry and independent frontiers
+PASS unsupported model + medium after SUCCESS and refresh never borrows corresponding thinking seed
+PASS returning to thinking medium restores exact registry and independent frontiers
+PASS unsupported model + max after SUCCESS and refresh never borrows corresponding thinking seed
+PASS returning to thinking max restores exact registry and independent frontiers
+PASS in-flight parsed real request still wins immediately and after incomplete restart
+PASS latest archived parsed request wins even if last/current pointers are older
+PASS request chronology ignores delayed completion and history array ordering
+PASS missing request time uses dispatch start and tied times use higher attempt ID
+PASS authoritative older request remains selected when newer record has no usable parsed model
+PASS non-generation preflight blocked-send and inferred model rows do not become authoritative
+PASS no-authoritative-request fallback preserves complete parent identity/vector outputs
+PASS newest accepted DIRECT/BATCH vector choice stays separate from request identity
+PASS unchanged verified current MAX override and numeric cap work with repaired identity
+PASS read-only identity and repeated completed migration do not append rewrite or persist seeds
+PASS canonical aliases raw request provenance privacy validator and full seed registry remain unchanged
+PASS repaired current identity invalidates pressure cache on successive model switches
+PASS candidate identity metadata reports 2.24.4.1 consistently
+27/27 V2.24.4.1 identity synthetic tests passed; native review pending

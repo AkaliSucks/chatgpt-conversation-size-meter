@@ -1,0 +1,41 @@
+PASS fresh supported install immediately uses anonymous seed with numeric LOW pressure
+PASS Extra High alias and canonical max select the same seed without extra aliases
+PASS unrelated or merely similar model slugs never borrow the bundled profile
+PASS unsupported missing or unpaired effort never silently selects max seed
+PASS seed profile schema contains exactly the supplied anonymous numeric pairs
+PASS static seed has no identifying fields values UUIDs URLs timestamps or text payloads
+PASS seed object array and all profile vectors are immutable
+PASS compute result summary and repeated reads never seed local events or write storage
+PASS seed-only migration is idempotent empty and never creates persistent namespace
+PASS explicit persistence contains only local rows and no bundled profiles or seed diagnostics
+PASS seed profiles are never locally observed conversations or confidence votes
+PASS sparse lower local MAX preserves both seed upper frontiers
+PASS higher local text frontier extends text alone with explicit source
+PASS higher local state frontier extends state alone with explicit source
+PASS independent local contributions can extend both axes from different chats
+PASS equal local seed frontier ties retain seed source and separate local count
+PASS same-chat repeated local episodes collapse by conversation without seed contamination
+PASS fresh supporting post-MAX cannot extend local or effective seed frontier
+PASS local canonical fallback still obeys inherited pre preference and independent counts
+PASS seed does not cross model or effort boundaries even with other local evidence
+PASS unsupported model with valid local evidence retains local-only dual scoring
+PASS seed fills absent local axis but missing current primary metric still calibrates
+PASS known zero current metrics remain zero ratios rather than unknown
+PASS verified current MAX overrides supported unsupported or missing calibration
+PASS stale local MAX and ratios above either seed frontier stay nonterminal
+PASS tiny has expected seeded approximate pressure without terminal MAX
+PASS state-heavy healthy has expected seeded approximate pressure without terminal MAX
+PASS near-state-boundary SUCCESS has expected seeded approximate pressure without terminal MAX
+PASS state boundary has expected seeded approximate pressure without terminal MAX
+PASS text boundary A has expected seeded approximate pressure without terminal MAX
+PASS text boundary B has expected seeded approximate pressure without terminal MAX
+PASS secondary metrics never enter seeded score or capacity calculation
+PASS seed ratios and local extensions are deterministic under permutation and repeated calculation
+PASS pure seed calculator works when localStorage is inaccessible and performs no network
+PASS cached production view immediately scores current captured state and observed Extra High without a dispatch
+PASS actual compact UI displays immediate seed pressure, then verified red MAX and clearance
+PASS seed-aware diagnostics compactly separate anonymous local and effective frontiers
+PASS V2.24.1 store is read without rewrite or seed injection then new local append preserves old provenance
+PASS local retention cap remains 256 despite seed-only and seeded diagnostics reads
+PASS actual candidate metadata Copy storage health and Retry consistently identify 2.24.2
+40/40 V2.24.2 anonymous-seed synthetic tests passed; native candidate review pending
