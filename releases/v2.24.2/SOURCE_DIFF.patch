@@ -1,0 +1,149 @@
+diff --git a/releases/v2.24.1/chatgpt_chat_size_meter_v2241_dual_axis_pressure.js b/releases/v2.24.2/chatgpt_chat_size_meter_v2242_anonymous_seed_calibration.js
+index bd4c4b8..0261957 100644
+--- a/releases/v2.24.1/chatgpt_chat_size_meter_v2241_dual_axis_pressure.js
++++ b/releases/v2.24.2/chatgpt_chat_size_meter_v2242_anonymous_seed_calibration.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24.1 DUAL AXIS PRESSURE
++// @name         ChatGPT Conversation Size Meter V2.24.2 ANONYMOUS SEED CALIBRATION
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.24.1
++// @version      2.24.2
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -3768,6 +3768,17 @@ function eventScheduleTelemetryTimeout(id, attemptId) {
+   },60000);
+ }
+ 
++// Anonymous empirical observations, not official OpenAI limits. Read-only code
++// reference only: never admit these profiles as local conversations or events.
++const PRESSURE_SEED = Object.freeze({
++  version:'v2242-anonymous-seed-1',model:'gpt-5-6-thinking',canonicalEffort:'max',
++  profiles:Object.freeze([
++    Object.freeze({displayLikeTokens:840795,activeBranchBytes:20075510}),
++    Object.freeze({displayLikeTokens:847977,activeBranchBytes:15645053}),
++    Object.freeze({displayLikeTokens:571836,activeBranchBytes:27151472})
++  ])
++});
++
+ // V2.24 empirical pressure, schema 1. No raw mappings, requests, or diagnostic objects.
+ // 256 event rows, at most two vectors/row. Eviction watermark prevents replay of old events.
+ const PRESSURE_KEY = `${P}:pressure-calibration-v224`;
+@@ -3823,7 +3834,7 @@ function pressureCleanRow(row, preserveEffort = false) {
+     provenance:row.provenance==='v223-migration'?'v223-migration':'v224-observed',canonical,postMax};
+ }
+ function pressureBlank() {
+-  return {schemaVersion:1,modelVersion:'v2241-dual-frontier-1',samples:[],watermark:null,
++  return {schemaVersion:1,modelVersion:'v2242-seeded-dual-frontier-1',samples:[],watermark:null,
+     retentionCount:0,migration:{done:false,examinedKeys:0,skippedKeys:0,admittedEvents:0},lastError:null};
+ }
+ function pressureLoad() {
+@@ -4029,6 +4040,27 @@ function pressureAxis(rows, vector, field, activeMax) {
+     fallbackContributionCount:contributions.filter(c=>c.snapshotRole!=='pre-dispatch').length,
+     sourceFamilyMismatch:contributions.some(c=>c.sourceFamily!==vector?.sourceFamily)};
+ }
++function pressureSeed(model, effort) {
++  if(model!==PRESSURE_SEED.model || effort!==PRESSURE_SEED.canonicalEffort)return null;
++  const text=PRESSURE_SEED.profiles.map(p=>p.displayLikeTokens),state=PRESSURE_SEED.profiles.map(p=>p.activeBranchBytes);
++  return {version:PRESSURE_SEED.version,model:PRESSURE_SEED.model,canonicalEffort:PRESSURE_SEED.canonicalEffort,
++    profileCount:PRESSURE_SEED.profiles.length,textFrontier:Math.max(...text),stateFrontier:Math.max(...state),
++    textRange:{min:Math.min(...text),max:Math.max(...text)},stateRange:{min:Math.min(...state),max:Math.max(...state)}};
++}
++function pressureSeedAxis(local, seed, activeMax) {
++  const text=local.field==='displayLikeTokens',seedAnchor=seed?(text?seed.textFrontier:seed.stateFrontier):null;
++  const seedRange=seed?(text?seed.textRange:seed.stateRange):null,localAnchor=local.anchor;
++  const anchor=seedAnchor && localAnchor?Math.max(seedAnchor,localAnchor):seedAnchor || localAnchor;
++  // Seed wins an exact tie; local can extend but never shrink a bundled frontier.
++  const frontierSource=anchor==null?null:seedAnchor && seedAnchor>= (localAnchor || 0)?'seed':'local';
++  const ratio=anchor && local.currentValue!=null?local.currentValue/anchor:null;
++  const ranges=[local.observedMaxRange,seedRange].filter(Boolean);
++  return {...local,anchor,ratio,exceededWhileAlive:!activeMax && ratio!=null && ratio>=1,
++    localAnchor,seedAnchor,frontierSource,seedMaxProfileCount:seed?.profileCount || 0,
++    localObservedMaxRange:local.observedMaxRange,seedObservedMaxRange:seedRange,
++    observedMaxRange:ranges.length?{min:Math.min(...ranges.map(r=>r.min)),max:anchor}:null,
++    anchorRule:seed?'max(anonymous seed upper frontier, independent local upper frontier); local may extend only':local.anchorRule};
++}
+ function pressureCompute(samples, current, activeMax = false) {
+   const vector=current?.canonical,model=pressureLabel(current?.model),effort=pressureEffort(current?.effort);
+   const same=samples.filter(s=>pressureLabel(s.model)===model && s.canonical?.displayLikeTokens>0);
+@@ -4040,8 +4072,15 @@ function pressureCompute(samples, current, activeMax = false) {
+   const rawMaxima=rows.filter(s=>s.outcome==='max'),successes=rows.filter(s=>s.outcome==='success');
+   const effective=pressureEffectiveMax(rows),maxima=effective.observations,n=maxima.length;
+   const successConversations=new Set(successes.map(s=>s.conversationId));
+-  const textAxis=pressureAxis(rows,vector,'displayLikeTokens',activeMax);
+-  const stateAxis=pressureAxis(rows,vector,'activeBranchBytes',activeMax);
++  // Built-in anonymous reference is selected independently from local tiering.
++  // It is never an event row, a local conversation, or a persistent sample.
++  const seed=pressureSeed(model,effort);
++  const localTextAxis=pressureAxis(rows,vector,'displayLikeTokens',activeMax);
++  const localStateAxis=pressureAxis(rows,vector,'activeBranchBytes',activeMax);
++  const textAxis=pressureSeedAxis(localTextAxis,seed,activeMax);
++  const stateAxis=pressureSeedAxis(localStateAxis,seed,activeMax);
++  const calibrationSource=seed?(n?'seed+local':'seed-only'):
++    localTextAxis.anchor && localStateAxis.anchor?'local-only':'calibrating';
+   const reason=!vector?'No valid current parser vector':!model?'Current model unknown':
+     !textAxis.anchor || !stateAxis.anchor?'No comparable empirical MAX anchor for both axes':
+     textAxis.ratio==null || stateAxis.ratio==null?'Current axis value missing or invalid':null;
+@@ -4049,7 +4088,7 @@ function pressureCompute(samples, current, activeMax = false) {
+   const ratio=reason?null:Math.max(textAxis.ratio,stateAxis.ratio);
+   const dominantAxis=ratio==null?null:textAxis.ratio===stateAxis.ratio?'tie':textAxis.ratio>stateAxis.ratio?'text':'state';
+   const score=activeMax || reason?null:Math.max(0,Math.min(99,Math.round(ratio*100)));
+-  const confidence='low',confidenceReason='Provisional heterogeneous dual-axis MAX frontier; V2.24.1 confidence held LOW';
++  const confidence='low',confidenceReason='Provisional heterogeneous dual-axis MAX frontier; V2.24.2 confidence held LOW; anonymous seed never increases local confidence';
+   const anchor=textAxis.anchor,range=textAxis.observedMaxRange,spread=anchor?(range.max-range.min)/anchor:null;
+   const contradictory=successes.filter(s=>textAxis.anchor && s.canonical.displayLikeTokens>=textAxis.anchor ||
+     stateAxis.anchor && pressureNumber(s.canonical.activeBranchBytes)!=null && s.canonical.activeBranchBytes>=stateAxis.anchor);
+@@ -4062,8 +4101,14 @@ function pressureCompute(samples, current, activeMax = false) {
+     const xs=maxima.map(s=>s.canonical[field]).filter(x=>pressureNumber(x)!=null);
+     secondary[field]={current:vector?.[field]??null,min:xs.length?Math.min(...xs):null,max:xs.length?Math.max(...xs):null};
+   }
+-  return {modelVersion:'v2241-dual-frontier-1',state:activeMax?'current-max':reason?'calibrating':'scored',
+-    score,confidence,confidenceReason,textAxis,stateAxis,
++  return {modelVersion:'v2242-seeded-dual-frontier-1',state:activeMax?'current-max':reason?'calibrating':'scored',
++    score,confidence,confidenceReason,textAxis,stateAxis,calibrationSource,
++    seedVersion:seed?.version || null,seedProfileCount:seed?.profileCount || 0,seedMaxProfileCount:seed?.profileCount || 0,
++    seedModel:seed?.model || null,seedCanonicalEffort:seed?.canonicalEffort || null,
++    seedTextFrontier:seed?.textFrontier || null,seedStateFrontier:seed?.stateFrontier || null,
++    localIndependentMaxConversationCount:n,localTextFrontier:localTextAxis.anchor,localStateFrontier:localStateAxis.anchor,
++    effectiveTextFrontier:textAxis.anchor,effectiveStateFrontier:stateAxis.anchor,
++    effectiveTextFrontierSource:textAxis.frontierSource,effectiveStateFrontierSource:stateAxis.frontierSource,
+     combined:{dominantAxis,ratio,score,reason:activeMax?'Verified current MAX overrides numeric pressure':reason ||
+       'Maximum of text and serialized-state ratios; rounded whole score clamped to 0..99'},
+     currentSourceVector:vector || null,currentDisplayLikeTokens:vector?.displayLikeTokens??null,
+@@ -4377,7 +4422,7 @@ function meterStorageFinalResult(id, required) {
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.24.1';
++  health.candidateVersion = '2.24.2';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4723,7 +4768,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24.1 DUAL AXIS PRESSURE',
++  return ['ChatGPT Conversation Size Meter V2.24.2 ANONYMOUS SEED CALIBRATION',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -7561,7 +7606,7 @@ async function retryCapture(binding = null) {
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.24.1',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.24.2',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -9396,7 +9441,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24.1 DUAL AXIS PRESSURE',
++    'Candidate userscript: V2.24.2 ANONYMOUS SEED CALIBRATION',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
