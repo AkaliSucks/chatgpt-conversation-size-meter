@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "candidateVersion": "2.24.3.1",
+  "model": "gpt-5-6-thinking",
+  "canonicalEffort": "high",
+  "outcome": "max",
+  "snapshotRole": "pre-max",
+  "sourceFamily": "batch",
+  "displayLikeTokens": 840795,
+  "activeBranchBytes": 20075510,
+  "mappingBytes": 20245263,
+  "retainedBytes": 12291277,
+  "toolResultBytes": 11060436,
+  "branchNodes": 4008,
+  "messageNodes": 4007,
+  "retainedShare": 61.23745802568528,
+  "hot128": 1259082,
+  "hot256": 2215360,
+  "strongContextMarkers": 118,
+  "verifiedCurrentMax": true,
+  "pressureState": "current-max"
+}

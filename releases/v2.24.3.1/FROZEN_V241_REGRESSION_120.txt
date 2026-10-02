@@ -1,0 +1,131 @@
+V2.24.1 superseding 120 cases: upper frontier, LOW policy, proportional synthetic state, and identity expectations explicitly updated; no cases skipped.
+PASS 1 short SUCCESS confirms immediately; archived telemetry continues
+PASS 2/7 long assistant stream quotes MAX without false outcomes
+PASS 3/10 repeated visible MAX at load creates one episode and zero attempts
+PASS 4 capped Send intent times out without inventing a dispatch
+PASS 5 Retry Capture bypasses fetch hook, parses once, attaches fresh episode source
+PASS 6 ordinary conversation text, hidden banners, panel and wrapper quotes are ignored
+PASS 8 SUCCESS then clone abort preserves outcome and archived totals
+PASS 9 SPA navigation cancels scheduled captures and in-progress parser attribution
+PASS split SSE lines and completion tokens survive arbitrary chunk boundaries
+PASS quoted completion markers in assistant deltas do not confirm SUCCESS
+PASS structured SSE MAX relates episode to real dispatch; repeated errors deduplicate
+PASS HTTP structured MAX, generic HTTP error and normal assistant JSON differ
+PASS preflight matching prefers identity and rejects conflicting parent/action/chat
+PASS delayed preflight response updates consumed preflight identity
+PASS classifier ignores mutation, prepare, wrong endpoints and action-only POST
+PASS fetch Request object body classification completes before clone reader starts
+PASS real network activity sets INFLIGHT despite absent Stop UI
+PASS lingering Stop UI cannot create attempts after SUCCESS
+PASS old stream callback never updates a newer dispatch with same URL
+PASS post-outcome job attaches to archived attempt while newer attempt runs
+PASS MAX clear starts a new episode; stale historical metrics remain pending
+PASS WebSocket auth redaction, no previews and explicit correlation only
+PASS null numeric helpers preserve unknown DIRECT rather than green/zero
+PASS quota failure is visible and in-memory SUCCESS tracking continues
+PASS bounded persistence retains ten full attempts and episodes
+PASS transport timeout closes telemetry without inventing stream close
+PASS SSE full fetch wrapper observes final totals once and preserves original Response
+PASS saved false-MAX fixtures replay quotes and synthetic attempt flooding only
+PASS fetch rejection closes only its generation attempt and passes rejection to page
+PASS XHR success, preflight and error use fixed request identities
+PASS fetch preflight response arrives after dispatch and attaches once
+PASS two preflights in the same millisecond keep distinct response ownership
+PASS pre-existing banner does not finalize a later unrelated dispatch
+PASS send followed by dispatch records latency and cannot become blocked
+PASS send listeners ignore Shift Enter, IME, modifiers and non-composer keys
+PASS coalesced Retry clicks use one internal workflow during generation
+PASS same-millisecond fresh capture does not trigger duplicate fallback parsing
+PASS cleared episode cancels its pending capture job
+PASS banner clearing alone is not recovery; later real SSE SUCCESS is
+PASS comparison missing metrics stay null and source families remain distinct
+PASS restart archives lost transport as correlation incomplete, preserving evidence
+PASS historical V2.22 synthetic attempts are neither migrated nor relabelled
+PASS rendered event sections and copied diagnostics omit predictive bands and tokens
+PASS late dispatch corrects provisional blocked-before-dispatch classification
+PASS unclassified conversation POST prevents a false blocked-before-dispatch label
+PASS native button icon click and tap submit correlate once, before body/UI initialization
+PASS native contenteditable Enter dispatch, form submit and implicit click produce one intent
+PASS Enter newline, ignored key and excluded search fields never become intents
+PASS disabled and unrelated composer controls are ignored; default submit semantics work
+PASS handled Enter followed by native MAX stays blocked without inventing a dispatch
+PASS native Enter composer clear confirms original length; navigation cancels provisional key
+STORAGE representative 10-attempt fixture: original JSON 259873; compact 37807; quota retry 17706 bytes
+STORAGE representative 1-attempt fixture: original JSON 60295; compact 25466; quota retry 11258 bytes
+PASS lossless storage compaction roundtrips repeated snapshots, nulls and Unicode
+PASS quota pressure bounds traces, recovers losslessly and retains attempt/MAX identity and outcomes
+PASS compact saved attempts, episodes, lifecycle, snapshot and diagnostics reload through production readers
+PASS parsed DIRECT then BATCH publish distinct static vectors even when every storage write fails
+PASS partial quota failure reproduces deep snapshot success and must retain lifecycle publication in memory
+PASS inflight parsed snapshots publish valid vectors without relabelling them stable or fabricating BATCH
+PASS snapshot persistence succeeds while lifecycle alone fails: profiler and published source metrics both survive
+PASS explicit snapshot clear invalidates its new memory cache
+PASS healthy parsed DIRECT and BATCH HTTP responses publish static metrics through production network hooks
+PASS origin-wide meter audit includes every owned namespace and conversation without reading unrelated values
+GC fixture: reclaimed 8162 meter-owned bytes from 2 stale keys; final save saved
+PASS stale cross-conversation legacy state is reclaimed and quota save finally succeeds without touching app storage
+PASS GC retains current sources, active/unknown V223 owners, undated/malformed/future caches and reserved metadata
+PASS GC twelve-key pass bound and cooldown hold across many inactive conversations; V223 episodes stay
+PASS GC stops after reclaim target even if the first eligible key is large
+PASS GC skips a whole stale conversation changed by another tab during inspection
+PASS new storage write times protect recently used conversations containing old research observations
+PASS validated 4b14425 checkpoint readers can still decode timestamped normal and retry storage
+PASS no eligible headroom and denied cleanup surface final failure while parsed in-memory state remains valid
+PASS non-quota storage failures never trigger destructive cleanup of stale evidence
+RECENT ORIGIN: 2504575 UTF-8 bytes / 5009150 UTF-16 bytes reclaimed; 5 obsolete keys; 3 bounded passes; 5/5 required keys saved; namespaces {"attempts-v218":{"keys":1,"bytes":150115,"utf16Bytes":300230},"attempts-v219":{"keys":1,"bytes":499115,"utf16Bytes":998230},"attempts-v220":{"keys":1,"bytes":323115,"utf16Bytes":646230},"attempts-v221":{"keys":1,"bytes":402115,"utf16Bytes":804230},"attempts-v222":{"keys":1,"bytes":1130115,"utf16Bytes":2260230}}
+RECENT ORIGIN AUDIT: before {"keys":65,"bytes":3384875,"utf16Bytes":6769750}; after {"keys":61,"bytes":891402,"utf16Bytes":1782804}; required current key bytes {"attempts-v223:chat-a":4439,"snapshot:chat-a":7141,"lifecycle-v216:chat-a":1584,"diag:chat-a":277,"max-episodes-v223:chat-a":1330}
+PASS recent multi-megabyte origin reclaims superseded v218-v222 histories and retries every current key
+PASS obsolete current-chat attempt versions are reclaimable; current sources and all V223 evidence survive
+PASS recent source caches are reclaimable only without active V223 owners; closed V223 history is retained
+PASS cleanup prioritizes obsolete non-current histories, then current legacy histories, then oldest caches
+PASS unrecoverable quota stops at four twelve-key passes and preserves every current key in memory
+PASS cleanup success cannot mask a remaining required-key failure and later recovery retries every key
+PASS silent storage write loss and externally missing keys cannot produce overall save success
+PASS Retry audits 168-byte singular failure then accepts an observed plural full mapping for existing episode #2
+PASS repeated successful Retry on one active episode appends one capture per accepted response without changing identity
+ROUTE fixture: metadata 72000 B not full; singular 168 B not full; one observed POST BATCH 20260000 B full; same MAX episode #1, one capture, zero attempts
+PASS 72KB metadata is not automatically full; one proven natural POST BATCH form can supply fresh episode state
+PASS resource URL alone never invents a BATCH request and background captures never replay large BATCH
+PASS BATCH that never yielded a parser-valid current-chat mapping is not replayed
+PASS failed Retry cannot reuse an old full snapshot or a concurrent natural app capture as success
+PASS navigation during Retry body read cancels parser writes and attachment to both chats
+PASS an episode replacement during delayed Retry cannot receive the earlier episode response
+PASS HTTP error with mapping-shaped body and partial message array both remain failed retries
+PASS Retry has a thirty-second total deadline; a late full response cannot be accepted
+PASS route plan remains bounded, de-duplicates absolute/relative URLs and never invents include_messages
+PASS Copy UI reports running/success, survives rerender and restores label without network or storage changes
+PASS Copy failure is persistent and restores its normal label without extra requests or evidence
+PASS Retry UI disables repeats, reports accepted DIRECT bytes and keeps completion after label restoration
+PASS Retry UI reports failure despite HTTP 200 and an old full snapshot
+PASS later quick action owns persistent status when an earlier capture finishes asynchronously
+PASS production click binding uses persistent quick feedback and retains tactile pointer animation
+PASS Retry UI gives accepted BATCH completion and Copy includes bounded route proof/failure diagnostics
+PASS large observed request bodies and expired forms do not produce unbounded BATCH replay
+PASS rejected capture fetches and failed body reads are recorded once as meter traffic with visible failure
+PASS source-family extension preserves legacy classification and only adds plural per-chat full sources
+PASS empty non-2xx generation responses terminate; empty meter responses are explicit failed captures
+PASS V235 active verified MAX overrides orange/warning overlay; clearing restores the identical ordinary state
+PASS V235 current verified MAX without any real attempt still forces red; snapshot phase cannot override clearance
+PASS V235 historical MAX, quoted conversation text and streamed phrases do not force red
+PASS V235 transport-verified active MAX forces red; recovery and navigation preserve binding
+PASS V235 shallow subtree counts, bytes, cache order and cycle semantics exactly match recursive parent
+PASS V235 missing roots, existing cache, duplicate/shared edges and caller visiting sets preserve exact metrics
+TOPOLOGY chain: 12000 ancestry nodes; exact 1833552 serialized bytes
+PASS V235 12000-node chain completes both subtree metrics with no truncation or RangeError
+TOPOLOGY branched: 12000 ancestry + 12000 leaves; exact 2880221 serialized bytes
+PASS V235 24000-node deeply branched tree completes both metrics and preserves every leaf
+TOPOLOGY full parser: 24000 mapping nodes; 12000 active + 12000 alternate; retained profiler valid
+PASS V235 full parser topology and retained profiler survive 12000-deep active AND alternate branches
+PASS V235 complete shallow topology/retained metrics serialize identically to parent across branched fixtures
+PASS V235 native-style 54-byte JSON HTTP 500 stream promptly terminalizes and preserves complete evidence
+PASS V235 successful resend after HTTP 500 is an independent real attempt; late failure cannot overwrite it
+PASS V235 non-2xx completion markers never become SUCCESS; positive completion retains 2xx behavior
+PASS V235 non-2xx structured MAX retains precedence and creates the same single related episode
+PASS V235 plain JSON MAX with no newline is still recognized at stream completion
+PASS V235 delayed chunked HTTP failure stays running only until body closes, with final exact totals
+PASS V235 XHR completed non-2xx uses the same terminal reason and archives status/type/bytes
+PASS V235 empty non-2xx stream completes ERROR; empty successful app response retains old no-observation behavior
+PASS V235 regression fixture reproduces both recursive helper overflows on the exact parent only
+PASS V235 generic HTTP error quoting MAX remains ERROR and preserves diagnostic distinction from unknown
+PASS V235 diagnostic versions consistently identify the hotfix without changing storage namespaces
+120/120 synthetic harness tests passed; native-browser validation not performed

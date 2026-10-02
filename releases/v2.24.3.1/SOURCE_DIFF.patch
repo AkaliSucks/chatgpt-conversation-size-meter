@@ -1,0 +1,95 @@
+diff --git a/releases/v2.24.3/chatgpt_chat_size_meter_v2243_anonymous_seed_builder.js b/releases/v2.24.3.1/chatgpt_chat_size_meter_v22431_effort_normalization.js
+index f68b4b6..09408f1 100644
+--- a/releases/v2.24.3/chatgpt_chat_size_meter_v2243_anonymous_seed_builder.js
++++ b/releases/v2.24.3.1/chatgpt_chat_size_meter_v22431_effort_normalization.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER
++// @name         ChatGPT Conversation Size Meter V2.24.3.1 CANONICAL EFFORT REPAIR
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.24.3
++// @version      2.24.3.1
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -3802,10 +3802,10 @@ function pressureLabel(value) {
+   return typeof value === 'string' && value.trim() ? value.trim().slice(0,120) : null;
+ }
+ function pressureEffort(value) {
+-  const effort=pressureLabel(value)?.toLowerCase().replace(/\s+/g,' ') || null;
+-  // Demonstrated UI/backend alias: Extra High / requestEffort=max. No guesses
+-  // for Thinking, xhigh, or other labels without paired repository evidence.
+-  return effort==='extra high' ? 'max' : effort;
++  const effort=typeof value==='string' ? value.trim().slice(0,120).toLowerCase().replace(/\s+/g,' ') || null : null;
++  // Paired UI/backend evidence only: Extra High/max and High/extended.
++  // Preserve other labels without guessing aliases or merging effort levels.
++  return effort==='extra high' ? 'max' : effort==='extended' ? 'high' : effort;
+ }
+ function pressureVector(obs, role, before = Infinity, after = 0) {
+   if (!obs || !['direct','batch'].includes(obs.sourceFamily)) return null;
+@@ -4194,10 +4194,10 @@ function anonymousSampleValid(sample) {
+   if(!sample || Array.isArray(sample) || !anonymousPrivacyValid(sample))return false;
+   const allowed=[...ANONYMOUS_SAMPLE_HEADERS,...ANONYMOUS_SAMPLE_METRICS];
+   if(Object.keys(sample).some(k=>!allowed.includes(k)) || ANONYMOUS_SAMPLE_HEADERS.some(k=>!Object.hasOwn(sample,k)))return false;
+-  if(sample.schemaVersion!==1 || !/^\d+\.\d+\.\d+$/.test(sample.candidateVersion) || typeof sample.candidateVersion!=='string' ||
++  if(sample.schemaVersion!==1 || !/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(sample.candidateVersion) || typeof sample.candidateVersion!=='string' ||
+     typeof sample.model!=='string' || !/^[a-z][a-z0-9._-]{0,119}$/i.test(sample.model) ||
+     typeof sample.canonicalEffort!=='string' || !/^[a-z][a-z0-9 ._-]{0,39}$/.test(sample.canonicalEffort) ||
+-    sample.canonicalEffort!==sample.canonicalEffort.trim().replace(/\s+/g,' ') || sample.canonicalEffort==='extra high' ||
++    sample.canonicalEffort!==pressureEffort(sample.canonicalEffort) ||
+     !['direct','batch'].includes(sample.sourceFamily) || !['scored','calibrating','current-max'].includes(sample.pressureState))return false;
+   const max=sample.outcome==='max',success=sample.outcome==='success';
+   if(!max && !success || sample.verifiedCurrentMax!==max || max && sample.pressureState!=='current-max' || success && sample.pressureState==='current-max' ||
+@@ -4211,7 +4211,7 @@ function anonymousSampleValid(sample) {
+ }
+ function anonymousProjectSample(identity, vector) {
+   if(!vector)return null;
+-  const sample={schemaVersion:1,candidateVersion:'2.24.3',model:identity.model,canonicalEffort:identity.effort,
++  const sample={schemaVersion:1,candidateVersion:'2.24.3.1',model:identity.model,canonicalEffort:pressureEffort(identity.effort),
+     outcome:identity.outcome,snapshotRole:identity.role,sourceFamily:vector.sourceFamily,
+     ...Object.fromEntries(ANONYMOUS_SAMPLE_METRICS.map(k=>[k,typeof vector[k]==='number' && Number.isFinite(vector[k]) && vector[k]>=0?vector[k]:null])),
+     verifiedCurrentMax:identity.outcome==='max',pressureState:identity.pressureState};
+@@ -4567,7 +4567,7 @@ function meterStorageFinalResult(id, required) {
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.24.3';
++  health.candidateVersion = '2.24.3.1';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4913,7 +4913,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
++  return ['ChatGPT Conversation Size Meter V2.24.3.1 CANONICAL EFFORT REPAIR',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -7267,6 +7267,7 @@ function attemptApplyRequestMeta(id, meta) {
+   if (a.requestEffort) {
+     a.requestEffortDetected = a.requestEffort;
+   }
++  a.requestCanonicalEffort = pressureEffort(a.requestEffort);
+ 
+   store.current = a;
+   saveAttemptState(id, store);
+@@ -7751,7 +7752,7 @@ async function retryCapture(binding = null) {
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.24.3',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.24.3.1',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -9587,7 +9588,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
++    'Candidate userscript: V2.24.3.1 CANONICAL EFFORT REPAIR',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),

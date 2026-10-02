@@ -1,0 +1,34 @@
+V2.24.2 local-only regression: unchanged V2.24.1 cases; seed-ineligible synthetic model for 31/34 cases; identity-only projection. Supported seed behavior tested separately. No cases skipped.
+V2.24.1 superseding 31 cases: upper frontier, LOW policy, proportional synthetic state, and identity expectations explicitly updated; no cases skipped.
+PASS native-reported Extra High / max case selects exact-model-effort and canonical max
+PASS known alias casing and spacing normalize safely; canonical backend values preserved
+PASS unknown efforts remain distinguishable; no undocumented alias is guessed
+PASS genuinely different and unknown effort retain explicit same-model fallback
+PASS five MAX episodes in one unchanged chat are one effective threshold observation
+PASS two capped conversations contribute two independent observations
+PASS native-style six MAX episodes on two conversations retain six raw and two effective events
+PASS repeated identical retries cannot promote confidence or change anchor/score
+PASS five distinct chats retain upper-frontier anchor despite many duplicate low-chat retries
+PASS materially distinct pre states in one chat are preserved diagnostically with one vote
+PASS capture timestamps and snapshot role metadata do not create distinct feature vectors
+PASS secondary metric variation is diagnosed without giving one conversation extra weight
+PASS supporting post-MAX vector never becomes an independent MAX or anchor
+PASS canonical pre supersedes repeated smaller post-MAX fallbacks within same conversation
+PASS post-only fallback remains one eligible low-confidence observation per conversation
+PASS aliases collapse one setting group while preserving all raw episodes
+PASS same-model effort pooling still gives one chat only one vote across settings
+PASS tier sufficiency is determined by independent chats rather than five same-effort retries
+PASS ten successes in one chat retain ten raw samples and only one success conversation
+PASS five MAX chats plus repeated success in one chat cannot reach HIGH
+PASS LOW persists despite five independent pre-MAX and ten independent success conversations
+PASS raw contradictory successes and unique contradictory conversation counts are separate
+PASS contradictory repeats retain raw provenance without altering confidence or effective count
+PASS effective calculation is deterministic under sample permutation including alias duplicates
+PASS revised view preserves old store bytes and effort provenance when only read/migrated
+PASS new sample append canonicalizes alias without rewriting old raw effort rows
+PASS migration alias normalization remains idempotent and old event stores untouched
+PASS 256 raw event cap is unchanged; effective view never deletes repeated research samples
+PASS normal contribution diagnostics have bounded conversation and setting previews
+PASS active verified MAX and numeric clamp preserve nonterminal semantics
+PASS new candidate metadata and diagnostics identify correctness model and raw/effective evidence
+31/31 calibration-correctness synthetic tests passed; native candidate validation pending
