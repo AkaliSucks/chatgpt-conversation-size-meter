@@ -1,0 +1,30 @@
+PASS exact V2.24.3.1 reproduces Medium mismatch despite verified MAX and valid BATCH pre vector
+PASS canonical alias "standard" -> medium
+PASS canonical alias "Medium" -> medium
+PASS canonical alias "medium" -> medium
+PASS canonical alias " STANDARD " -> medium
+PASS canonical alias "extended" -> high
+PASS canonical alias "High" -> high
+PASS canonical alias "max" -> max
+PASS canonical alias "Extra High" -> max
+PASS all unrelated labels and existing normalization match parent behavior
+PASS request ingestion keeps raw standard and sets canonical medium separately
+PASS Medium MAX matches standard request and copies exact supplied pre-MAX BATCH metrics
+PASS new Medium MAX calibration rows persist and group as medium rather than standard
+PASS medium high and max remain separate canonical identities and exact local tiers
+PASS historical standard evaluates as medium without modifying stored or loaded raw rows
+PASS migration is idempotent and necessary append preserves unrelated historical raw rows
+PASS persisted attempt with stale canonical standard exports by normalizing raw effort without writes
+PASS SUCCESS export for canonical medium high and max is identical apart from version
+PASS standard SUCCESS now matches medium and stays nonterminal without calibration
+PASS projection canonicalizes standard but final schema refuses raw aliases
+PASS builder uses shared normalizer and keeps medium high max groups separate
+PASS builder duplicate Medium aliases cannot manufacture independent observations
+PASS copy and normalization retain privacy exclusions and unchanged storage/counts
+PASS diagnostics preserve raw standard while canonical request pressure and summary show medium
+PASS seed registry and pressure scores match parent for established canonical identities
+PASS fresh medium standard and other unsupported settings remain calibrating without invented seeds
+PASS structured SSE MAX accepts Medium while genuine high or max mismatch still refuses
+PASS runtime normalizer is the exact shared module used by offline builder
+PASS candidate identity agrees in metadata anonymous copy health Retry and diagnostics
+29/29 V2.24.3.2 Medium-normalization synthetic tests passed; native review pending

@@ -1,0 +1,71 @@
+diff --git a/releases/v2.24.3.1/chatgpt_chat_size_meter_v22431_effort_normalization.js b/releases/v2.24.3.2/chatgpt_chat_size_meter_v22432_medium_effort_repair.js
+index 09408f1..b4fd802 100644
+--- a/releases/v2.24.3.1/chatgpt_chat_size_meter_v22431_effort_normalization.js
++++ b/releases/v2.24.3.2/chatgpt_chat_size_meter_v22432_medium_effort_repair.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24.3.1 CANONICAL EFFORT REPAIR
++// @name         ChatGPT Conversation Size Meter V2.24.3.2 MEDIUM EFFORT REPAIR
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.24.3.1
++// @version      2.24.3.2
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -3803,9 +3803,9 @@ function pressureLabel(value) {
+ }
+ function pressureEffort(value) {
+   const effort=typeof value==='string' ? value.trim().slice(0,120).toLowerCase().replace(/\s+/g,' ') || null : null;
+-  // Paired UI/backend evidence only: Extra High/max and High/extended.
++  // Paired UI/backend evidence only: Extra High/max, High/extended, Medium/standard.
+   // Preserve other labels without guessing aliases or merging effort levels.
+-  return effort==='extra high' ? 'max' : effort==='extended' ? 'high' : effort;
++  return effort==='extra high' ? 'max' : effort==='extended' ? 'high' : effort==='standard' ? 'medium' : effort;
+ }
+ function pressureVector(obs, role, before = Infinity, after = 0) {
+   if (!obs || !['direct','batch'].includes(obs.sourceFamily)) return null;
+@@ -4211,7 +4211,7 @@ function anonymousSampleValid(sample) {
+ }
+ function anonymousProjectSample(identity, vector) {
+   if(!vector)return null;
+-  const sample={schemaVersion:1,candidateVersion:'2.24.3.1',model:identity.model,canonicalEffort:pressureEffort(identity.effort),
++  const sample={schemaVersion:1,candidateVersion:'2.24.3.2',model:identity.model,canonicalEffort:pressureEffort(identity.effort),
+     outcome:identity.outcome,snapshotRole:identity.role,sourceFamily:vector.sourceFamily,
+     ...Object.fromEntries(ANONYMOUS_SAMPLE_METRICS.map(k=>[k,typeof vector[k]==='number' && Number.isFinite(vector[k]) && vector[k]>=0?vector[k]:null])),
+     verifiedCurrentMax:identity.outcome==='max',pressureState:identity.pressureState};
+@@ -4567,7 +4567,7 @@ function meterStorageFinalResult(id, required) {
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.24.3.1';
++  health.candidateVersion = '2.24.3.2';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4913,7 +4913,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24.3.1 CANONICAL EFFORT REPAIR',
++  return ['ChatGPT Conversation Size Meter V2.24.3.2 MEDIUM EFFORT REPAIR',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -7752,7 +7752,7 @@ async function retryCapture(binding = null) {
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.24.3.1',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.24.3.2',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -9588,7 +9588,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24.3.1 CANONICAL EFFORT REPAIR',
++    'Candidate userscript: V2.24.3.2 MEDIUM EFFORT REPAIR',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
