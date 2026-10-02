@@ -1,0 +1,44 @@
+PASS exact registry contains only the three supplied identities with all 99 numeric aggregates
+PASS registry entries profile arrays and every vector are immutable distinct objects
+PASS identical metrics never collapse or alias identities or nine profile observations
+PASS max selects exactly its own three profiles and expected independent frontiers
+PASS max cannot borrow either other seed when its entry is absent
+PASS max lower exact local MAX cannot shrink either bundled frontier
+PASS max exact local evidence independently extends text and state
+PASS max local extensions stay isolated with sufficient exact evidence in every profile
+PASS max numeric pressure caps at 99 until existing current MAX is verified
+PASS max zero current metrics stay zero and missing primary data stays calibrating
+PASS max production view immediately scores fresh captured state without dispatch or persistence
+PASS high selects exactly its own three profiles and expected independent frontiers
+PASS high cannot borrow either other seed when its entry is absent
+PASS high lower exact local MAX cannot shrink either bundled frontier
+PASS high exact local evidence independently extends text and state
+PASS high local extensions stay isolated with sufficient exact evidence in every profile
+PASS high numeric pressure caps at 99 until existing current MAX is verified
+PASS high zero current metrics stay zero and missing primary data stays calibrating
+PASS high production view immediately scores fresh captured state without dispatch or persistence
+PASS medium selects exactly its own three profiles and expected independent frontiers
+PASS medium cannot borrow either other seed when its entry is absent
+PASS medium lower exact local MAX cannot shrink either bundled frontier
+PASS medium exact local evidence independently extends text and state
+PASS medium local extensions stay isolated with sufficient exact evidence in every profile
+PASS medium numeric pressure caps at 99 until existing current MAX is verified
+PASS medium zero current metrics stay zero and missing primary data stays calibrating
+PASS medium production view immediately scores fresh captured state without dispatch or persistence
+PASS supported aliases select corresponding seed through authoritative normalization only
+PASS unsupported efforts never receive a seed or another effort fallback
+PASS unsupported and similar models never receive any of the three seeds
+PASS unsupported exact model with valid local evidence retains local-only scoring
+PASS all nine secondary metrics are diagnostics only and cannot alter score
+PASS seed metadata and values do not include prohibited identifiers or private source data
+PASS seed-only compute lookup summaries and empty migration never persist seeds or count local observations
+PASS necessary local save contains only local event rows rather than nine seed profiles
+PASS historical raw extended and standard provenance stays unchanged on evaluation/migration
+PASS Extra High original constant and all max scorer behavior remain byte/value equivalent
+PASS raw backend provenance and seeded anonymous MAX/SUCCESS export work for each effort
+PASS anonymous privacy contract remains closed for every seeded effort
+PASS offline builder does not collapse identical observations across effort identities
+PASS registry lookup and full pressure are deterministic under registry and row permutations
+PASS all three profiles retain LOW confidence regardless of local sample population
+PASS release identity agrees in metadata anonymous copy health Retry and diagnostics
+43/43 V2.24.4 full-registry synthetic tests passed; native review pending

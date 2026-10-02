@@ -1,0 +1,47 @@
+V2.24.3.1: frozen V2.24.3 cases; identity projection only; offline builder cases/CLI redirected to repaired utility. No cases skipped.
+PASS static seed is byte-identical to exact frozen parent and embedded unchanged
+PASS registry has only accepted exact immutable max entry and all three original pairs
+PASS exact supported registry lookup derives existing text and state frontiers
+PASS high has no seed and fresh pressure remains calibrating
+PASS medium has no seed and fresh pressure remains calibrating
+PASS low has no seed and fresh pressure remains calibrating
+PASS instant has no seed and fresh pressure remains calibrating
+PASS xhigh has no seed and fresh pressure remains calibrating
+PASS null has no seed and fresh pressure remains calibrating
+PASS unrelated and similar model IDs do not borrow a seed
+PASS future entries can use the existing scorer lookup with no shipped synthetic profiles
+PASS actual verified MAX exports complete numeric aggregates with pre-max provenance
+PASS actual confirmed SUCCESS exports full metrics with success-pre provenance
+PASS SUCCESS current role requires stable capture at or after success confirmation
+PASS MAX prefers complete canonical BATCH pre vector over a newer DIRECT vector
+PASS MAX without pre uses accepted fresh post-MAX fallback with explicit role
+PASS MAX last resort requires current capture after MAX and labels current-max
+PASS MAX cannot reuse an old current or fallback capture
+PASS linked MAX model or effort mismatch refuses export
+PASS no confirmed generation SUCCESS does not fabricate a healthy sample
+PASS running attempt and failed latest attempt cannot borrow older SUCCESS
+PASS untracked visible native MAX cannot be silently exported as SUCCESS
+PASS quoted MAX text remains normal SUCCESS through unchanged detector
+PASS stale cleared MAX is not exported as current verified MAX
+PASS zero unknown or invalid primary axes fail closed for anonymous calibration
+PASS optional unknown secondary aggregates stay explicit null
+PASS clipboard whitelist excludes IDs timestamps contents URLs file names and diagnostics
+PASS recursive privacy validator refuses forbidden nested keys at array depths
+PASS privacy rejects URLs UUIDs timestamps cycles accessors symbols and excessive structure
+PASS schema rejects unknown fields nonfinite metrics and outcome contradictions
+PASS repeated manual export cannot write storage or change local calibration counts
+PASS persisted export path cannot finalize pending attempts or migrate storage
+PASS clipboard denial and navigation refusal leave calibration and storage unchanged
+PASS anonymous action binds separate runner and keeps collapsed controls unchanged
+PASS anonymous action coalesces concurrent copies and resets only its own label
+PASS seed-only score current MAX and seed-plus-local scores remain exact parent behavior
+PASS builder groups only exact model plus canonical effort and ignores success for MAX frontier
+PASS builder retains heterogeneous vectors including different vectors within one observation
+PASS duplicate vectors never manufacture independent observations even with different labels
+PASS secondary MAX heterogeneity is retained without new scoring profiles or independence
+PASS overlapping observation labels merge transitively without losing heterogeneous vectors
+PASS builder scalar frontiers and ordered retained vectors are deterministic under permutation
+PASS success-only groups bracket diagnostics but produce no seed entries
+PASS builder rejects private malformed and contradictory samples without echoing raw inputs
+PASS builder CLI only returns anonymous candidates and never auto-admits them
+45/45 V2.24.3 registry/export/builder synthetic tests passed; native review pending

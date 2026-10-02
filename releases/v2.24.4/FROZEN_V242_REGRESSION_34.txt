@@ -1,0 +1,36 @@
+V2.24.2 local-only regression: unchanged V2.24.1 cases; seed-ineligible synthetic model for 31/34 cases; identity-only projection. Supported seed behavior tested separately. No cases skipped.
+PASS three independent native-reported MAX chats establish separate upper capacities
+PASS healthyEarlier matches empirical dual score and remains non-MAX
+PASS healthyNearBoundary matches empirical dual score and remains non-MAX
+PASS tinyHealthy matches empirical dual score and remains non-MAX
+PASS healthy state-heavy text 54 and state 73 produce visible PRESSURE 73 LOW
+PASS both successful states are retained as SUCCESS without MAX or contradictions
+PASS state-heavy verified current MAX alone gives terminal PRESSURE MAX
+PASS same state-heavy vector without current verification remains numeric 99
+PASS text-heavy MAX 0 approaches terminal through text axis
+PASS text-heavy MAX 1 approaches terminal through text axis
+PASS fresh post-MAX is supporting evidence only and cannot increase either anchor
+PASS live structured MAX and fresh capture keep one third-conversation episode
+PASS new state-heavy observation never collapses established text capacity
+PASS identical retries across three chats do not alter either axis or independent weighting
+PASS distinct canonical states of one chat select upper value independently per axis
+PASS pre-MAX canonical evidence excludes larger fallback and supporting post on both axes
+PASS canonical fallback contributes only when that axis has no valid pre contribution
+PASS missing state evidence is explicit calibrating without silent text-only scoring
+PASS invalid current state metric never coerces to zero or hides missing axis
+PASS known zero state current contributes zero ratio while missing/zero capacities remain uncalibrated
+PASS state exceedance alone clamps 99, stays nonterminal, and flags the state axis
+PASS text exceedance alone clamps 99 and leaves the state axis below capacity
+PASS secondary nine metrics can be huge without changing either axis score
+PASS SUCCESS exceeding either capacity counted once with raw and independent accounting
+PASS confidence stays LOW even with a large homogeneous synthetic frontier
+PASS deterministic repeated calculation and sample permutations include equal-value contribution ties
+PASS equal axis ratios produce explicit tie with a deterministic combined score
+PASS comparison tier and demonstrated effort alias remain exact-model-effort
+PASS old compact event store loads without byte rewrite and new model identity is in memory
+PASS axis diagnostics remain bounded without losing total contribution counts
+PASS actual render shows 73 LOW and current MAX uses preserved red theme, then clears
+PASS actual diagnostics include both axes/combined and real V2.24.1 metadata and Retry identity
+PASS production model has no fixed native numbers, changed storage prefix, or recursive pressure helper
+PASS verified current MAX overrides both missing axes and missing comparison identity
+34/34 V2.24.1 dual-axis synthetic tests passed; native candidate review pending
