@@ -1,0 +1,261 @@
+diff --git a/releases/v2.24.2/chatgpt_chat_size_meter_v2242_anonymous_seed_calibration.js b/releases/v2.24.3/chatgpt_chat_size_meter_v2243_anonymous_seed_builder.js
+index 0261957..f68b4b6 100644
+--- a/releases/v2.24.2/chatgpt_chat_size_meter_v2242_anonymous_seed_calibration.js
++++ b/releases/v2.24.3/chatgpt_chat_size_meter_v2243_anonymous_seed_builder.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+-// @name         ChatGPT Conversation Size Meter V2.24.2 ANONYMOUS SEED CALIBRATION
++// @name         ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER
+ // @namespace    local.chatgpt.size.v2101
+-// @version      2.24.2
++// @version      2.24.3
+ // @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+ // @match        https://chatgpt.com/*
+ // @grant        unsafeWindow
+@@ -3779,6 +3779,13 @@ const PRESSURE_SEED = Object.freeze({
+   ])
+ });
+ 
++// Only the accepted model/effort has evidence. Future entries use this same
++// immutable shape; no thresholds are supplied for unobserved combinations.
++const ANONYMOUS_PRESSURE_SEEDS = Object.freeze([
++  Object.freeze({model:PRESSURE_SEED.model,canonicalEffort:PRESSURE_SEED.canonicalEffort,
++    seedVersion:PRESSURE_SEED.version,profiles:PRESSURE_SEED.profiles})
++]);
++
+ // V2.24 empirical pressure, schema 1. No raw mappings, requests, or diagnostic objects.
+ // 256 event rows, at most two vectors/row. Eviction watermark prevents replay of old events.
+ const PRESSURE_KEY = `${P}:pressure-calibration-v224`;
+@@ -4041,10 +4048,11 @@ function pressureAxis(rows, vector, field, activeMax) {
+     sourceFamilyMismatch:contributions.some(c=>c.sourceFamily!==vector?.sourceFamily)};
+ }
+ function pressureSeed(model, effort) {
+-  if(model!==PRESSURE_SEED.model || effort!==PRESSURE_SEED.canonicalEffort)return null;
+-  const text=PRESSURE_SEED.profiles.map(p=>p.displayLikeTokens),state=PRESSURE_SEED.profiles.map(p=>p.activeBranchBytes);
+-  return {version:PRESSURE_SEED.version,model:PRESSURE_SEED.model,canonicalEffort:PRESSURE_SEED.canonicalEffort,
+-    profileCount:PRESSURE_SEED.profiles.length,textFrontier:Math.max(...text),stateFrontier:Math.max(...state),
++  const selected=ANONYMOUS_PRESSURE_SEEDS.find(s=>s.model===model && s.canonicalEffort===effort);
++  if(!selected)return null;
++  const text=selected.profiles.map(p=>p.displayLikeTokens),state=selected.profiles.map(p=>p.activeBranchBytes);
++  return {version:selected.seedVersion,model:selected.model,canonicalEffort:selected.canonicalEffort,
++    profileCount:selected.profiles.length,textFrontier:Math.max(...text),stateFrontier:Math.max(...state),
+     textRange:{min:Math.min(...text),max:Math.max(...text)},stateRange:{min:Math.min(...state),max:Math.max(...state)}};
+ }
+ function pressureSeedAxis(local, seed, activeMax) {
+@@ -4147,6 +4155,143 @@ function pressureText(result) {
+     `PRESSURE ${result.score} / 100 · ${result.confidence.toUpperCase()}`;
+ }
+ 
++// Schema 1 is an allowlisted anonymous metric projection, never a diagnostic dump.
++const ANONYMOUS_SAMPLE_METRICS = Object.freeze(['displayLikeTokens','activeBranchBytes','mappingBytes',
++  'retainedBytes','toolResultBytes','branchNodes','messageNodes','retainedShare','hot128','hot256','strongContextMarkers']);
++const ANONYMOUS_SAMPLE_HEADERS = Object.freeze(['schemaVersion','candidateVersion','model','canonicalEffort',
++  'outcome','snapshotRole','sourceFamily','verifiedCurrentMax','pressureState']);
++function anonymousPrivacyValid(value) {
++  // Inspect nested objects/arrays iteratively. Cycles, accessors, unusual values
++  // and excessive structure fail closed instead of being serialized accidentally.
++  const pending=[{value,depth:0}],seen=new Set();let count=0;
++  try {
++    while(pending.length) {
++      const item=pending.pop(),x=item.value;if(++count>1024 || item.depth>32)return false;
++      if(x==null || typeof x==='boolean')continue;
++      if(typeof x==='number'){if(!Number.isFinite(x))return false;continue;}
++      if(typeof x==='string'){
++        if(x.length>160 || /(?:https?:\/\/|www\.|[a-z]+:\/\/|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\d{4}-\d{2}-\d{2}T\d{2}:)/i.test(x))return false;
++        continue;
++      }
++      if(typeof x!=='object' || seen.has(x) || !['[object Object]','[object Array]'].includes(Object.prototype.toString.call(x)))return false;
++      seen.add(x);
++      for(const key of Reflect.ownKeys(x)) {
++        if(typeof key!=='string')return false;
++        const normalized=key.replace(/[^a-z0-9]/gi,'').toLowerCase();
++        if(/(?:conversationid|messageid|attemptid|episodeid|accountid|userid|assetid|timestamp|prompt|response|screenshot|filename|rawmapping|rawdiagnostic)/.test(normalized) ||
++          /(?:id|ids|url|urls|uri|uris|href|title|mapping|mappings|diagnostics|diagnosticblobs|rawbody|content|text)$/.test(normalized) ||
++          /(?:started|ended|created|updated|confirmed|completed|observed|captured)at$/.test(normalized) ||
++          ['time','date','capturedat','fullcapturedat','firstseenat','lastseenat','requestdetectedat','outcomeconfirmedat','rawdiagnosticblob','rawdiagnosticblobs','account','user','asset','file'].includes(normalized))return false;
++        const descriptor=Object.getOwnPropertyDescriptor(x,key);
++        if(!descriptor || descriptor.get || descriptor.set)return false;
++        pending.push({value:descriptor.value,depth:item.depth+1});
++      }
++    }
++    return true;
++  }catch{return false;}
++}
++function anonymousSampleValid(sample) {
++  if(!sample || Array.isArray(sample) || !anonymousPrivacyValid(sample))return false;
++  const allowed=[...ANONYMOUS_SAMPLE_HEADERS,...ANONYMOUS_SAMPLE_METRICS];
++  if(Object.keys(sample).some(k=>!allowed.includes(k)) || ANONYMOUS_SAMPLE_HEADERS.some(k=>!Object.hasOwn(sample,k)))return false;
++  if(sample.schemaVersion!==1 || !/^\d+\.\d+\.\d+$/.test(sample.candidateVersion) || typeof sample.candidateVersion!=='string' ||
++    typeof sample.model!=='string' || !/^[a-z][a-z0-9._-]{0,119}$/i.test(sample.model) ||
++    typeof sample.canonicalEffort!=='string' || !/^[a-z][a-z0-9 ._-]{0,39}$/.test(sample.canonicalEffort) ||
++    sample.canonicalEffort!==sample.canonicalEffort.trim().replace(/\s+/g,' ') || sample.canonicalEffort==='extra high' ||
++    !['direct','batch'].includes(sample.sourceFamily) || !['scored','calibrating','current-max'].includes(sample.pressureState))return false;
++  const max=sample.outcome==='max',success=sample.outcome==='success';
++  if(!max && !success || sample.verifiedCurrentMax!==max || max && sample.pressureState!=='current-max' || success && sample.pressureState==='current-max' ||
++    !(max?['pre-max','fallback','current-max']:['success-pre','current']).includes(sample.snapshotRole))return false;
++  for(const field of ANONYMOUS_SAMPLE_METRICS) {
++    const x=sample[field];
++    if(x==null){if(['displayLikeTokens','activeBranchBytes','mappingBytes','branchNodes'].includes(field))return false;continue;}
++    if(typeof x!=='number' || !Number.isFinite(x) || x<0)return false;
++  }
++  return sample.displayLikeTokens>0 && sample.activeBranchBytes>0 && sample.mappingBytes>0 && sample.branchNodes>0;
++}
++function anonymousProjectSample(identity, vector) {
++  if(!vector)return null;
++  const sample={schemaVersion:1,candidateVersion:'2.24.3',model:identity.model,canonicalEffort:identity.effort,
++    outcome:identity.outcome,snapshotRole:identity.role,sourceFamily:vector.sourceFamily,
++    ...Object.fromEntries(ANONYMOUS_SAMPLE_METRICS.map(k=>[k,typeof vector[k]==='number' && Number.isFinite(vector[k]) && vector[k]>=0?vector[k]:null])),
++    verifiedCurrentMax:identity.outcome==='max',pressureState:identity.pressureState};
++  return anonymousSampleValid(sample)?sample:null;
++}
++
++function anonymousReadState(id, namespace, cache) {
++  const cached=cache?.get(id);if(cached)return cached;
++  try {
++    const text=localStorage.getItem(`${P}:${namespace}${namespace==='pressure-calibration-v224'?'':':'+id}`);
++    return text && text.length<=1500000?eventStorageParse(text):null;
++  }catch{return null;}
++}
++function anonymousSampleForChat(id = chatIdFromURL()) {
++  // Read caches or persisted bytes directly, without normal load/restart paths:
++  // export cannot finalize an attempt, migrate, persist, or admit calibration.
++  if(!id || id!==chatIdFromURL())return null;
++  const attempts=anonymousReadState(id,'attempts-v223',attemptCache),episodes=anonymousReadState(id,'max-episodes-v223',episodeCache);
++  const life=anonymousReadState(id,'lifecycle-v216',lifecycleCache),snapshot=anonymousReadState(id,'snapshot',snapshotCache);
++  const local=pressureStore || anonymousReadState(id,'pressure-calibration-v224');
++  const samples=local?.schemaVersion===1 && Array.isArray(local.samples) && local.samples.length<=PRESSURE_CAP?
++    local.samples.map(s=>pressureCleanRow(s,true)).filter(Boolean):[];
++  const latestAttempt=attempts?.current || attempts?.last;
++  const model=pressureLabel(attempts?.current?.requestModel) || pressureLabel(snapshot?.structure?.contextTopology?.currentModel) || pressureLabel(latestAttempt?.requestModel);
++  const effort=pressureEffort(attemptEffortHint()) || (model===latestAttempt?.requestModel?pressureEffort(latestAttempt?.requestEffort):null);
++  if(!model || !effort)return null;
++  const rows=[attempts?.current,attempts?.last,...(Array.isArray(attempts?.attempts)?attempts.attempts:[])].filter(Boolean);
++  const matching=a=>a.conversationId===id && a.trigger==='network-generation-dispatch' && pressureLabel(a.requestModel)===model && pressureEffort(a.requestEffort)===effort;
++  const sourceVectors=(role,stableOnly=false)=>['batch','direct'].flatMap(f=>{
++    const family=life?.families?.[f];return (stableOnly?[family?.lastStable]:[family?.lastObservation,family?.lastStable,family?.lastInflight]).map(v=>pressureVector(v,role));
++  }).filter(Boolean).sort((a,b)=>b.fullCapturedAt-a.fullCapturedAt || Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch'));
++  const current=sourceVectors('current')[0] || null;
++  const episode=Array.isArray(episodes?.episodes)?episodes.episodes.find(e=>e.id===episodes.activeId && e.active===true && e.conversationId===id && pressureNumber(e.firstSeenAt)>0 &&
++    Number.isSafeInteger(e.id) && e.id>0 && ['UI MAX banner','structured SSE error','HTTP generation error','blocked before dispatch'].includes(e.confirmationSource)):null;
++  let vector=null,role=null,outcome=null;
++  if(episode) {
++    const related=rows.find(a=>a.id===episode.relatedRealAttemptId);
++    if(related && !matching(related))return null;
++    const linked=related;
++    const compact=samples.filter(s=>s.conversationId===id && s.eventId===episode.id && s.outcome==='max' && s.model===model && pressureEffort(s.effort)===effort);
++    const pre=pressureBest([
++      ...compact.filter(s=>s.canonical.snapshotRole==='pre-dispatch').map(s=>pressureVector(s.canonical,'pre-dispatch',episode.firstSeenAt)),
++      ...['batch','direct'].map(f=>pressureVector(linked?.pre?.[f],'pre-dispatch',linked?.requestDetectedAt || linked?.startedAt || 0))
++    ]);
++    const fallback=pressureBest([
++      ...compact.filter(s=>s.canonical.snapshotRole==='fresh-post-max-fallback').map(s=>pressureVector(s.canonical,'fresh-post-max-fallback',Infinity,episode.firstSeenAt)),
++      ...['batch','direct'].map(f=>pressureVector(episode[f],'fresh-post-max-fallback',Infinity,episode.firstSeenAt))
++    ]);
++    vector=pre || fallback || sourceVectors('current-max').find(v=>v.fullCapturedAt>=episode.firstSeenAt) || null;
++    role=pre?'pre-max':fallback?'fallback':'current-max';outcome='max';
++  }else {
++    if(visibleHardMax() || attempts?.current && !attempts.current.outcome)return null;
++    const success=rows.filter(a=>a.conversationId===id && a.trigger==='network-generation-dispatch')
++      .sort((a,b)=>b.id-a.id)[0];
++    if(!success || !matching(success) || success.outcome!=='success' || !success.outcomeConfirmedBy || !(pressureNumber(success.outcomeConfirmedAt)>0))return null;
++    const pre=pressureBest(['batch','direct'].map(f=>pressureVector(success.pre?.[f],'pre-dispatch',success.requestDetectedAt || success.startedAt || 0)));
++    const stable=sourceVectors('current',true).find(v=>v.fullCapturedAt>=success.outcomeConfirmedAt);
++    vector=stable || pre;role=stable?'current':'success-pre';outcome='success';
++  }
++  const pressure=pressureCompute(samples,{model,effort,canonical:current},!!episode);
++  return anonymousProjectSample({model,effort,outcome,role,pressureState:pressure.state},vector);
++}
++async function copyAnonymousSample() {
++  const id=chatIdFromURL(),sample=anonymousSampleForChat(id);
++  if(!sample || !anonymousSampleValid(sample) || !anonymousPrivacyValid(sample))return false;
++  const text=JSON.stringify(sample,null,2);
++  if(text.length>4096 || chatIdFromURL()!==id)return false;
++  try {await navigator.clipboard.writeText(text);return true;}catch{return false;}
++}
++async function runAnonymousCopy() {
++  const state=quickActionState.anon;if(state.running)return false;
++  const serial=++quickActionState.serial,token=++state.token;
++  state.running=true;state.label='Copying…';quickActionState.last='Copying anonymous sample…';quickActionState.type='busy';paintQuickActions();
++  let ok=false;try{ok=await copyAnonymousSample();}catch{}
++  state.running=false;state.label=ok?'Copied ✓':'No safe sample ✕';
++  if(quickActionState.serial===serial){quickActionState.last=ok?'Anonymous sample copied ✓':'Anonymous copy unavailable or failed ✕';quickActionState.type=ok?'ok':'error';}
++  paintQuickActions();setTimeout(()=>{if(state.token!==token || state.running)return;state.label='Copy anon sample';paintQuickActions();},2200);
++  return ok;
++}
++
+ function eventStorageError(id, error) {
+   const health = storageHealth.get(id) || {lastSaveSuccessful:null,serializedBytes:null};
+   health.lastError = redactDiagnosticText(error?.message || String(error)).slice(0,300);
+@@ -4422,7 +4567,7 @@ function meterStorageFinalResult(id, required) {
+   health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+   health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+   health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+-  health.candidateVersion = '2.24.2';
++  health.candidateVersion = '2.24.3';
+   storageHealth.set(id,health);
+   return health.lastSaveSuccessful;
+ }
+@@ -4768,7 +4913,7 @@ function eventDiagnostics(id) {
+   const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+   const a = store.current || store.last;
+   const life = loadLifecycle(id);
+-  return ['ChatGPT Conversation Size Meter V2.24.2 ANONYMOUS SEED CALIBRATION',
++  return ['ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
+     `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+     `Active MAX episode ID: ${e?.id ?? 'none'}`,
+     `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+@@ -7606,7 +7751,7 @@ async function retryCapture(binding = null) {
+   if (!eventBindingValid(binding)) return false;
+   const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+   binding.retryToken = token;
+-  const trace = {version:'2.24.2',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
++  const trace = {version:'2.24.3',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+     startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+   retryTraces.set(captureRetryKey(binding),trace);
+   while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+@@ -8478,7 +8623,8 @@ function statusColor(cls) {
+ const quickActionState = {
+   serial:0,last:'No quick action yet',type:'muted',
+   copy:{running:false,label:'Copy diagnostics',token:0},
+-  retry:{running:false,label:'Retry capture',token:0}
++  retry:{running:false,label:'Retry capture',token:0},
++  anon:{running:false,label:'Copy anon sample',token:0}
+ };
+ 
+ function quickActionsMarkup() {
+@@ -8486,13 +8632,13 @@ function quickActionsMarkup() {
+     const state = quickActionState[action];
+     return `<button data-action="${action}" ${state.running ? 'disabled aria-busy="true"' : ''}>${esc(state.label || normal)}</button>`;
+   };
+-  return `<div class="quick-actions">${button('copy','Copy diagnostics')}${button('retry','Retry capture')}
++  return `<div class="quick-actions">${button('copy','Copy diagnostics')}${button('retry','Retry capture')}${button('anon','Copy anon sample')}
+     <div class="last-action ${esc(quickActionState.type)}" data-quick-status role="status" aria-live="polite" aria-atomic="true">Last action: ${esc(quickActionState.last)}</div></div>`;
+ }
+ 
+ function paintQuickActions() {
+   if (!panel) return;
+-  for (const action of ['copy','retry']) {
++  for (const action of ['copy','retry','anon']) {
+     const button = panel.querySelector(`[data-action="${action}"]`), state = quickActionState[action];
+     if (!button) continue;
+     button.textContent = state.label; button.disabled = state.running;
+@@ -9441,7 +9587,7 @@ async function copyStats() {
+   if (!latest) return false;
+ 
+   const lines = [
+-    'Candidate userscript: V2.24.2 ANONYMOUS SEED CALIBRATION',
++    'Candidate userscript: V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
+     ...eventDiagnostics(latest.id),
+     'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+     'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
+@@ -10389,6 +10535,10 @@ function bindUI() {
+           await runQuickAction('retry');
+           break;
+ 
++        case 'anon':
++          await runAnonymousCopy();
++          break;
++
+         case 'copy':
+           await runQuickAction('copy');
+           break;

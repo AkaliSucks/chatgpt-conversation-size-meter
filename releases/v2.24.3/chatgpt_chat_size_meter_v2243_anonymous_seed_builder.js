@@ -1,0 +1,10693 @@
+// ==UserScript==
+// @name         ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER
+// @namespace    local.chatgpt.size.v2101
+// @version      2.24.3
+// @description  Separates real generation attempts, MAX episodes, source captures and transport telemetry for empirical research.
+// @match        https://chatgpt.com/*
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+(() => {
+'use strict';
+
+/*
+  V2.23 — EVENT MODEL CLEANUP
+
+  Goal:
+  - Do not auto-scroll the conversation.
+  - Do not require a manual top-to-bottom pass.
+  - Observe ChatGPT's own conversation network traffic at document-start.
+  - Extract user/assistant messages from full conversation payloads when available.
+  - Merge later POST/SSE messages into a captured full snapshot.
+  - Persist only message IDs/roles/character counts; not the conversation text.
+
+  Important:
+  ChatGPT does not expose an official "remaining conversation capacity" value.
+  V2.23 preserves explicit SSE completion to authoritative SUCCESS evidence and makes post-response source snapshots optional correlation rather than a success gate.
+  It measures the active current_node ancestry separately from the total mapping,
+  records hidden/internal-role structure, branch topology, content types, and stable
+  serialized-size diagnostics. Verified MAX samples can only be saved while the
+  actual red maximum-length banner is visible.
+
+  If ChatGPT changes its internal transport again and no full payload can be
+  captured, this script intentionally says "waiting for full data" instead of
+  pretending a viewport sample is the whole conversation.
+*/
+
+const P = 'cgpt-size-meter-v2101';
+const SETTINGS_KEY = `${P}:settings`;
+const POSITION_KEY = `${P}:position`;
+const SNAPSHOT_PREFIX = `${P}:snapshot`;
+const MAX_PREFIX = `${P}:max`;
+const DIAG_PREFIX = `${P}:diag`;
+const MAX_SAMPLES_KEY = `${P}:verified-max-samples`;
+const LIFECYCLE_PREFIX = `${P}:lifecycle-v216`;
+const ATTEMPT_PREFIX = `${P}:attempts-v223`;
+
+const DEFAULTS = {
+  charsPerToken: 4.0,
+  fallbackReferenceTokens: 250000,
+  warningPercent: 80,
+  notifications: false,
+  calibrationTokens: null,
+  expanded: false
+};
+
+let S = loadSettings();
+let panel = null;
+let compact = null;
+let detail = null;
+let settingsBox = null;
+let latest = null;
+let updateTimer = null;
+let lastURL = location.href;
+let drag = false;
+let dx = 0;
+let dy = 0;
+let networkHooked = false;
+let directRetryTimer = null;
+let lastGeneratingState = false;
+let lifecycleRetryTimer = null;
+let attemptFinalizeTimer = null;
+let attemptUnknownTimer = null;
+let attemptSettleTimer = null;
+let attemptSSESuccessTimer = null;
+let websocketHooked = false;
+let attemptDOMObserver = null;
+let attemptDOMTimer = null;
+let attemptDOMLastSignature = '';
+let attemptDOMLastGenerating = null;
+let attemptDOMLastCaptureAt = 0;
+
+const page = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+// V2.23 event state is isolated from historical V2.22 inferred outcomes.
+const attemptCache = new Map();
+const episodeCache = new Map();
+const storageHealth = new Map();
+const snapshotCache = new Map();
+const lifecycleCache = new Map();
+const diagnosticCache = new Map();
+const storagePending = new Map();
+let storageRecoveryRunning = false;
+const meterStorageTotals = {meterOwnedKeyCount:null,meterOwnedBytes:null,meterOwnedUtf16Bytes:null,
+  bytesReclaimed:0,cleanupAt:null,lastAuditAt:null};
+const streamBuffers = new Map(); // ephemeral framing only, never persisted
+const captureJobs = new Map();
+let meterFetch = null;
+const captureRoutes = new Map(); // session-only request forms; never serialized
+const retryTraces = new Map(); // bounded, body/header-free results
+let retrySerial = 0;
+let activeCaptureBinding = null; // synchronous parser-to-event handoff only
+let sendIntentHooked = false;
+let pendingComposerEnter = null;
+let lastComposerSubmission = null;
+
+
+
+// ============================================================
+// Storage
+// ============================================================
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
+
+    for (const k of [
+      'cgpt-size-meter-v210:settings',
+      'cgpt-size-meter-v29:settings',
+      'cgpt-size-meter-v28:settings',
+      'cgpt-size-meter-v27:settings',
+      'cgpt-size-meter-v26:settings',
+      'cgpt-size-meter-v25:settings',
+      'cgpt-size-meter-v24:settings',
+      'cgpt-size-meter-v23:settings',
+      'cgpt-size-meter-v22:settings'
+    ]) {
+      const x = localStorage.getItem(k);
+      if (!x) continue;
+
+      const migrated = {
+        ...DEFAULTS,
+        ...JSON.parse(x),
+        // V2.7 proved that raw archive-text size is NOT a universal
+        // conversation hard limit. Never migrate the old calibration.
+        calibrationTokens: null
+      };
+
+      localStorage.setItem(
+        SETTINGS_KEY,
+        JSON.stringify(migrated)
+      );
+
+      return migrated;
+    }
+  } catch {}
+
+  return { ...DEFAULTS };
+}
+
+function saveSettings() {
+  localStorage.setItem(
+    SETTINGS_KEY,
+    JSON.stringify(S)
+  );
+}
+
+function chatIdFromURL() {
+  return location.pathname.match(/\/c\/([^/?#]+)/)?.[1] || null;
+}
+
+function snapshotKey(id = chatIdFromURL()) {
+  return id ? `${SNAPSHOT_PREFIX}:${id}` : null;
+}
+
+function maxKey(id = chatIdFromURL()) {
+  return id ? `${MAX_PREFIX}:${id}` : null;
+}
+
+function diagKey(id = chatIdFromURL()) {
+  return id ? `${DIAG_PREFIX}:${id}` : null;
+}
+
+function blankSnapshot() {
+  return {
+    version: 3,
+    full: false,
+    records: [],
+    source: 'waiting for full data',
+    capturedAt: 0,
+    fullCapturedAt: 0,
+    structure: null,
+    maxFullPayloadBytes: 0
+  };
+}
+
+function loadSnapshot(id = chatIdFromURL()) {
+  const k = snapshotKey(id);
+  if (!k) return blankSnapshot();
+  if (snapshotCache.has(id)) return snapshotCache.get(id);
+
+  try {
+    const parsed = eventStorageParse(localStorage.getItem(k));
+    if (parsed && Array.isArray(parsed.records)) {
+      const snapshot = {
+        ...blankSnapshot(),
+        ...parsed
+      };
+      snapshotCache.set(id,snapshot);
+      return snapshot;
+    }
+  } catch {}
+
+  return blankSnapshot();
+}
+
+function saveSnapshot(id, snap) {
+  const key = snapshotKey(id);
+  if (key) { snapshotCache.set(id,snap); eventSave(id,key,snap); }
+}
+
+function saveDiagnostic(id, diag) {
+  const key = diagKey(id);
+  if (!key) return;
+  let previous = {};
+  try { previous = loadDiagnostic(id) || {}; }
+  catch (error) { eventStorageError(id,error); }
+  const value = {...previous,...diag,time:Date.now()};
+  for (const field of ['lastObservedURL','lastSourceURL']) {
+    if (value[field]) value[field] = sanitizeURL(value[field]);
+  }
+  diagnosticCache.set(id,value);
+  eventSave(id,key,value);
+}
+
+function loadDiagnostic(id = chatIdFromURL()) {
+  const k = diagKey(id);
+  if (!k) return null;
+  if (diagnosticCache.has(id)) return diagnosticCache.get(id);
+
+  try {
+    const value = eventStorageParse(localStorage.getItem(k));
+    if (value) diagnosticCache.set(id,value);
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function esc(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function fmt(n) {
+  if (!Number.isFinite(n)) return '0';
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e5) return `${(n / 1e3).toFixed(0)}k`;
+  if (n >= 1e4) return `${(n / 1e3).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
+function hashString(s) {
+  let h = 2166136261;
+
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+
+  return (h >>> 0).toString(36);
+}
+
+function estimateTokens(chars) {
+  return chars
+    ? Math.ceil(chars / S.charsPerToken)
+    : 0;
+}
+
+function formatAge(ts) {
+  if (!ts) return '—';
+
+  const mins = Math.max(
+    0,
+    Math.floor((Date.now() - ts) / 60000)
+  );
+
+  if (mins < 60) return `${mins}m ago`;
+
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function scheduleUpdate() {
+  clearTimeout(updateTimer);
+  updateTimer = setTimeout(updateUI, 150);
+}
+
+
+// ============================================================
+// Hard-limit persistence
+// ============================================================
+
+function visibleHardMax() {
+  return !!detectMaxBanner();
+}
+
+function verifiedSampleSignature(sample) {
+  return [
+    sample?.chatId ?? '',
+    sample?.archiveTokens ?? '',
+    sample?.messages ?? '',
+    sample?.userMessages ?? '',
+    sample?.assistantMessages ?? ''
+  ].join('|');
+}
+
+function richerVerifiedSample(a, b) {
+  const score = x => [
+    x?.mappingNodes,
+    x?.activeBranchNodes,
+    x?.activeAllTextCharacters,
+    x?.mappingSerializedBytes,
+    x?.maxFullPayloadBytes
+  ].filter(v => Number.isFinite(Number(v)) && Number(v) > 0).length;
+
+  return score(b) >= score(a) ? { ...a, ...b } : { ...b, ...a };
+}
+
+function loadVerifiedMaxSamples() {
+  let samples = [];
+
+  try {
+    const x = JSON.parse(localStorage.getItem(MAX_SAMPLES_KEY));
+    if (Array.isArray(x)) samples = x;
+  } catch {}
+
+  if (!samples.length) {
+    for (const oldKey of [
+      'cgpt-size-meter-v210:verified-max-samples',
+      'cgpt-size-meter-v29:verified-max-samples',
+      'cgpt-size-meter-v28:verified-max-samples'
+    ]) {
+      try {
+        const old = JSON.parse(localStorage.getItem(oldKey));
+
+        if (Array.isArray(old) && old.length) {
+          const bySignature = new Map();
+
+          for (const sample of old) {
+            const sig = verifiedSampleSignature(sample);
+            const prior = bySignature.get(sig);
+            bySignature.set(
+              sig,
+              prior ? richerVerifiedSample(prior, sample) : sample
+            );
+          }
+
+          samples = [...bySignature.values()];
+          localStorage.setItem(
+            MAX_SAMPLES_KEY,
+            JSON.stringify(samples.slice(-20))
+          );
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  return samples;
+}
+
+function saveVerifiedMaxSample(sample) {
+  const samples = loadVerifiedMaxSamples();
+  const sig = verifiedSampleSignature(sample);
+  const index = samples.findIndex(x => verifiedSampleSignature(x) === sig);
+
+  if (index >= 0) {
+    samples[index] = richerVerifiedSample(samples[index], sample);
+  } else {
+    samples.push(sample);
+  }
+
+  localStorage.setItem(MAX_SAMPLES_KEY, JSON.stringify(samples.slice(-20)));
+}
+
+function clearVerifiedMaxSamples() {
+  localStorage.removeItem(MAX_SAMPLES_KEY);
+}
+
+
+// ============================================================
+// Message extraction
+// ============================================================
+
+function normalizeRole(role) {
+  const r = String(role || '').trim().toLowerCase();
+
+  if (['user', 'assistant'].includes(r)) {
+    return r;
+  }
+
+  return null;
+}
+
+function textFromPart(part) {
+  if (part == null) return '';
+
+  if (typeof part === 'string') {
+    return part;
+  }
+
+  if (Array.isArray(part)) {
+    return part
+      .map(textFromPart)
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (typeof part === 'object') {
+    if (typeof part.text === 'string') return part.text;
+    if (typeof part.value === 'string') return part.value;
+
+    if (typeof part.content === 'string') {
+      return part.content;
+    }
+
+    if (Array.isArray(part.parts)) {
+      return part.parts
+        .map(textFromPart)
+        .filter(Boolean)
+        .join('\n');
+    }
+
+    if (
+      part.content &&
+      typeof part.content === 'object'
+    ) {
+      return textFromPart(part.content);
+    }
+  }
+
+  return '';
+}
+
+function textFromMessage(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+
+  const c = msg.content;
+
+  if (typeof c === 'string') {
+    return c.trim();
+  }
+
+  if (c && typeof c === 'object') {
+    if (Array.isArray(c.parts)) {
+      return c.parts
+        .map(textFromPart)
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+    }
+
+    if (typeof c.text === 'string') {
+      return c.text.trim();
+    }
+
+    if (typeof c.content === 'string') {
+      return c.content.trim();
+    }
+
+    const derived = textFromPart(c);
+    if (derived) return derived.trim();
+  }
+
+  if (typeof msg.text === 'string') {
+    return msg.text.trim();
+  }
+
+  return '';
+}
+
+function roleFromMessage(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+
+  return normalizeRole(
+    msg.author?.role ??
+    msg.role ??
+    msg.message?.author?.role ??
+    msg.message?.role
+  );
+}
+
+function idFromMessage(msg, fallbackText, role) {
+  const id =
+    msg?.id ??
+    msg?.message?.id ??
+    msg?.message_id ??
+    msg?.client_message_id ??
+    msg?.metadata?.message_id;
+
+  if (id) return String(id);
+
+  return `hash:${hashString(`${role}\0${fallbackText}`)}`;
+}
+
+function recordFromMessage(msg) {
+  const actual = msg?.message && typeof msg.message === 'object'
+    ? msg.message
+    : msg;
+
+  const role = roleFromMessage(actual);
+  if (!role) return null;
+
+  const text = textFromMessage(actual);
+  if (!text) return null;
+
+  return {
+    id: idFromMessage(actual, text, role),
+    role,
+    chars: text.length
+  };
+}
+
+
+// ============================================================
+// Conversation-shape parsers + structural diagnostics
+// ============================================================
+
+function rawRoleFromMessage(msg) {
+  const actual = msg?.message && typeof msg.message === 'object'
+    ? msg.message
+    : msg;
+
+  const role =
+    actual?.author?.role ??
+    actual?.role ??
+    'unknown';
+
+  return String(role || 'unknown').trim().toLowerCase() || 'unknown';
+}
+
+function primaryContentType(msg) {
+  const actual = msg?.message && typeof msg.message === 'object'
+    ? msg.message
+    : msg;
+
+  const c = actual?.content;
+
+  const type =
+    c?.content_type ??
+    c?.type ??
+    actual?.content_type ??
+    actual?.type ??
+    'unknown';
+
+  return String(type || 'unknown').trim().toLowerCase() || 'unknown';
+}
+
+function countInto(obj, key, amount = 1) {
+  const k = String(key || 'unknown');
+  obj[k] = (obj[k] || 0) + amount;
+}
+
+function utf8BytesOfJSON(value) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length;
+  } catch {
+    return null;
+  }
+}
+
+function cleanShortString(value, max = 240) {
+  if (typeof value !== 'string') return null;
+  const s = value.trim();
+  if (!s || s.length > max) return null;
+  return s;
+}
+
+function genericRecipient(value) {
+  const s = String(value || '').trim().toLowerCase();
+
+  return (
+    !s ||
+    s === 'all' ||
+    s === 'none' ||
+    s === 'null' ||
+    s === 'assistant' ||
+    s === 'user' ||
+    s === 'system' ||
+    s === 'developer'
+  );
+}
+
+function looksLikeImageGenName(value) {
+  const s = String(value || '').toLowerCase();
+
+  return (
+    /image[_\-. ]?(gen|generation)/.test(s) ||
+    /gpt[-_. ]?image/.test(s) ||
+    /\bdall[-_. ]?e?\b/.test(s) ||
+    /imagegen/.test(s) ||
+    /text2im/.test(s)
+  );
+}
+
+function looksLikeAssetKey(key) {
+  const k = String(key || '').toLowerCase();
+
+  return (
+    k === 'asset_pointer' ||
+    k === 'image_asset_pointer' ||
+    k === 'file_id' ||
+    k === 'attachment_id' ||
+    k === 'upload_id' ||
+    k === 'media_id' ||
+    k === 'asset_id' ||
+    k === 'sandbox_path' ||
+    k === 'download_url' ||
+    k === 'image_url' ||
+    k === 'file_url'
+  );
+}
+
+function scanDeepSignals(value, depth = 0, state = null, parentKey = '') {
+  if (!state) {
+    state = {
+      attachment: false,
+      image: false,
+      file: false,
+      audio: false,
+      video: false,
+      generatedImageHint: false,
+      imageReferenceOccurrences: 0,
+      fileReferenceOccurrences: 0,
+      assetIds: new Set(),
+      imageAssetIds: new Set(),
+      fileAssetIds: new Set(),
+      modelIds: new Set(),
+      toolNameHints: new Set()
+    };
+  }
+
+  if (value == null || depth > 9) return state;
+
+  if (typeof value === 'string') {
+    const lower = value.toLowerCase();
+    const pk = String(parentKey || '').toLowerCase();
+
+    if (looksLikeImageGenName(value)) {
+      state.generatedImageHint = true;
+    }
+
+    if (
+      pk === 'model' ||
+      pk === 'model_id' ||
+      pk === 'model_name' ||
+      pk === 'model_slug' ||
+      pk === 'default_model_slug' ||
+      pk.endsWith('_model_slug') ||
+      pk.endsWith('_model_id')
+    ) {
+      const v = cleanShortString(value, 160);
+      if (v) state.modelIds.add(v);
+    }
+
+    if (
+      pk === 'tool_name' ||
+      pk === 'function_name' ||
+      pk === 'recipient' ||
+      pk === 'name'
+    ) {
+      const v = cleanShortString(value, 180);
+      if (v && !genericRecipient(v)) {
+        state.toolNameHints.add(v);
+      }
+    }
+
+    if (looksLikeAssetKey(pk)) {
+      state.assetIds.add(value);
+
+      if (pk.includes('image')) {
+        state.image = true;
+        state.imageReferenceOccurrences++;
+        state.imageAssetIds.add(value);
+      }
+
+      if (
+        pk.includes('file') ||
+        pk.includes('attachment') ||
+        pk.includes('upload') ||
+        pk === 'sandbox_path'
+      ) {
+        state.file = true;
+        state.fileReferenceOccurrences++;
+        state.fileAssetIds.add(value);
+      }
+    }
+
+    if (
+      lower.startsWith('sediment://') ||
+      lower.startsWith('asset://') ||
+      lower.startsWith('sandbox:/') ||
+      lower.startsWith('file-')
+    ) {
+      state.assetIds.add(value);
+    }
+
+    return state;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 300)) {
+      scanDeepSignals(item, depth + 1, state, parentKey);
+    }
+    return state;
+  }
+
+  if (typeof value !== 'object') return state;
+
+  for (const [key, child] of Object.entries(value)) {
+    const k = String(key || '').toLowerCase();
+
+    if (
+      k === 'attachment' ||
+      k === 'attachments' ||
+      k.includes('attachment') ||
+      k === 'asset_pointer' ||
+      k === 'image_asset_pointer' ||
+      k === 'file_id' ||
+      k === 'upload_id' ||
+      k === 'sandbox_path'
+    ) {
+      state.attachment = true;
+    }
+
+    if (k.includes('image')) {
+      state.image = true;
+      state.imageReferenceOccurrences++;
+    }
+
+    if (k.includes('file') || k.includes('attachment') || k.includes('upload')) {
+      state.file = true;
+      state.fileReferenceOccurrences++;
+    }
+
+    if (k.includes('audio')) state.audio = true;
+    if (k.includes('video')) state.video = true;
+
+    if (
+      (k === 'content_type' || k === 'type') &&
+      typeof child === 'string'
+    ) {
+      const v = child.toLowerCase();
+
+      if (v.includes('image')) {
+        state.image = true;
+        state.imageReferenceOccurrences++;
+      }
+
+      if (v.includes('file') || v.includes('attachment')) {
+        state.file = true;
+        state.fileReferenceOccurrences++;
+      }
+
+      if (v.includes('audio')) state.audio = true;
+      if (v.includes('video')) state.video = true;
+
+      if (looksLikeImageGenName(v)) {
+        state.generatedImageHint = true;
+      }
+    }
+
+    if (typeof child === 'string') {
+      const v = child;
+
+      if (looksLikeAssetKey(k)) {
+        state.assetIds.add(v);
+
+        if (k.includes('image')) {
+          state.imageAssetIds.add(v);
+        }
+
+        if (
+          k.includes('file') ||
+          k.includes('attachment') ||
+          k.includes('upload') ||
+          k === 'sandbox_path'
+        ) {
+          state.fileAssetIds.add(v);
+        }
+      }
+
+      if (
+        k === 'model' ||
+        k === 'model_id' ||
+        k === 'model_name' ||
+        k === 'model_slug' ||
+        k === 'default_model_slug' ||
+        k.endsWith('_model_slug') ||
+        k.endsWith('_model_id')
+      ) {
+        const m = cleanShortString(v, 160);
+        if (m) state.modelIds.add(m);
+      }
+
+      if (
+        k === 'tool_name' ||
+        k === 'function_name' ||
+        k === 'recipient'
+      ) {
+        const t = cleanShortString(v, 180);
+        if (t && !genericRecipient(t)) {
+          state.toolNameHints.add(t);
+        }
+      }
+
+      if (looksLikeImageGenName(v)) {
+        state.generatedImageHint = true;
+      }
+    }
+
+    if (child && typeof child === 'object') {
+      scanDeepSignals(child, depth + 1, state, k);
+    }
+  }
+
+  return state;
+}
+
+function messageDiagnostics(msg) {
+  const actual = msg?.message && typeof msg.message === 'object'
+    ? msg.message
+    : msg;
+
+  if (!actual || typeof actual !== 'object') {
+    return null;
+  }
+
+  const role = rawRoleFromMessage(actual);
+  const contentType = primaryContentType(actual);
+  const text = textFromMessage(actual);
+  const textChars = text.length;
+  const signals = scanDeepSignals(actual);
+
+  const recipient =
+    cleanShortString(
+      actual?.recipient ??
+      actual?.metadata?.recipient ??
+      actual?.content?.recipient,
+      180
+    );
+
+  const authorName =
+    cleanShortString(
+      actual?.author?.name ??
+      actual?.name,
+      180
+    );
+
+  const metadataToolName =
+    cleanShortString(
+      actual?.metadata?.tool_name ??
+      actual?.metadata?.function_name ??
+      actual?.metadata?.name ??
+      actual?.content?.name,
+      180
+    );
+
+  const nonGenericRecipient =
+    recipient && !genericRecipient(recipient)
+      ? recipient
+      : null;
+
+  /*
+    V2.9 incorrectly treated nearly every message as tool-like because many
+    ChatGPT messages carry a generic recipient field. V2.10.1 only treats
+    non-generic recipients and explicit tool/function/result shapes as tools.
+  */
+  const toolCall =
+    (
+      role === 'assistant' ||
+      role === 'developer'
+    ) &&
+    (
+      Boolean(nonGenericRecipient) ||
+      contentType.includes('tool_call') ||
+      contentType.includes('function_call') ||
+      contentType.includes('computer_initialize_state')
+    );
+
+  const explicitToolRole =
+    role === 'tool' ||
+    role === 'function';
+
+  const toolResult =
+    explicitToolRole ||
+    contentType.includes('execution_output') ||
+    contentType.includes('tool_result') ||
+    contentType.includes('function_result') ||
+    contentType.includes('computer_output');
+
+  const toolish =
+    toolCall ||
+    toolResult;
+
+  let toolName = null;
+
+  if (toolCall) {
+    toolName =
+      nonGenericRecipient ||
+      metadataToolName ||
+      [...signals.toolNameHints][0] ||
+      authorName ||
+      'unknown-tool';
+  } else if (toolResult) {
+    toolName =
+      authorName ||
+      metadataToolName ||
+      [...signals.toolNameHints][0] ||
+      nonGenericRecipient ||
+      'unknown-tool';
+  }
+
+  const imageGenCall =
+    toolCall &&
+    (
+      looksLikeImageGenName(toolName) ||
+      signals.generatedImageHint
+    );
+
+  const imageGenResult =
+    toolResult &&
+    (
+      looksLikeImageGenName(toolName) ||
+      signals.generatedImageHint
+    );
+
+  const generatedImageNode =
+    imageGenCall ||
+    imageGenResult ||
+    (
+      signals.generatedImageHint &&
+      signals.image
+    );
+
+  const uploadedImageNode =
+    role === 'user' &&
+    signals.image;
+
+  const knownInternalContentType =
+    (
+      contentType === 'thoughts' ||
+      contentType === 'reasoning_recap' ||
+      contentType === 'model_editable_context' ||
+      contentType === 'execution_output' ||
+      contentType === 'tool_result' ||
+      contentType === 'function_result'
+    );
+
+  const displayLike =
+    (
+      role === 'user' ||
+      role === 'assistant'
+    ) &&
+    !knownInternalContentType;
+
+  const contextLike =
+    role === 'system' ||
+    role === 'developer' ||
+    contentType.includes('context') ||
+    contentType.includes('summary') ||
+    contentType === 'model_editable_context';
+
+  const modelIds = [...signals.modelIds];
+  const gpt6Pro =
+    modelIds.some(x => {
+      const v = x.toLowerCase();
+      return (
+        (v.includes('gpt-6') || v.includes('gpt6')) &&
+        v.includes('pro')
+      );
+    });
+
+  return {
+    role,
+    contentType,
+    textChars,
+    hasText: textChars > 0,
+    displayLike,
+    toolCall,
+    toolResult,
+    explicitToolRole,
+    toolish,
+    toolName,
+    recipient: nonGenericRecipient,
+    imageGenCall,
+    imageGenResult,
+    generatedImageNode,
+    uploadedImageNode,
+    contextLike,
+    attachment: signals.attachment,
+    image: signals.image,
+    file: signals.file,
+    audio: signals.audio,
+    video: signals.video,
+    assetIds: [...signals.assetIds],
+    imageAssetIds: [...signals.imageAssetIds],
+    fileAssetIds: [...signals.fileAssetIds],
+    imageReferenceOccurrences: signals.imageReferenceOccurrences,
+    fileReferenceOccurrences: signals.fileReferenceOccurrences,
+    modelIds,
+    gpt6Pro
+  };
+}
+
+function getActiveBranch(mapping, currentNode) {
+  if (!mapping || typeof mapping !== 'object') return [];
+
+  if (currentNode && mapping[currentNode]) {
+    const reversed = [];
+    const seen = new Set();
+    let nodeId = currentNode;
+
+    while (
+      nodeId &&
+      mapping[nodeId] &&
+      !seen.has(nodeId)
+    ) {
+      seen.add(nodeId);
+      reversed.push(mapping[nodeId]);
+      nodeId = mapping[nodeId].parent;
+    }
+
+    reversed.reverse();
+    return reversed;
+  }
+
+  return Object.values(mapping)
+    .filter(Boolean)
+    .sort((a, b) => {
+      const at = Number(a?.message?.create_time || 0);
+      const bt = Number(b?.message?.create_time || 0);
+      return at - bt;
+    });
+}
+
+function largestRecord(current, bytes, d, extra = {}) {
+  if (!Number.isFinite(Number(bytes))) return current;
+
+  if (!current || Number(bytes) > Number(current.bytes || 0)) {
+    return {
+      bytes: Number(bytes),
+      role: d?.role ?? 'unknown',
+      contentType: d?.contentType ?? 'unknown',
+      toolName: d?.toolName ?? null,
+      ...extra
+    };
+  }
+
+  return current;
+}
+
+function analyzeNodes(nodes) {
+  const roleCounts = {};
+  const contentTypeCounts = {};
+  const toolCallNames = {};
+  const toolResultNames = {};
+  const recipientCounts = {};
+  const modelCounts = {};
+  const nodeBytesByRole = {};
+  const nodeBytesByContentType = {};
+
+  const uniqueAssetIds = new Set();
+  const uniqueImageAssetIds = new Set();
+  const uniqueFileAssetIds = new Set();
+  const uniqueGeneratedImageAssetIds = new Set();
+  const uniqueUploadedImageAssetIds = new Set();
+
+  let messageNodes = 0;
+  let emptyMessageNodes = 0;
+  let allTextChars = 0;
+
+  // Legacy role-based user/assistant text, retained for continuity.
+  let displayTextChars = 0;
+  let displayMessages = 0;
+
+  // Heuristic UI-display-like text excluding known internal assistant content.
+  let displayLikeTextChars = 0;
+  let displayLikeMessages = 0;
+
+  let hiddenMessageNodes = 0;
+  let hiddenTextChars = 0;
+
+  let explicitToolRoleNodes = 0;
+  let toolishNodes = 0;
+  let toolCallNodes = 0;
+  let toolResultNodes = 0;
+  let toolCallBytes = 0;
+  let toolResultBytes = 0;
+
+  let contextLikeNodes = 0;
+  let attachmentNodes = 0;
+  let imageNodes = 0;
+  let fileNodes = 0;
+  let audioNodes = 0;
+  let videoNodes = 0;
+
+  let imageGenCallNodes = 0;
+  let imageGenResultNodes = 0;
+  let generatedImageNodes = 0;
+  let uploadedImageNodes = 0;
+  let imageReferenceOccurrences = 0;
+  let fileReferenceOccurrences = 0;
+
+  let assetNodeBytes = 0;
+  let imageNodeBytes = 0;
+  let fileNodeBytes = 0;
+
+  let gpt6ProMessageNodes = 0;
+
+  let largestNode = null;
+  let largestToolResult = null;
+  let largestImageNode = null;
+
+  for (const node of nodes) {
+    const msg = node?.message;
+    if (!msg) continue;
+
+    messageNodes++;
+
+    const d = messageDiagnostics(msg);
+    if (!d) continue;
+
+    const nodeBytes = utf8BytesOfJSON(node) ?? 0;
+
+    countInto(roleCounts, d.role);
+    countInto(contentTypeCounts, d.contentType);
+    countInto(nodeBytesByRole, d.role, nodeBytes);
+    countInto(nodeBytesByContentType, d.contentType, nodeBytes);
+
+    allTextChars += d.textChars;
+
+    if (!d.hasText) {
+      emptyMessageNodes++;
+    }
+
+    if (d.role === 'user' || d.role === 'assistant') {
+      if (d.hasText) {
+        displayMessages++;
+        displayTextChars += d.textChars;
+      }
+    } else {
+      hiddenMessageNodes++;
+      hiddenTextChars += d.textChars;
+    }
+
+    if (d.displayLike && d.hasText) {
+      displayLikeMessages++;
+      displayLikeTextChars += d.textChars;
+    }
+
+    if (d.explicitToolRole) {
+      explicitToolRoleNodes++;
+    }
+
+    if (d.toolish) {
+      toolishNodes++;
+    }
+
+    if (d.toolCall) {
+      toolCallNodes++;
+      toolCallBytes += nodeBytes;
+      countInto(toolCallNames, d.toolName || 'unknown-tool');
+
+      if (d.recipient) {
+        countInto(recipientCounts, d.recipient);
+      }
+    }
+
+    if (d.toolResult) {
+      toolResultNodes++;
+      toolResultBytes += nodeBytes;
+      countInto(toolResultNames, d.toolName || 'unknown-tool');
+      largestToolResult = largestRecord(
+        largestToolResult,
+        nodeBytes,
+        d
+      );
+    }
+
+    if (d.contextLike) contextLikeNodes++;
+    if (d.attachment) attachmentNodes++;
+    if (d.image) imageNodes++;
+    if (d.file) fileNodes++;
+    if (d.audio) audioNodes++;
+    if (d.video) videoNodes++;
+
+    if (d.imageGenCall) imageGenCallNodes++;
+    if (d.imageGenResult) imageGenResultNodes++;
+    if (d.generatedImageNode) generatedImageNodes++;
+    if (d.uploadedImageNode) uploadedImageNodes++;
+
+    imageReferenceOccurrences += d.imageReferenceOccurrences || 0;
+    fileReferenceOccurrences += d.fileReferenceOccurrences || 0;
+
+    for (const x of d.assetIds) uniqueAssetIds.add(x);
+    for (const x of d.imageAssetIds) uniqueImageAssetIds.add(x);
+    for (const x of d.fileAssetIds) uniqueFileAssetIds.add(x);
+
+    if (d.generatedImageNode) {
+      for (const x of d.imageAssetIds) {
+        uniqueGeneratedImageAssetIds.add(x);
+      }
+    }
+
+    if (d.uploadedImageNode) {
+      for (const x of d.imageAssetIds) {
+        uniqueUploadedImageAssetIds.add(x);
+      }
+    }
+
+    if (d.attachment || d.image || d.file) {
+      assetNodeBytes += nodeBytes;
+    }
+
+    if (d.image) {
+      imageNodeBytes += nodeBytes;
+      largestImageNode = largestRecord(
+        largestImageNode,
+        nodeBytes,
+        d
+      );
+    }
+
+    if (d.file) {
+      fileNodeBytes += nodeBytes;
+    }
+
+    for (const modelId of d.modelIds) {
+      countInto(modelCounts, modelId);
+    }
+
+    if (d.gpt6Pro) {
+      gpt6ProMessageNodes++;
+    }
+
+    largestNode = largestRecord(
+      largestNode,
+      nodeBytes,
+      d
+    );
+  }
+
+  return {
+    messageNodes,
+    emptyMessageNodes,
+    allTextChars,
+
+    displayTextChars,
+    displayMessages,
+    displayLikeTextChars,
+    displayLikeMessages,
+
+    hiddenMessageNodes,
+    hiddenTextChars,
+
+    explicitToolRoleNodes,
+    toolishNodes,
+    toolCallNodes,
+    toolResultNodes,
+    toolCallBytes,
+    toolResultBytes,
+    toolCallNames,
+    toolResultNames,
+    recipientCounts,
+
+    contextLikeNodes,
+    attachmentNodes,
+    imageNodes,
+    fileNodes,
+    audioNodes,
+    videoNodes,
+
+    imageGenCallNodes,
+    imageGenResultNodes,
+    generatedImageNodes,
+    uploadedImageNodes,
+
+    uniqueAssetIds: uniqueAssetIds.size,
+    uniqueImageAssetIds: uniqueImageAssetIds.size,
+    uniqueFileAssetIds: uniqueFileAssetIds.size,
+    uniqueGeneratedImageAssetIds: uniqueGeneratedImageAssetIds.size,
+    uniqueUploadedImageAssetIds: uniqueUploadedImageAssetIds.size,
+    imageReferenceOccurrences,
+    fileReferenceOccurrences,
+
+    assetNodeBytes,
+    imageNodeBytes,
+    fileNodeBytes,
+
+    modelCounts,
+    gpt6ProMessageNodes,
+
+    roleCounts,
+    contentTypeCounts,
+    nodeBytesByRole,
+    nodeBytesByContentType,
+
+    largestNode,
+    largestToolResult,
+    largestImageNode
+  };
+}
+
+function subtreeSize(mapping, rootId, cache, visiting = null) {
+  if (!rootId || !mapping[rootId]) return 0;
+  if (cache.has(rootId)) return cache.get(rootId);
+  if (!visiting) visiting = new Set();
+  if (visiting.has(rootId)) return 0;
+
+  // Same ordered traversal/counts as recursion, without an ancestry depth limit.
+  const stack = [];
+  const enter = id => {
+    visiting.add(id);
+    const node = mapping[id];
+    stack.push({id,children:Array.isArray(node?.children) ? node.children : [],index:0,size:1});
+  };
+  enter(rootId);
+  while (stack.length) {
+    const frame = stack[stack.length-1];
+    if (frame.index < frame.children.length) {
+      const childId = frame.children[frame.index++];
+      if (!childId || !mapping[childId]) continue;
+      if (cache.has(childId)) frame.size += cache.get(childId);
+      else if (!visiting.has(childId)) enter(childId);
+      continue;
+    }
+    visiting.delete(frame.id);
+    cache.set(frame.id,frame.size);
+    stack.pop();
+    if (!stack.length) return frame.size;
+    stack[stack.length-1].size += frame.size;
+  }
+}
+
+function analyzeBranchPoints(mapping, activeNodes) {
+  const idByNode = new Map();
+
+  for (const [id, node] of Object.entries(mapping)) {
+    if (node && typeof node === 'object') {
+      idByNode.set(node, id);
+    }
+  }
+
+  const activeIds = activeNodes.map(node => {
+    return (
+      idByNode.get(node) ||
+      node?.id ||
+      null
+    );
+  });
+
+  const subtreeCache = new Map();
+  const details = [];
+
+  let alternateSubtreeNodesTotal = 0;
+  let alternateSubtreeNodesMax = 0;
+  let lastBranchPointDepth = null;
+
+  for (let depth = 0; depth < activeNodes.length; depth++) {
+    const node = activeNodes[depth];
+    const children = Array.isArray(node?.children) ? node.children : [];
+
+    if (children.length <= 1) continue;
+
+    const selectedChild = activeIds[depth + 1] || null;
+    const alternateChildren = children.filter(x => x !== selectedChild);
+
+    const alternateSizes = alternateChildren.map(childId => {
+      return subtreeSize(mapping, childId, subtreeCache);
+    });
+
+    const alternateTotal = alternateSizes.reduce((a, b) => a + b, 0);
+    const alternateMax = alternateSizes.length
+      ? Math.max(...alternateSizes)
+      : 0;
+
+    alternateSubtreeNodesTotal += alternateTotal;
+    alternateSubtreeNodesMax = Math.max(
+      alternateSubtreeNodesMax,
+      alternateMax
+    );
+
+    lastBranchPointDepth = depth;
+
+    details.push({
+      depth,
+      children: children.length,
+      alternateChildren: alternateChildren.length,
+      alternateSubtreeNodes: alternateTotal,
+      largestAlternateSubtreeNodes: alternateMax
+    });
+  }
+
+  return {
+    activeBranchPoints: details.length,
+    activeBranchPointDepths: details.map(x => x.depth),
+    lastBranchPointDepth,
+    nodesSinceLastBranchPoint:
+      lastBranchPointDepth == null
+        ? activeNodes.length
+        : Math.max(0, activeNodes.length - lastBranchPointDepth - 1),
+    alternateSubtreeNodesTotal,
+    alternateSubtreeNodesMax,
+    branchPointDetails: details
+  };
+}
+
+
+function litePrimaryModel(msg, diagnostics) {
+  const actual = msg?.message && typeof msg.message === 'object'
+    ? msg.message
+    : msg;
+
+  const candidates = [
+    actual?.metadata?.model_slug,
+    actual?.metadata?.model_id,
+    actual?.metadata?.model_name,
+    actual?.metadata?.default_model_slug,
+    actual?.model_slug,
+    actual?.model_id,
+    actual?.model_name,
+    ...(Array.isArray(diagnostics?.modelIds)
+      ? diagnostics.modelIds
+      : [])
+  ];
+
+  for (const value of candidates) {
+    const v = cleanShortString(value, 160);
+    if (v) return v;
+  }
+
+  return null;
+}
+
+function liteIsGpt6Pro(model) {
+  const v = String(model || '').toLowerCase();
+
+  return (
+    (v.includes('gpt-6') || v.includes('gpt6')) &&
+    v.includes('pro')
+  );
+}
+
+function liteStrongContextMarker(msg, diagnostics, text) {
+  const role = diagnostics?.role || 'unknown';
+  const type = diagnostics?.contentType || 'unknown';
+  const sample = String(text || '').slice(0, 5000).toLowerCase();
+
+  if (type === 'model_editable_context') return true;
+
+  if (
+    role === 'system' &&
+    (
+      sample.includes('user knowledge memories') ||
+      sample.includes('recent conversation content') ||
+      sample.includes('model set context') ||
+      sample.includes('conversation summary') ||
+      sample.includes('context summary')
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function liteNearestDistance(depth, depths) {
+  if (
+    !Number.isFinite(Number(depth)) ||
+    !Array.isArray(depths) ||
+    !depths.length
+  ) {
+    return null;
+  }
+
+  let best = Infinity;
+
+  for (const x of depths) {
+    const d = Math.abs(Number(depth) - Number(x));
+    if (d < best) best = d;
+  }
+
+  return Number.isFinite(best) ? best : null;
+}
+
+function liteDepthList(depths, limit = 120) {
+  if (!Array.isArray(depths)) return [];
+  return depths.length <= limit ? depths : depths.slice(-limit);
+}
+
+function liteWindowSummary(timeline, branchDepths, size) {
+  const total = timeline.length;
+  const startDepth = Math.max(0, total - size);
+  const slice = timeline.filter(x => x.depth >= startDepth);
+
+  const models = {};
+  let bytes = 0;
+  let displayChars = 0;
+  let allChars = 0;
+  let toolCalls = 0;
+  let toolResults = 0;
+  let imageEvents = 0;
+  let generatedImages = 0;
+  let gpt6ProNodes = 0;
+  let contextMarkers = 0;
+  let recapMarkers = 0;
+
+  for (const item of slice) {
+    bytes += item.nodeBytes || 0;
+    allChars += item.textChars || 0;
+
+    if (item.displayLike) {
+      displayChars += item.textChars || 0;
+    }
+
+    if (item.toolCall) toolCalls++;
+    if (item.toolResult) toolResults++;
+    if (item.imageGenEvent) imageEvents++;
+    if (item.generatedImageNode) generatedImages++;
+    if (item.gpt6Pro) gpt6ProNodes++;
+    if (item.strongContextMarker) contextMarkers++;
+    if (item.recapMarker) recapMarkers++;
+
+    if (item.model) {
+      countInto(models, item.model);
+    }
+  }
+
+  return {
+    size,
+    actualNodes: slice.length,
+    startDepth,
+    endDepth: total ? total - 1 : null,
+    serializedBytes: bytes,
+    displayLikeTextTokens: tokenEstimateForChars(displayChars),
+    allTextTokens: tokenEstimateForChars(allChars),
+    toolCalls,
+    toolResults,
+    imageGenEvents: imageEvents,
+    generatedImageNodes: generatedImages,
+    gpt6ProNodes,
+    strongContextMarkers: contextMarkers,
+    recapMarkers,
+    branchPoints: Array.isArray(branchDepths)
+      ? branchDepths.filter(x => x >= startDepth).length
+      : 0,
+    modelCounts: models
+  };
+}
+
+function liteInferImagePairs(timeline) {
+  const calls = timeline.filter(x => x.toolCall);
+  const results = timeline.filter(
+    x => x.imageGenResult || x.generatedImageNode
+  );
+
+  const used = new Set();
+  const pairs = [];
+  const names = {};
+
+  for (const result of results) {
+    let best = null;
+
+    for (let i = calls.length - 1; i >= 0; i--) {
+      const call = calls[i];
+
+      if (call.depth >= result.depth) continue;
+
+      const distance = result.depth - call.depth;
+
+      if (distance > 24) break;
+      if (used.has(call.depth)) continue;
+
+      best = {
+        callDepth: call.depth,
+        resultDepth: result.depth,
+        distance,
+        toolName: call.toolName || 'unknown-tool'
+      };
+
+      break;
+    }
+
+    if (best) {
+      used.add(best.callDepth);
+      pairs.push(best);
+      countInto(names, best.toolName);
+    }
+  }
+
+  const distances = pairs.map(x => x.distance);
+
+  return {
+    pairCount: pairs.length,
+    unpairedResults: Math.max(0, results.length - pairs.length),
+    inferredCallNames: names,
+    pairDistanceMin: distances.length ? Math.min(...distances) : null,
+    pairDistanceMax: distances.length ? Math.max(...distances) : null,
+    pairDistanceAverage: distances.length
+      ? distances.reduce((a, b) => a + b, 0) / distances.length
+      : null,
+    pairs: pairs.slice(-100)
+  };
+}
+
+function analyzeContextHistoryLite(
+  activeNodes,
+  branchDepths = [],
+  mapping = null
+) {
+  /*
+    V2.12 remains one-pass/fault-tolerant for active ancestry, but retains
+    enough per-depth metadata to profile "special" state by region.
+  */
+  const timeline = [];
+  const gpt6Depths = [];
+  const imageDepths = [];
+  const generatedDepths = [];
+  const contextDepths = [];
+  const recapDepths = [];
+
+  const modelSegments = [];
+  let currentSegment = null;
+  let latestModel = null;
+
+  for (let depth = 0; depth < activeNodes.length; depth++) {
+    const node = activeNodes[depth];
+    const msg = node?.message;
+    const nodeBytes = utf8BytesOfJSON(node) || 0;
+
+    if (!msg) {
+      timeline.push({
+        depth,
+        nodeBytes,
+        textChars: 0,
+        assetIds: []
+      });
+      continue;
+    }
+
+    const d = messageDiagnostics(msg);
+
+    if (!d) {
+      timeline.push({
+        depth,
+        nodeBytes,
+        textChars: 0,
+        assetIds: []
+      });
+      continue;
+    }
+
+    const text = textFromMessage(msg);
+    const model = litePrimaryModel(msg, d);
+    const gpt6Pro = Boolean(
+      d.gpt6Pro ||
+      liteIsGpt6Pro(model)
+    );
+
+    const strongContextMarker =
+      liteStrongContextMarker(
+        msg,
+        d,
+        text
+      );
+
+    const recapMarker =
+      d.contentType === 'reasoning_recap';
+
+    const imageGenEvent =
+      Boolean(
+        d.imageGenCall ||
+        d.imageGenResult
+      );
+
+    /*
+      "Special node bytes" is deliberately deduplicated per node.
+      A node counts once if it is a tool result, image-like/generated-image,
+      or GPT-6 Pro-labeled. This is a comparison proxy, not a product limit.
+    */
+    const specialNode =
+      Boolean(
+        d.toolResult ||
+        d.image ||
+        d.generatedImageNode ||
+        gpt6Pro
+      );
+
+    const item = {
+      depth,
+      role: d.role,
+      contentType: d.contentType,
+      model,
+      gpt6Pro,
+      textChars: d.textChars || 0,
+      displayLike: Boolean(d.displayLike),
+
+      toolCall: Boolean(d.toolCall),
+      toolResult: Boolean(d.toolResult),
+      toolName: d.toolName || null,
+
+      imageLike: Boolean(d.image),
+      imageGenCall: Boolean(d.imageGenCall),
+      imageGenResult: Boolean(d.imageGenResult),
+      imageGenEvent,
+      generatedImageNode: Boolean(d.generatedImageNode),
+
+      assetIds: Array.isArray(d.assetIds)
+        ? d.assetIds
+        : [],
+
+      strongContextMarker,
+      recapMarker,
+
+      nodeBytes,
+
+      specialNode,
+      specialNodeBytes:
+        specialNode ? nodeBytes : 0,
+
+      toolCallBytes:
+        d.toolCall ? nodeBytes : 0,
+
+      toolResultBytes:
+        d.toolResult ? nodeBytes : 0,
+
+      imageLikeBytes:
+        d.image ? nodeBytes : 0,
+
+      imageGenResultBytes:
+        d.imageGenResult ? nodeBytes : 0,
+
+      gpt6ProBytes:
+        gpt6Pro ? nodeBytes : 0
+    };
+
+    timeline.push(item);
+
+    if (model) {
+      latestModel = model;
+
+      if (
+        !currentSegment ||
+        currentSegment.model !== model
+      ) {
+        if (currentSegment) {
+          modelSegments.push(currentSegment);
+        }
+
+        currentSegment = {
+          model,
+          startDepth: depth,
+          endDepth: depth,
+          labeledNodes: 1
+        };
+      } else {
+        currentSegment.endDepth = depth;
+        currentSegment.labeledNodes++;
+      }
+    }
+
+    if (gpt6Pro) gpt6Depths.push(depth);
+    if (imageGenEvent) imageDepths.push(depth);
+    if (d.generatedImageNode) generatedDepths.push(depth);
+    if (strongContextMarker) contextDepths.push(depth);
+    if (recapMarker) recapDepths.push(depth);
+  }
+
+  if (currentSegment) {
+    modelSegments.push(currentSegment);
+  }
+
+  for (const segment of modelSegments) {
+    segment.spanNodes =
+      Math.max(
+        1,
+        segment.endDepth -
+        segment.startDepth +
+        1
+      );
+  }
+
+  const gpt6Segments =
+    modelSegments.filter(
+      x => liteIsGpt6Pro(x.model)
+    );
+
+  const longestGpt6 =
+    gpt6Segments.length
+      ? [...gpt6Segments].sort(
+          (a, b) =>
+            (b.labeledNodes - a.labeledNodes) ||
+            (b.spanNodes - a.spanNodes)
+        )[0]
+      : null;
+
+  const latestGpt6 =
+    gpt6Segments.length
+      ? gpt6Segments[gpt6Segments.length - 1]
+      : null;
+
+  const currentDepth =
+    activeNodes.length
+      ? activeNodes.length - 1
+      : null;
+
+  const lastGpt6Depth =
+    gpt6Depths.length
+      ? gpt6Depths[gpt6Depths.length - 1]
+      : null;
+
+  const lastImageDepth =
+    imageDepths.length
+      ? imageDepths[imageDepths.length - 1]
+      : null;
+
+  const lastContextDepth =
+    contextDepths.length
+      ? contextDepths[contextDepths.length - 1]
+      : null;
+
+  const lastRecapDepth =
+    recapDepths.length
+      ? recapDepths[recapDepths.length - 1]
+      : null;
+
+  const recentWindows =
+    [64, 128, 256, 512].map(
+      size =>
+        liteWindowSummary(
+          timeline,
+          branchDepths,
+          size
+        )
+    );
+
+  let sinceLastContext = null;
+
+  if (lastContextDepth != null) {
+    const slice =
+      timeline.filter(
+        x => x.depth > lastContextDepth
+      );
+
+    const modelCounts = {};
+    let bytes = 0;
+    let displayChars = 0;
+    let allChars = 0;
+    let toolCalls = 0;
+    let toolResults = 0;
+    let imageGenResults = 0;
+    let generatedImageNodes = 0;
+    let gpt6ProNodes = 0;
+
+    for (const item of slice) {
+      bytes += item.nodeBytes || 0;
+      allChars += item.textChars || 0;
+
+      if (item.displayLike) {
+        displayChars += item.textChars || 0;
+      }
+
+      if (item.toolCall) toolCalls++;
+      if (item.toolResult) toolResults++;
+      if (item.imageGenResult) imageGenResults++;
+      if (item.generatedImageNode) generatedImageNodes++;
+      if (item.gpt6Pro) gpt6ProNodes++;
+
+      if (item.model) {
+        countInto(
+          modelCounts,
+          item.model
+        );
+      }
+    }
+
+    sinceLastContext = {
+      startDepth:
+        lastContextDepth + 1,
+      nodes: slice.length,
+      serializedBytes: bytes,
+      displayLikeTextTokens:
+        tokenEstimateForChars(
+          displayChars
+        ),
+      allTextTokens:
+        tokenEstimateForChars(
+          allChars
+        ),
+      toolCalls,
+      toolResults,
+      imageGenResults,
+      generatedImageNodes,
+      gpt6ProNodes,
+      modelCounts
+    };
+  }
+
+  const pairing =
+    liteInferImagePairs(
+      timeline
+    );
+
+  let retainedState = null;
+
+  if (mapping) {
+    retainedState =
+      v212AnalyzeRetainedState(
+        mapping,
+        activeNodes,
+        timeline,
+        branchDepths,
+        modelSegments,
+        lastImageDepth
+      );
+  }
+
+  return {
+    ok: true,
+    currentDepth,
+    currentModel: latestModel,
+
+    modelSegments:
+      modelSegments.slice(-100),
+    modelSegmentCount:
+      modelSegments.length,
+
+    gpt6ProSegmentCount:
+      gpt6Segments.length,
+    longestGpt6ProSegment:
+      longestGpt6,
+    latestGpt6ProSegment:
+      latestGpt6,
+
+    gpt6ProDepthCount:
+      gpt6Depths.length,
+    gpt6ProDepths:
+      liteDepthList(gpt6Depths),
+    firstGpt6ProDepth:
+      gpt6Depths.length
+        ? gpt6Depths[0]
+        : null,
+    lastGpt6ProDepth:
+      lastGpt6Depth,
+    nodesSinceLastGpt6Pro:
+      currentDepth != null &&
+      lastGpt6Depth != null
+        ? currentDepth - lastGpt6Depth
+        : null,
+
+    imageGenDepthCount:
+      imageDepths.length,
+    imageGenDepths:
+      liteDepthList(imageDepths),
+    generatedImageDepthCount:
+      generatedDepths.length,
+    generatedImageDepths:
+      liteDepthList(generatedDepths),
+    lastImageGenDepth:
+      lastImageDepth,
+    nodesSinceLastImageGen:
+      currentDepth != null &&
+      lastImageDepth != null
+        ? currentDepth - lastImageDepth
+        : null,
+
+    strongContextMarkerCount:
+      contextDepths.length,
+    strongContextMarkerDepths:
+      liteDepthList(contextDepths),
+    lastStrongContextMarkerDepth:
+      lastContextDepth,
+    nodesSinceLastStrongContextMarker:
+      currentDepth != null &&
+      lastContextDepth != null
+        ? currentDepth - lastContextDepth
+        : null,
+
+    recapMarkerCount:
+      recapDepths.length,
+    recapDepths:
+      liteDepthList(recapDepths),
+    lastRecapDepth,
+    nodesSinceLastRecap:
+      currentDepth != null &&
+      lastRecapDepth != null
+        ? currentDepth - lastRecapDepth
+        : null,
+
+    branchPointsAfterLastImageGen:
+      lastImageDepth == null
+        ? null
+        : branchDepths.filter(
+            x => x > lastImageDepth
+          ).length,
+
+    branchPointsAfterLastGpt6Pro:
+      lastGpt6Depth == null
+        ? null
+        : branchDepths.filter(
+            x => x > lastGpt6Depth
+          ).length,
+
+    branchPointsNearImageGen32:
+      imageDepths.length
+        ? branchDepths.filter(
+            b =>
+              imageDepths.some(
+                d => Math.abs(b - d) <= 32
+              )
+          ).length
+        : 0,
+
+    branchPointsNearGpt6Pro32:
+      gpt6Depths.length
+        ? branchDepths.filter(
+            b =>
+              gpt6Depths.some(
+                d => Math.abs(b - d) <= 32
+              )
+          ).length
+        : 0,
+
+    nearestBranchDistanceToLastImageGen:
+      liteNearestDistance(
+        lastImageDepth,
+        branchDepths
+      ),
+
+    nearestBranchDistanceToLastGpt6Pro:
+      liteNearestDistance(
+        lastGpt6Depth,
+        branchDepths
+      ),
+
+    imageGenPairCount:
+      pairing.pairCount,
+    imageGenUnpairedResults:
+      pairing.unpairedResults,
+    imageGenInferredCallNames:
+      pairing.inferredCallNames,
+    imageGenPairDistanceMin:
+      pairing.pairDistanceMin,
+    imageGenPairDistanceMax:
+      pairing.pairDistanceMax,
+    imageGenPairDistanceAverage:
+      pairing.pairDistanceAverage,
+
+    recentWindows,
+    sinceLastContext,
+
+    retainedState
+  };
+}
+
+function compactDepthsV2114(depths, limit = 36) {
+  if (!Array.isArray(depths) || !depths.length) return '—';
+
+  if (depths.length <= limit) {
+    return depths.join(', ');
+  }
+
+  return `… ${depths.slice(-limit).join(', ')}`;
+}
+
+function segmentTextV2114(segment) {
+  if (!segment) return '—';
+
+  return (
+    `${segment.model || 'unknown'} ` +
+    `d${segment.startDepth}→${segment.endDepth} ` +
+    `(${segment.labeledNodes || 0} labeled)`
+  );
+}
+
+function modelSegmentsTextV2114(segments, limit = 14) {
+  if (!Array.isArray(segments) || !segments.length) return '—';
+
+  const shown = segments.slice(-limit).map(segmentTextV2114);
+
+  if (segments.length > limit) {
+    shown.unshift(`+${segments.length - limit} earlier`);
+  }
+
+  return shown.join(' | ');
+}
+
+function recentWindowsTextV2114(windows) {
+  if (!Array.isArray(windows) || !windows.length) return '—';
+
+  return windows.map(w => (
+    `last${w.size}: ` +
+    `${fmt(w.serializedBytes || 0)}B, ` +
+    `${fmt(w.displayLikeTextTokens || 0)} disp, ` +
+    `${fmt(w.allTextTokens || 0)} all, ` +
+    `tools ${w.toolCalls || 0}/${w.toolResults || 0}, ` +
+    `img ${w.imageGenEvents || 0}, ` +
+    `pro ${w.gpt6ProNodes || 0}, ` +
+    `ctx ${w.strongContextMarkers || 0}, ` +
+    `branches ${w.branchPoints || 0}`
+  )).join(' || ');
+}
+
+
+function v212Percent(part, whole) {
+  const p = Number(part);
+  const w = Number(whole);
+
+  if (!Number.isFinite(p) || !Number.isFinite(w) || w <= 0) {
+    return null;
+  }
+
+  return (p / w) * 100;
+}
+
+function v212SummarizeTimelineSlice(slice, branchDepths = []) {
+  let serializedBytes = 0;
+  let specialNodeBytes = 0;
+  let toolCallBytes = 0;
+  let toolResultBytes = 0;
+  let imageLikeBytes = 0;
+  let imageGenResultBytes = 0;
+  let gpt6ProBytes = 0;
+
+  let toolCalls = 0;
+  let toolResults = 0;
+  let imageGenEvents = 0;
+  let imageGenResults = 0;
+  let generatedImages = 0;
+  let gpt6ProNodes = 0;
+
+  const assetIds = new Set();
+
+  for (const item of slice) {
+    serializedBytes += item.nodeBytes || 0;
+    specialNodeBytes += item.specialNodeBytes || 0;
+    toolCallBytes += item.toolCallBytes || 0;
+    toolResultBytes += item.toolResultBytes || 0;
+    imageLikeBytes += item.imageLikeBytes || 0;
+    imageGenResultBytes += item.imageGenResultBytes || 0;
+    gpt6ProBytes += item.gpt6ProBytes || 0;
+
+    if (item.toolCall) toolCalls++;
+    if (item.toolResult) toolResults++;
+    if (item.imageGenEvent) imageGenEvents++;
+    if (item.imageGenResult) imageGenResults++;
+    if (item.generatedImageNode) generatedImages++;
+    if (item.gpt6Pro) gpt6ProNodes++;
+
+    for (const id of item.assetIds || []) {
+      assetIds.add(id);
+    }
+  }
+
+  const startDepth = slice.length ? slice[0].depth : null;
+  const endDepth = slice.length ? slice[slice.length - 1].depth : null;
+
+  return {
+    startDepth,
+    endDepth,
+    nodes: slice.length,
+    serializedBytes,
+    specialNodeBytes,
+    specialSharePercent: v212Percent(specialNodeBytes, serializedBytes),
+    toolCallBytes,
+    toolResultBytes,
+    imageLikeBytes,
+    imageGenResultBytes,
+    gpt6ProBytes,
+    toolCalls,
+    toolResults,
+    imageGenEvents,
+    imageGenResults,
+    generatedImages,
+    gpt6ProNodes,
+    uniqueAssetIds: assetIds.size,
+    branchPoints:
+      startDepth == null || endDepth == null
+        ? 0
+        : branchDepths.filter(
+            x => x >= startDepth && x <= endDepth
+          ).length
+  };
+}
+
+function v212BuildDepthBuckets(timeline, branchDepths = [], bucketSize = 100) {
+  if (!Array.isArray(timeline) || !timeline.length) return [];
+
+  const buckets = [];
+
+  for (let start = 0; start < timeline.length; start += bucketSize) {
+    const end = Math.min(timeline.length, start + bucketSize);
+    const slice = timeline.slice(start, end);
+    const summary = v212SummarizeTimelineSlice(slice, branchDepths);
+
+    summary.bucketIndex = Math.floor(start / bucketSize);
+    summary.bucketSize = bucketSize;
+
+    buckets.push(summary);
+  }
+
+  return buckets;
+}
+
+function v212HottestWindow(timeline, branchDepths = [], windowSize = 256) {
+  if (!Array.isArray(timeline) || !timeline.length) return null;
+
+  const n = timeline.length;
+  const size = Math.min(windowSize, n);
+
+  const prefixSpecial = new Array(n + 1).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    prefixSpecial[i + 1] =
+      prefixSpecial[i] +
+      Number(timeline[i].specialNodeBytes || 0);
+  }
+
+  let bestStart = 0;
+  let bestSpecial = -1;
+
+  for (let start = 0; start + size <= n; start++) {
+    const value =
+      prefixSpecial[start + size] -
+      prefixSpecial[start];
+
+    if (value > bestSpecial) {
+      bestSpecial = value;
+      bestStart = start;
+    }
+  }
+
+  const slice = timeline.slice(bestStart, bestStart + size);
+  const summary = v212SummarizeTimelineSlice(slice, branchDepths);
+
+  summary.windowSize = size;
+
+  return summary;
+}
+
+function v212SubtreeSerializedStats(mapping, rootId, cache, visiting = null) {
+  if (!rootId || !mapping?.[rootId]) return {nodes:0,bytes:0};
+  if (cache.has(rootId)) return cache.get(rootId);
+  if (!visiting) visiting = new Set();
+  if (visiting.has(rootId)) return {nodes:0,bytes:0};
+
+  // Explicit DFS frames preserve recursive child order, cache and cycle semantics.
+  const stack = [];
+  const enter = id => {
+    visiting.add(id);
+    const node = mapping[id];
+    stack.push({id,children:Array.isArray(node?.children) ? node.children : [],
+      index:0,nodes:1,bytes:utf8BytesOfJSON(node) || 0});
+  };
+  enter(rootId);
+  while (stack.length) {
+    const frame = stack[stack.length-1];
+    if (frame.index < frame.children.length) {
+      const childId = frame.children[frame.index++];
+      if (!childId || !mapping?.[childId]) continue;
+      if (cache.has(childId)) {
+        const child = cache.get(childId);
+        frame.nodes += child.nodes; frame.bytes += child.bytes;
+      } else if (!visiting.has(childId)) enter(childId);
+      continue;
+    }
+    visiting.delete(frame.id);
+    const result = {nodes:frame.nodes,bytes:frame.bytes};
+    cache.set(frame.id,result);
+    stack.pop();
+    if (!stack.length) return result;
+    const parent = stack[stack.length-1];
+    parent.nodes += result.nodes; parent.bytes += result.bytes;
+  }
+}
+
+function v212AnalyzeBranchRetention(
+  mapping,
+  activeNodes,
+  timeline,
+  branchDepths = []
+) {
+  if (!mapping || typeof mapping !== 'object') {
+    return {
+      details: [],
+      alternateSubtreeBytesTotal: 0,
+      alternateSubtreeBytesMax: 0
+    };
+  }
+
+  const idByNode = new Map();
+
+  for (const [id, node] of Object.entries(mapping)) {
+    if (node && typeof node === 'object') {
+      idByNode.set(node, id);
+    }
+  }
+
+  const activeIds = activeNodes.map(node => {
+    return idByNode.get(node) || node?.id || null;
+  });
+
+  const subtreeCache = new Map();
+  const details = [];
+
+  let alternateSubtreeBytesTotal = 0;
+  let alternateSubtreeBytesMax = 0;
+
+  for (const depth of branchDepths) {
+    const node = activeNodes[depth];
+    if (!node) continue;
+
+    const children = Array.isArray(node.children) ? node.children : [];
+    if (children.length <= 1) continue;
+
+    const selectedChild = activeIds[depth + 1] || null;
+    const alternateChildren = children.filter(x => x !== selectedChild);
+
+    const activeStats = selectedChild
+      ? v212SubtreeSerializedStats(
+          mapping,
+          selectedChild,
+          subtreeCache
+        )
+      : {
+          nodes: 0,
+          bytes: 0
+        };
+
+    let alternateNodes = 0;
+    let alternateBytes = 0;
+    let largestAlternateBytes = 0;
+
+    for (const childId of alternateChildren) {
+      const stats = v212SubtreeSerializedStats(
+        mapping,
+        childId,
+        subtreeCache
+      );
+
+      alternateNodes += stats.nodes;
+      alternateBytes += stats.bytes;
+      largestAlternateBytes = Math.max(
+        largestAlternateBytes,
+        stats.bytes
+      );
+    }
+
+    alternateSubtreeBytesTotal += alternateBytes;
+    alternateSubtreeBytesMax = Math.max(
+      alternateSubtreeBytesMax,
+      largestAlternateBytes
+    );
+
+    const neighborhoods = {};
+
+    for (const radius of [16, 32, 64]) {
+      const start = Math.max(0, depth - radius);
+      const end = Math.min(timeline.length, depth + radius + 1);
+
+      neighborhoods[`r${radius}`] =
+        v212SummarizeTimelineSlice(
+          timeline.slice(start, end),
+          branchDepths
+        );
+    }
+
+    details.push({
+      depth,
+      children: children.length,
+      alternateChildren: alternateChildren.length,
+      activeSubtreeNodes: activeStats.nodes,
+      activeSubtreeBytes: activeStats.bytes,
+      alternateSubtreeNodes: alternateNodes,
+      alternateSubtreeBytes: alternateBytes,
+      largestAlternateSubtreeBytes: largestAlternateBytes,
+      neighborhoods
+    });
+  }
+
+  return {
+    details,
+    alternateSubtreeBytesTotal,
+    alternateSubtreeBytesMax
+  };
+}
+
+function v212AnalyzeAssetPersistence(timeline, lastImageDepth) {
+  const assets = new Map();
+  const imageGenAssociated = new Set();
+
+  for (const item of timeline) {
+    const ids = Array.isArray(item.assetIds)
+      ? item.assetIds
+      : [];
+
+    for (const id of ids) {
+      if (!id) continue;
+
+      let rec = assets.get(id);
+
+      if (!rec) {
+        rec = {
+          firstDepth: item.depth,
+          lastDepth: item.depth,
+          references: 0,
+          firstSeenInImageGen: false,
+          seenInImageGen: false
+        };
+
+        assets.set(id, rec);
+      }
+
+      rec.lastDepth = item.depth;
+      rec.references++;
+
+      if (
+        item.imageGenResult ||
+        item.generatedImageNode
+      ) {
+        rec.seenInImageGen = true;
+
+        if (rec.firstDepth === item.depth) {
+          rec.firstSeenInImageGen = true;
+        }
+
+        imageGenAssociated.add(id);
+      }
+    }
+  }
+
+  let assetsExistingByLastImage = 0;
+  let assetsReferencedAfterLastImage = 0;
+  let imageGenAssetsReferencedAfterLastImage = 0;
+  let persistentAssetReferenceNodesAfterLastImage = 0;
+
+  if (lastImageDepth != null) {
+    for (const rec of assets.values()) {
+      if (rec.firstDepth <= lastImageDepth) {
+        assetsExistingByLastImage++;
+
+        if (rec.lastDepth > lastImageDepth) {
+          assetsReferencedAfterLastImage++;
+        }
+      }
+    }
+
+    for (const id of imageGenAssociated) {
+      const rec = assets.get(id);
+
+      if (
+        rec &&
+        rec.lastDepth > lastImageDepth
+      ) {
+        imageGenAssetsReferencedAfterLastImage++;
+      }
+    }
+
+    for (const item of timeline) {
+      if (item.depth <= lastImageDepth) continue;
+
+      const ids = Array.isArray(item.assetIds)
+        ? item.assetIds
+        : [];
+
+      if (
+        ids.some(id => {
+          const rec = assets.get(id);
+          return rec && rec.firstDepth <= lastImageDepth;
+        })
+      ) {
+        persistentAssetReferenceNodesAfterLastImage++;
+      }
+    }
+  }
+
+  return {
+    uniqueAssetsObserved: assets.size,
+    imageGenAssociatedAssetIds: imageGenAssociated.size,
+    assetsExistingByLastImage,
+    assetsReferencedAfterLastImage,
+    imageGenAssetsReferencedAfterLastImage,
+    persistentAssetReferenceNodesAfterLastImage
+  };
+}
+
+function v212AnalyzeProSegments(
+  modelSegments,
+  timeline,
+  branchDepths = []
+) {
+  if (!Array.isArray(modelSegments)) return [];
+
+  const output = [];
+
+  for (const segment of modelSegments) {
+    if (!liteIsGpt6Pro(segment.model)) continue;
+
+    const slice = timeline.filter(
+      x =>
+        x.depth >= segment.startDepth &&
+        x.depth <= segment.endDepth
+    );
+
+    const summary =
+      v212SummarizeTimelineSlice(
+        slice,
+        branchDepths
+      );
+
+    output.push({
+      ...segment,
+      serializedBytes: summary.serializedBytes,
+      specialNodeBytes: summary.specialNodeBytes,
+      toolCallBytes: summary.toolCallBytes,
+      toolResultBytes: summary.toolResultBytes,
+      imageLikeBytes: summary.imageLikeBytes,
+      imageGenResultBytes: summary.imageGenResultBytes,
+      imageGenEvents: summary.imageGenEvents,
+      imageGenResults: summary.imageGenResults,
+      generatedImages: summary.generatedImages,
+      branchPoints: summary.branchPoints
+    });
+  }
+
+  return output;
+}
+
+function v212TopImageGenResults(timeline, limit = 12) {
+  const rows = timeline
+    .filter(x => x.imageGenResult)
+    .map(x => ({
+      depth: x.depth,
+      bytes: x.nodeBytes || 0,
+      toolName: x.toolName || null,
+      contentType: x.contentType || null,
+      model: x.model || null
+    }))
+    .sort((a, b) => b.bytes - a.bytes);
+
+  const totalBytes = rows.reduce(
+    (sum, x) => sum + x.bytes,
+    0
+  );
+
+  return {
+    count: rows.length,
+    totalBytes,
+    averageBytes: rows.length
+      ? totalBytes / rows.length
+      : null,
+    largestBytes: rows.length
+      ? rows[0].bytes
+      : null,
+    top: rows.slice(0, limit)
+  };
+}
+
+function v212AnalyzeRetainedState(
+  mapping,
+  activeNodes,
+  timeline,
+  branchDepths,
+  modelSegments,
+  lastImageDepth
+) {
+  const depthBuckets100 =
+    v212BuildDepthBuckets(
+      timeline,
+      branchDepths,
+      100
+    );
+
+  const hottestBuckets =
+    [...depthBuckets100]
+      .sort(
+        (a, b) =>
+          (b.specialNodeBytes - a.specialNodeBytes) ||
+          (b.serializedBytes - a.serializedBytes)
+      )
+      .slice(0, 10);
+
+  const hotWindows = {
+    w128: v212HottestWindow(
+      timeline,
+      branchDepths,
+      128
+    ),
+    w256: v212HottestWindow(
+      timeline,
+      branchDepths,
+      256
+    ),
+    w512: v212HottestWindow(
+      timeline,
+      branchDepths,
+      512
+    )
+  };
+
+  const branchRetention =
+    v212AnalyzeBranchRetention(
+      mapping,
+      activeNodes,
+      timeline,
+      branchDepths
+    );
+
+  const assetPersistence =
+    v212AnalyzeAssetPersistence(
+      timeline,
+      lastImageDepth
+    );
+
+  const proSegments =
+    v212AnalyzeProSegments(
+      modelSegments,
+      timeline,
+      branchDepths
+    );
+
+  const imageGenResults =
+    v212TopImageGenResults(
+      timeline,
+      12
+    );
+
+  const activeSerializedBytes =
+    timeline.reduce(
+      (sum, x) =>
+        sum + (x.nodeBytes || 0),
+      0
+    );
+
+  const activeSpecialNodeBytes =
+    timeline.reduce(
+      (sum, x) =>
+        sum + (x.specialNodeBytes || 0),
+      0
+    );
+
+  const activeToolResultBytes =
+    timeline.reduce(
+      (sum, x) =>
+        sum + (x.toolResultBytes || 0),
+      0
+    );
+
+  const activeImageLikeBytes =
+    timeline.reduce(
+      (sum, x) =>
+        sum + (x.imageLikeBytes || 0),
+      0
+    );
+
+  const activeGpt6ProBytes =
+    timeline.reduce(
+      (sum, x) =>
+        sum + (x.gpt6ProBytes || 0),
+      0
+    );
+
+  const retainedStateProxyBytes =
+    activeSpecialNodeBytes +
+    branchRetention.alternateSubtreeBytesTotal;
+
+  return {
+    ok: true,
+
+    activeSerializedBytes,
+    activeSpecialNodeBytes,
+    activeSpecialSharePercent:
+      v212Percent(
+        activeSpecialNodeBytes,
+        activeSerializedBytes
+      ),
+
+    activeToolResultBytes,
+    activeImageLikeBytes,
+    activeGpt6ProBytes,
+
+    retainedStateProxyBytes,
+    retainedStateProxySharePercent:
+      v212Percent(
+        retainedStateProxyBytes,
+        activeSerializedBytes
+      ),
+
+    depthBuckets100,
+    hottestBuckets,
+    hotWindows,
+
+    branchRetention,
+    assetPersistence,
+    proSegments,
+    imageGenResults
+  };
+}
+
+function v212BucketText(buckets, limit = 8) {
+  if (!Array.isArray(buckets) || !buckets.length) {
+    return '—';
+  }
+
+  return buckets
+    .slice(0, limit)
+    .map(x => (
+      `d${x.startDepth}-${x.endDepth}: ` +
+      `${fmt(x.specialNodeBytes || 0)}B special / ` +
+      `${fmt(x.serializedBytes || 0)}B total · ` +
+      `tools ${x.toolCalls || 0}/${x.toolResults || 0} · ` +
+      `img ${x.imageGenResults || 0} · ` +
+      `pro ${x.gpt6ProNodes || 0} · ` +
+      `br ${x.branchPoints || 0}`
+    ))
+    .join(' || ');
+}
+
+function v212HotWindowText(window) {
+  if (!window) return '—';
+
+  return (
+    `d${window.startDepth}-${window.endDepth} · ` +
+    `${fmt(window.specialNodeBytes || 0)}B special / ` +
+    `${fmt(window.serializedBytes || 0)}B total ` +
+    `(${window.specialSharePercent != null
+      ? window.specialSharePercent.toFixed(1) + '%'
+      : '—'}) · ` +
+    `toolres ${fmt(window.toolResultBytes || 0)}B · ` +
+    `image ${fmt(window.imageLikeBytes || 0)}B · ` +
+    `img-gen ${fmt(window.imageGenResultBytes || 0)}B · ` +
+    `pro ${fmt(window.gpt6ProBytes || 0)}B · ` +
+    `branches ${window.branchPoints || 0}`
+  );
+}
+
+function v212BranchRetentionText(details, limit = 12) {
+  if (!Array.isArray(details) || !details.length) {
+    return '—';
+  }
+
+  const shown = details.slice(-limit).map(x => (
+    `d${x.depth}: ` +
+    `alt ${x.alternateSubtreeNodes || 0}n/${fmt(x.alternateSubtreeBytes || 0)}B · ` +
+    `active ${x.activeSubtreeNodes || 0}n/${fmt(x.activeSubtreeBytes || 0)}B · ` +
+    `±32 ${fmt(x.neighborhoods?.r32?.specialNodeBytes || 0)}B special`
+  ));
+
+  if (details.length > limit) {
+    shown.unshift(`+${details.length - limit} earlier`);
+  }
+
+  return shown.join(' || ');
+}
+
+function v212ProSegmentsText(segments, limit = 12) {
+  if (!Array.isArray(segments) || !segments.length) {
+    return '—';
+  }
+
+  return segments
+    .slice(-limit)
+    .map(x => (
+      `${x.model} d${x.startDepth}-${x.endDepth}: ` +
+      `${fmt(x.toolResultBytes || 0)}B toolres · ` +
+      `${fmt(x.imageGenResultBytes || 0)}B img-gen · ` +
+      `${fmt(x.specialNodeBytes || 0)}B special · ` +
+      `${x.branchPoints || 0} branches`
+    ))
+    .join(' || ');
+}
+
+function v212ImageGenResultsText(result) {
+  if (!result || !Array.isArray(result.top) || !result.top.length) {
+    return '—';
+  }
+
+  return result.top
+    .map(x => (
+      `d${x.depth}:${fmt(x.bytes || 0)}B` +
+      `${x.toolName ? ':' + x.toolName : ''}`
+    ))
+    .join(', ');
+}
+
+
+function analyzeMapping(mapping, activeNodes) {
+  const allNodes = Object.values(mapping).filter(Boolean);
+  const all = analyzeNodes(allNodes);
+  const active = analyzeNodes(activeNodes);
+
+  let leafNodes = 0;
+  let branchPoints = 0;
+  let maxChildren = 0;
+
+  for (const node of allNodes) {
+    const children = Array.isArray(node?.children) ? node.children : [];
+    const count = children.length;
+
+    if (count === 0) leafNodes++;
+    if (count > 1) branchPoints++;
+    if (count > maxChildren) maxChildren = count;
+  }
+
+  const mappingNodes = allNodes.length;
+  const activeBranchNodes = activeNodes.length;
+  const branch = analyzeBranchPoints(mapping, activeNodes);
+
+  let contextTopology;
+
+  try {
+    contextTopology = analyzeContextHistoryLite(
+      activeNodes,
+      branch.activeBranchPointDepths,
+      mapping
+    );
+  } catch (error) {
+    contextTopology = {
+      ok: false,
+      error:
+        String(error?.stack || error?.message || error || 'unknown topology error')
+          .slice(0, 4000)
+    };
+  }
+
+  return {
+    contextTopology,
+    mappingNodes,
+    activeBranchNodes,
+    offBranchNodes: Math.max(0, mappingNodes - activeBranchNodes),
+    leafNodes,
+    branchPoints,
+    maxChildren,
+
+    activeBranchPoints: branch.activeBranchPoints,
+    activeBranchPointDepths: branch.activeBranchPointDepths,
+    lastBranchPointDepth: branch.lastBranchPointDepth,
+    nodesSinceLastBranchPoint: branch.nodesSinceLastBranchPoint,
+    alternateSubtreeNodesTotal: branch.alternateSubtreeNodesTotal,
+    alternateSubtreeNodesMax: branch.alternateSubtreeNodesMax,
+    branchPointDetails: branch.branchPointDetails,
+
+    mappingMessageNodes: all.messageNodes,
+    mappingEmptyMessageNodes: all.emptyMessageNodes,
+    mappingAllTextChars: all.allTextChars,
+    mappingDisplayTextChars: all.displayTextChars,
+    mappingDisplayLikeTextChars: all.displayLikeTextChars,
+    mappingDisplayLikeMessages: all.displayLikeMessages,
+    mappingHiddenMessageNodes: all.hiddenMessageNodes,
+    mappingHiddenTextChars: all.hiddenTextChars,
+
+    mappingExplicitToolRoleNodes: all.explicitToolRoleNodes,
+    mappingToolishNodes: all.toolishNodes,
+    mappingToolCallNodes: all.toolCallNodes,
+    mappingToolResultNodes: all.toolResultNodes,
+    mappingToolCallBytes: all.toolCallBytes,
+    mappingToolResultBytes: all.toolResultBytes,
+    mappingToolCallNames: all.toolCallNames,
+    mappingToolResultNames: all.toolResultNames,
+    mappingRecipientCounts: all.recipientCounts,
+
+    mappingContextLikeNodes: all.contextLikeNodes,
+    mappingAttachmentNodes: all.attachmentNodes,
+    mappingImageNodes: all.imageNodes,
+    mappingFileNodes: all.fileNodes,
+    mappingAudioNodes: all.audioNodes,
+    mappingVideoNodes: all.videoNodes,
+
+    mappingImageGenCallNodes: all.imageGenCallNodes,
+    mappingImageGenResultNodes: all.imageGenResultNodes,
+    mappingGeneratedImageNodes: all.generatedImageNodes,
+    mappingUploadedImageNodes: all.uploadedImageNodes,
+
+    mappingUniqueAssetIds: all.uniqueAssetIds,
+    mappingUniqueImageAssetIds: all.uniqueImageAssetIds,
+    mappingUniqueFileAssetIds: all.uniqueFileAssetIds,
+    mappingUniqueGeneratedImageAssetIds: all.uniqueGeneratedImageAssetIds,
+    mappingUniqueUploadedImageAssetIds: all.uniqueUploadedImageAssetIds,
+    mappingImageReferenceOccurrences: all.imageReferenceOccurrences,
+    mappingFileReferenceOccurrences: all.fileReferenceOccurrences,
+
+    mappingAssetNodeBytes: all.assetNodeBytes,
+    mappingImageNodeBytes: all.imageNodeBytes,
+    mappingFileNodeBytes: all.fileNodeBytes,
+
+    mappingModelCounts: all.modelCounts,
+    mappingGpt6ProMessageNodes: all.gpt6ProMessageNodes,
+    mappingRoleCounts: all.roleCounts,
+    mappingContentTypeCounts: all.contentTypeCounts,
+    mappingNodeBytesByRole: all.nodeBytesByRole,
+    mappingNodeBytesByContentType: all.nodeBytesByContentType,
+    mappingLargestNode: all.largestNode,
+    mappingLargestToolResult: all.largestToolResult,
+    mappingLargestImageNode: all.largestImageNode,
+
+    activeMessageNodes: active.messageNodes,
+    activeDisplayMessages: active.displayMessages,
+    activeDisplayTextChars: active.displayTextChars,
+    activeDisplayLikeMessages: active.displayLikeMessages,
+    activeDisplayLikeTextChars: active.displayLikeTextChars,
+    activeAllTextChars: active.allTextChars,
+    activeHiddenMessageNodes: active.hiddenMessageNodes,
+    activeHiddenTextChars: active.hiddenTextChars,
+    activeEmptyMessageNodes: active.emptyMessageNodes,
+
+    activeExplicitToolRoleNodes: active.explicitToolRoleNodes,
+    activeToolishNodes: active.toolishNodes,
+    activeToolCallNodes: active.toolCallNodes,
+    activeToolResultNodes: active.toolResultNodes,
+    activeToolCallBytes: active.toolCallBytes,
+    activeToolResultBytes: active.toolResultBytes,
+    activeToolCallNames: active.toolCallNames,
+    activeToolResultNames: active.toolResultNames,
+    activeRecipientCounts: active.recipientCounts,
+
+    activeContextLikeNodes: active.contextLikeNodes,
+    activeAttachmentNodes: active.attachmentNodes,
+    activeImageNodes: active.imageNodes,
+    activeFileNodes: active.fileNodes,
+    activeAudioNodes: active.audioNodes,
+    activeVideoNodes: active.videoNodes,
+
+    activeImageGenCallNodes: active.imageGenCallNodes,
+    activeImageGenResultNodes: active.imageGenResultNodes,
+    activeGeneratedImageNodes: active.generatedImageNodes,
+    activeUploadedImageNodes: active.uploadedImageNodes,
+
+    activeUniqueAssetIds: active.uniqueAssetIds,
+    activeUniqueImageAssetIds: active.uniqueImageAssetIds,
+    activeUniqueFileAssetIds: active.uniqueFileAssetIds,
+    activeUniqueGeneratedImageAssetIds: active.uniqueGeneratedImageAssetIds,
+    activeUniqueUploadedImageAssetIds: active.uniqueUploadedImageAssetIds,
+    activeImageReferenceOccurrences: active.imageReferenceOccurrences,
+    activeFileReferenceOccurrences: active.fileReferenceOccurrences,
+
+    activeAssetNodeBytes: active.assetNodeBytes,
+    activeImageNodeBytes: active.imageNodeBytes,
+    activeFileNodeBytes: active.fileNodeBytes,
+
+    activeModelCounts: active.modelCounts,
+    activeGpt6ProMessageNodes: active.gpt6ProMessageNodes,
+    activeRoleCounts: active.roleCounts,
+    activeContentTypeCounts: active.contentTypeCounts,
+    activeNodeBytesByRole: active.nodeBytesByRole,
+    activeNodeBytesByContentType: active.nodeBytesByContentType,
+    activeLargestNode: active.largestNode,
+    activeLargestToolResult: active.largestToolResult,
+    activeLargestImageNode: active.largestImageNode,
+
+    mappingSerializedBytes: utf8BytesOfJSON(mapping),
+    activeBranchSerializedBytes: utf8BytesOfJSON(activeNodes)
+  };
+}
+
+function parseMappingConversation(obj) {
+  const mapping = obj?.mapping;
+
+  if (!mapping || typeof mapping !== 'object') {
+    return null;
+  }
+
+  const keys = Object.keys(mapping);
+  if (!keys.length) return null;
+
+  const activeNodes = getActiveBranch(mapping, obj.current_node);
+  const records = [];
+
+  for (const node of activeNodes) {
+    const rec = recordFromMessage(node);
+    if (rec) records.push(rec);
+  }
+
+  if (!records.length) return null;
+
+  return {
+    records,
+    full: true,
+    mappingNodes: keys.length,
+    structure: analyzeMapping(mapping, activeNodes),
+    conversationId:
+      obj.conversation_id ??
+      obj.id ??
+      obj.conversationId ??
+      null,
+    source: 'network conversation mapping'
+  };
+}
+
+function parseMessageArray(arr, source = 'network messages') {
+  if (!Array.isArray(arr) || !arr.length) {
+    return null;
+  }
+
+  const records = [];
+
+  for (const item of arr) {
+    const rec = recordFromMessage(item);
+    if (rec) records.push(rec);
+  }
+
+  if (!records.length) return null;
+
+  return {
+    records,
+    full: false,
+    mappingNodes: null,
+    structure: null,
+    conversationId: null,
+    source
+  };
+}
+
+function findBestCandidate(root) {
+  if (!root || typeof root !== 'object') {
+    return null;
+  }
+
+  let best = null;
+  let visited = 0;
+  const queue = [root];
+  const seen = new WeakSet();
+
+  while (queue.length && visited < 12000) {
+    const obj = queue.shift();
+
+    if (
+      !obj ||
+      typeof obj !== 'object'
+    ) {
+      continue;
+    }
+
+    if (seen.has(obj)) continue;
+    seen.add(obj);
+    visited++;
+
+    const mapped = parseMappingConversation(obj);
+
+    if (mapped) {
+      const score =
+        1000000 +
+        mapped.records.reduce((s, r) => s + r.chars, 0) +
+        mapped.records.length * 200;
+
+      if (!best || score > best.score) {
+        best = { ...mapped, score };
+      }
+    }
+
+    for (const prop of ['messages', 'items', 'data']) {
+      if (Array.isArray(obj[prop])) {
+        const parsed = parseMessageArray(
+          obj[prop],
+          `network ${prop}`
+        );
+
+        if (parsed) {
+          const chars = parsed.records.reduce(
+            (s, r) => s + r.chars,
+            0
+          );
+
+          const score =
+            chars +
+            parsed.records.length * 100;
+
+          if (!best || score > best.score) {
+            best = { ...parsed, score };
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(obj)) {
+      const parsed = parseMessageArray(
+        obj,
+        'network message array'
+      );
+
+      if (parsed) {
+        const chars = parsed.records.reduce(
+          (s, r) => s + r.chars,
+          0
+        );
+
+        const score =
+          chars +
+          parsed.records.length * 100;
+
+        if (!best || score > best.score) {
+          best = { ...parsed, score };
+        }
+      }
+
+      for (const child of obj) {
+        if (child && typeof child === 'object') {
+          queue.push(child);
+        }
+      }
+    } else {
+      for (const [k, child] of Object.entries(obj)) {
+        if (
+          ['mapping', 'messages', 'items'].includes(k)
+        ) {
+          continue;
+        }
+
+        if (child && typeof child === 'object') {
+          queue.push(child);
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+
+
+function lifecycleKey(id = chatIdFromURL()) {
+  return id ? `${LIFECYCLE_PREFIX}:${id}` : null;
+}
+
+
+function lifecycleSourceFamily(source) {
+  const s = String(source || '');
+
+  if (
+    s.includes('/backend-api/conversations/batch')
+  ) {
+    return 'batch';
+  }
+
+  if (
+    (/\/backend-api\/conversation\/[^/?#]+/i.test(s) &&
+    !s.includes('/backend-api/conversations/')) ||
+    /\/backend-api\/conversations\/[^/?#]+(?:[?#]|$)/i.test(s)
+  ) {
+    return 'direct';
+  }
+
+  return 'other';
+}
+
+function lifecycleFamilyLabel(family) {
+  return ({
+    direct: 'DIRECT',
+    batch: 'BATCH',
+    other: 'OTHER'
+  })[family] || 'OTHER';
+}
+
+function blankLifecycleFamily() {
+  return {
+    lastStable: null,
+    lastInflight: null,
+    highestStable: null,
+    highestInflight: null,
+    currentPeak: null,
+    lastGenerationPeak: null,
+    lastMaxEvent: null,
+    maxEvents: [],
+    lastRecovery: null,
+    recoveryPending: null
+  };
+}
+
+function normalizeLifecycleFamily(x) {
+  return {
+    ...blankLifecycleFamily(),
+    ...(x && typeof x === 'object' ? x : {})
+  };
+}
+
+function lifecycleAssignObservationToFamily(state, obs) {
+  if (!obs) return;
+
+  const family =
+    obs.sourceFamily ||
+    lifecycleSourceFamily(obs.source);
+
+  obs.sourceFamily = family;
+
+  const f = state.families[family];
+
+  if (obs.phase === 'stable') {
+    f.lastStable = obs;
+    f.highestStable = chooseHigher(f.highestStable, obs);
+  } else if (obs.phase === 'inflight') {
+    f.lastInflight = obs;
+    f.highestInflight = chooseHigher(f.highestInflight, obs);
+  } else if (obs.phase === 'max') {
+    f.lastMaxEvent = {
+      time: obs.time || Date.now(),
+      fullCapturedAt: obs.fullCapturedAt || 0,
+      sourceFamily: family,
+      metrics: obs,
+      generationPeak: f.currentPeak || f.lastInflight || null
+    };
+  }
+}
+
+function migrateLifecycleV216(x) {
+  const state = blankLifecycle();
+
+  if (!x || typeof x !== 'object') {
+    return state;
+  }
+
+  /*
+    V2.16 had one global bucket. Rebuild family buckets from every
+    source-tagged observation it already saved.
+  */
+  const rows = Array.isArray(x.observations)
+    ? x.observations
+    : [];
+
+  for (const raw of rows) {
+    const obs = {
+      ...raw,
+      sourceFamily:
+        raw?.sourceFamily ||
+        lifecycleSourceFamily(raw?.source)
+    };
+
+    lifecycleAssignObservationToFamily(state, obs);
+    state.observations.push(obs);
+    state.lastObservation = obs;
+  }
+
+  for (const raw of [
+    x.lastStable,
+    x.lastInflight,
+    x.lastObservation,
+    x.highestStable,
+    x.highestInflight
+  ]) {
+    if (!raw) continue;
+
+    const obs = {
+      ...raw,
+      sourceFamily:
+        raw.sourceFamily ||
+        lifecycleSourceFamily(raw.source)
+    };
+
+    lifecycleAssignObservationToFamily(state, obs);
+  }
+
+  /*
+    Old MAX events did not carry a source family. Attribute them to the
+    closest/latest observation source, which is sufficient to preserve
+    V2.16 history without pretending it is cross-source comparable.
+  */
+  const oldEvents = Array.isArray(x.maxEvents)
+    ? x.maxEvents
+    : [];
+
+  for (const event of oldEvents) {
+    const family =
+      event?.sourceFamily ||
+      lifecycleSourceFamily(
+        event?.metrics?.source ||
+        x.lastObservation?.source
+      );
+
+    const migrated = {
+      ...event,
+      sourceFamily: family
+    };
+
+    state.maxEvents.push(migrated);
+    state.families[family].maxEvents.push(migrated);
+    state.families[family].lastMaxEvent = migrated;
+    state.lastMaxEvent = migrated;
+  }
+
+  if (x.lastMaxEvent && !oldEvents.length) {
+    const family =
+      lifecycleSourceFamily(
+        x.lastMaxEvent?.metrics?.source ||
+        x.lastObservation?.source
+      );
+
+    const migrated = {
+      ...x.lastMaxEvent,
+      sourceFamily: family
+    };
+
+    state.lastMaxEvent = migrated;
+    state.maxEvents.push(migrated);
+    state.families[family].lastMaxEvent = migrated;
+    state.families[family].maxEvents.push(migrated);
+  }
+
+  state.bannerActive = Boolean(x.bannerActive);
+  state.bannerClearedAt = x.bannerClearedAt || null;
+  state.lastSourceFamily =
+    state.lastObservation?.sourceFamily || null;
+
+  return state;
+}
+
+
+function blankLifecycle() {
+  return {
+    version: 2,
+    families: {
+      direct: blankLifecycleFamily(),
+      batch: blankLifecycleFamily(),
+      other: blankLifecycleFamily()
+    },
+    lastObservation: null,
+    lastSourceFamily: null,
+    sourceSwitches: [],
+    bannerActive: false,
+    bannerClearedAt: null,
+    lastMaxEvent: null,
+    maxEvents: [],
+    observations: []
+  };
+}
+
+function loadLifecycle(id = chatIdFromURL()) {
+  const k = lifecycleKey(id);
+  if (!k) return blankLifecycle();
+  if (lifecycleCache.has(id)) return lifecycleCache.get(id);
+
+  try {
+    const x = eventStorageParse(localStorage.getItem(k));
+
+    if (!x || typeof x !== 'object') {
+      const empty = blankLifecycle(); lifecycleCache.set(id,empty); return empty;
+    }
+
+    if (
+      x.version === 2 &&
+      x.families &&
+      typeof x.families === 'object'
+    ) {
+      const state = {
+        ...blankLifecycle(),
+        ...x,
+        families: {
+          direct: normalizeLifecycleFamily(x.families.direct),
+          batch: normalizeLifecycleFamily(x.families.batch),
+          other: normalizeLifecycleFamily(x.families.other)
+        },
+        sourceSwitches: Array.isArray(x.sourceSwitches)
+          ? x.sourceSwitches
+          : [],
+        maxEvents: Array.isArray(x.maxEvents)
+          ? x.maxEvents
+          : [],
+        observations: Array.isArray(x.observations)
+          ? x.observations
+          : []
+      };
+      lifecycleCache.set(id,state);
+      return state;
+    }
+
+    const migrated = migrateLifecycleV216(x);
+    saveLifecycle(id, migrated);
+    return migrated;
+  } catch {
+    return blankLifecycle();
+  }
+}
+
+function saveLifecycle(id, x) {
+  const key = lifecycleKey(id);
+  if (key) { lifecycleCache.set(id,x); eventSave(id,key,x); }
+}
+
+function visibleGenerationActive() {
+  try {
+    if (document.querySelector(
+      '[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop response"]'
+    )) return true;
+
+    return [...document.querySelectorAll('button[data-testid],button[aria-label]')]
+      .some(el => {
+        const t = String(el.getAttribute('data-testid') || '').toLowerCase();
+        const a = String(el.getAttribute('aria-label') || '').toLowerCase();
+        return t.includes('stop') || a === 'stop generating' || a === 'stop response';
+      });
+  } catch {
+    return false;
+  }
+}
+
+function lifecycleSourceLabel(url) {
+  return url ? attemptRequestPath(url).slice(0,220) : 'unknown';
+}
+
+function lifecycleMetrics(id = chatIdFromURL()) {
+  const snap = loadSnapshot(id);
+  const s = snap.structure || {};
+  const top = s.contextTopology || {};
+  const retained = top.retainedState || {};
+
+  const userMessages = Array.isArray(snap.records)
+    ? snap.records.filter(x => x.role === 'user').length
+    : null;
+
+  const assistantMessages = Array.isArray(snap.records)
+    ? snap.records.filter(x => x.role === 'assistant').length
+    : null;
+
+  return {
+    time: Date.now(),
+    fullCapturedAt: Number(snap.fullCapturedAt) || 0,
+    retainedBytes: nullableNumber(retained.retainedStateProxyBytes),
+    retainedShare: nullableNumber(retained.retainedStateProxySharePercent),
+    activeBranchBytes: nullableNumber(s.activeBranchSerializedBytes),
+    mappingBytes: nullableNumber(s.mappingSerializedBytes),
+    branchNodes: nullableNumber(s.activeBranchNodes),
+    messageNodes: nullableNumber(s.activeMessageNodes),
+    userMessages,
+    assistantMessages,
+    toolResults: nullableNumber(s.activeToolResultNodes),
+    toolResultBytes:nullableNumber(s.activeToolResultBytes),
+    hot128:nullableNumber(retained.hotWindows?.w128?.specialNodeBytes),
+    hot256:nullableNumber(retained.hotWindows?.w256?.specialNodeBytes),
+    toolCalls: nullableNumber(s.activeToolCallNodes),
+    strongContextMarkers: nullableNumber(top.strongContextMarkerCount),
+    systemRoleNodes: nullableNumber(s.activeRoleCounts?.system),
+    displayLikeTokens:
+      s.activeDisplayLikeTextChars != null
+        ? tokenEstimateForChars(Number(s.activeDisplayLikeTextChars) || 0)
+        : null
+  };
+}
+
+function chooseHigher(a, b, field = 'retainedBytes') {
+  if (!a) return b || null;
+  if (!b) return a;
+  const av = nullableNumber(a[field]);
+  const bv = nullableNumber(b[field]);
+  if (av == null) return b;
+  if (bv == null) return a;
+  return bv > av ? b : a;
+}
+
+function recordLifecycleFullCapture(id, sourceURL = '', payloadBytes = null) {
+  if (!id) return;
+
+  const state = loadLifecycle(id);
+  const eventStore = loadAttemptState(id);
+  eventStore.captureSequence = (eventStore.captureSequence || 0) + 1;
+  const generating = !!loadAttemptState(id).current || visibleGenerationActive();
+  const maxVisible = visibleHardMax();
+  const phase = maxVisible
+    ? 'max'
+    : generating
+      ? 'inflight'
+      : 'stable';
+
+  const source = lifecycleSourceLabel(sourceURL);
+  const sourceFamily = lifecycleSourceFamily(source);
+  const family = state.families[sourceFamily];
+
+  const obs = {
+    ...lifecycleMetrics(id),
+    phase,
+    generating,
+    maxVisible,
+    source,
+    sourceFamily,
+    payloadBytes: nullableNumber(payloadBytes)
+  };
+
+  if (
+    state.lastSourceFamily &&
+    state.lastSourceFamily !== sourceFamily
+  ) {
+    const switches = Array.isArray(state.sourceSwitches)
+      ? state.sourceSwitches
+      : [];
+
+    switches.push({
+      time: Date.now(),
+      from: state.lastSourceFamily,
+      to: sourceFamily,
+      retainedBytes: obs.retainedBytes,
+      activeBranchBytes: obs.activeBranchBytes
+    });
+
+    state.sourceSwitches = switches.slice(-30);
+  }
+
+  state.lastSourceFamily = sourceFamily;
+  state.lastObservation = obs;
+  family.lastObservation = obs;
+
+  if (phase === 'inflight') {
+    family.lastInflight = obs;
+    family.currentPeak = chooseHigher(family.currentPeak, obs);
+    family.highestInflight = chooseHigher(family.highestInflight, obs);
+  }
+
+  if (phase === 'stable') {
+    family.lastStable = obs;
+    family.highestStable = chooseHigher(family.highestStable, obs);
+
+    const maxEvent = family.lastMaxEvent;
+    const before = maxEvent?.metrics || null;
+
+    if (
+      maxEvent &&
+      before &&
+      !maxVisible &&
+      obs.fullCapturedAt > Number(maxEvent.fullCapturedAt || 0)
+    ) {
+      /*
+        A disappearing banner is NOT enough.
+        Confirm recovery only when the SAME SOURCE FAMILY shows newer
+        conversation progress after its MAX event.
+      */
+      const progressed =
+        (
+          obs.userMessages != null &&
+          before.userMessages != null &&
+          obs.userMessages > before.userMessages
+        ) ||
+        (
+          obs.assistantMessages != null &&
+          before.assistantMessages != null &&
+          obs.assistantMessages > before.assistantMessages
+        ) ||
+        (
+          obs.branchNodes != null &&
+          before.branchNodes != null &&
+          obs.branchNodes > before.branchNodes
+        );
+
+      if (progressed) {
+        family.lastRecovery = {
+          confirmed: true,
+          time: Date.now(),
+          sourceFamily,
+          afterMaxTime: maxEvent.time,
+          before,
+          after: obs,
+          delta: {
+            retainedBytes:
+              (obs.retainedBytes ?? 0) -
+              (before.retainedBytes ?? 0),
+            activeBranchBytes:
+              (obs.activeBranchBytes ?? 0) -
+              (before.activeBranchBytes ?? 0),
+            mappingBytes:
+              (obs.mappingBytes ?? 0) -
+              (before.mappingBytes ?? 0),
+            branchNodes:
+              (obs.branchNodes ?? 0) -
+              (before.branchNodes ?? 0),
+            userMessages:
+              (obs.userMessages ?? 0) -
+              (before.userMessages ?? 0),
+            assistantMessages:
+              (obs.assistantMessages ?? 0) -
+              (before.assistantMessages ?? 0),
+            toolResults:
+              (obs.toolResults ?? 0) -
+              (before.toolResults ?? 0),
+            strongContextMarkers:
+              (obs.strongContextMarkers ?? 0) -
+              (before.strongContextMarkers ?? 0)
+          }
+        };
+
+        family.recoveryPending = null;
+      } else {
+        family.recoveryPending = {
+          confirmed: false,
+          time: Date.now(),
+          sourceFamily,
+          reason:
+            'banner cleared / newer snapshot seen, but no same-source message or branch progress yet',
+          maxEvent,
+          candidate: obs
+        };
+      }
+    }
+  }
+
+  if (phase === 'max') {
+    const event = {
+      time: Date.now(),
+      fullCapturedAt: obs.fullCapturedAt,
+      sourceFamily,
+      metrics: obs,
+      generationPeak:
+        family.currentPeak ||
+        family.lastInflight ||
+        null
+    };
+
+    const duplicate =
+      family.lastMaxEvent &&
+      Number(family.lastMaxEvent.fullCapturedAt) ===
+        Number(event.fullCapturedAt) &&
+      family.lastMaxEvent.sourceFamily === sourceFamily;
+
+    if (!duplicate) {
+      family.lastMaxEvent = event;
+      const familyEvents = Array.isArray(family.maxEvents)
+        ? family.maxEvents
+        : [];
+      familyEvents.push(event);
+      family.maxEvents = familyEvents.slice(-12);
+
+      state.lastMaxEvent = event;
+      const allEvents = Array.isArray(state.maxEvents)
+        ? state.maxEvents
+        : [];
+      allEvents.push(event);
+      state.maxEvents = allEvents.slice(-24);
+    }
+  }
+
+  const rows = Array.isArray(state.observations)
+    ? state.observations
+    : [];
+
+  const prev = rows[rows.length - 1];
+
+  const sig = [
+    phase,
+    sourceFamily,
+    obs.retainedBytes,
+    obs.activeBranchBytes,
+    obs.branchNodes,
+    obs.source
+  ].join('|');
+
+  const prevSig = prev
+    ? [
+        prev.phase,
+        prev.sourceFamily,
+        prev.retainedBytes,
+        prev.activeBranchBytes,
+        prev.branchNodes,
+        prev.source
+      ].join('|')
+    : '';
+
+  if (sig !== prevSig) {
+    rows.push(obs);
+  }
+
+  state.observations = rows.slice(-80);
+  saveLifecycle(id, state);
+
+  eventCapture(id, obs, activeCaptureBinding);
+  attemptRecordFullCapture(id, obs);
+  attemptRecordPostOutcomeCapture(id, obs);
+}
+
+function lifecyclePollPhase() {
+  const id = chatIdFromURL();
+  if (!id) return;
+  eventPollMax(id);
+  // DOM generation is supplementary phase evidence, never an attempt factory.
+  lastGeneratingState = visibleGenerationActive();
+}
+
+function lifecycleObsText(x) {
+  if (!x) return '—';
+
+  return (
+    `${lifecycleFamilyLabel(x.sourceFamily || lifecycleSourceFamily(x.source))} ` +
+    `${x.phase || '?'} · ` +
+    `${x.retainedBytes != null ? fmt(x.retainedBytes) + 'B retained' : '— retained'} · ` +
+    `${x.activeBranchBytes != null ? fmt(x.activeBranchBytes) + 'B active' : '— active'} · ` +
+    `${x.branchNodes ?? '—'} nodes · ${x.source || 'unknown'}`
+  );
+}
+
+function lifecycleRowsText(rows, limit = 12) {
+  if (!Array.isArray(rows) || !rows.length) return '—';
+  return rows.slice(-limit).map(lifecycleObsText).join(' || ');
+}
+
+function lifecycleDelta(value, suffix = '') {
+  const n = nullableNumber(value);
+  if (n == null) return '—';
+  return `${n > 0 ? '+' : ''}${fmt(n)}${suffix}`;
+}
+
+
+
+// ============================================================
+// V2.23 event identities, episodes, bounded persistence and UI
+// ============================================================
+function sanitizeURL(value) {
+  try {
+    const u = new URL(String(value || ''), location.origin);
+    return `${u.origin}${u.pathname}`; // credentials, fragments, all query values removed
+  } catch { return '[invalid URL]'; }
+}
+
+function redactDiagnosticText(value) {
+  return String(value).replace(/(?:https?|wss?):\/\/[^\s|<>"']+/g, sanitizeURL)
+    .replace(/\b(verify|authorization|access_token|session_token|refresh_token)\s*[=:]\s*[^\s,;]+/gi, '$1=[REDACTED]');
+}
+
+function safeEventKind(value) {
+  const allowed = new Set(['error','conversation_error','message','delta','ping','pong',
+    'message_start','message_end','message_stream_complete','finished_successfully',
+    'in_progress','done','[DONE]','conversation','response.completed']);
+  return allowed.has(value) ? value : null;
+}
+
+function generationClassifierReason(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const action = String(parsed.action || '').toLowerCase();
+  if (!['next','continue','variant','retry','edit'].includes(action)) return null;
+  const parent = typeof parsed.parent_message_id === 'string' && !!parsed.parent_message_id;
+  const model = typeof parsed.model === 'string' && !!parsed.model;
+  const messages = Array.isArray(parsed.messages) && parsed.messages.length > 0;
+  const encoding = Array.isArray(parsed.supported_encodings) || !!parsed.client_prepare_state;
+  if (parent && (model || messages || encoding)) return 'supported action + parent + model/messages/encoding';
+  if (model && messages) return 'supported action + model + messages';
+  return null;
+}
+
+function eventAttempt(id, attemptId) {
+  if (!id || attemptId == null) return null;
+  const store = loadAttemptState(id);
+  return [store.current,store.last,...store.attempts].find(a => a?.id === attemptId) || null;
+}
+
+function eventFinalizeError(id, a, reason) {
+  if (a.outcome) return;
+  const store = loadAttemptState(id);
+  a.status = a.outcome = reason.startsWith('correlation incomplete') ? 'unknown' : 'error';
+  a.outcomeConfirmedBy = reason;
+  a.outcomeConfirmedAt = a.finalizedAt = Date.now();
+  attemptFinalize(store,a);
+  saveAttemptState(id,store);
+}
+
+function eventScheduleTelemetryTimeout(id, attemptId) {
+  if (!id) return;
+  setTimeout(() => {
+    const a = eventAttempt(id,attemptId);
+    if (!a || a.telemetryFinalizedAt) return;
+    a.telemetryFinalizedAt = Date.now();
+    a.telemetryClosureReason = 'timeout; stream close unobserved';
+    streamBuffers.delete(`${id}:${attemptId}`);
+    saveAttemptState(id,loadAttemptState(id));
+  },60000);
+}
+
+// Anonymous empirical observations, not official OpenAI limits. Read-only code
+// reference only: never admit these profiles as local conversations or events.
+const PRESSURE_SEED = Object.freeze({
+  version:'v2242-anonymous-seed-1',model:'gpt-5-6-thinking',canonicalEffort:'max',
+  profiles:Object.freeze([
+    Object.freeze({displayLikeTokens:840795,activeBranchBytes:20075510}),
+    Object.freeze({displayLikeTokens:847977,activeBranchBytes:15645053}),
+    Object.freeze({displayLikeTokens:571836,activeBranchBytes:27151472})
+  ])
+});
+
+// Only the accepted model/effort has evidence. Future entries use this same
+// immutable shape; no thresholds are supplied for unobserved combinations.
+const ANONYMOUS_PRESSURE_SEEDS = Object.freeze([
+  Object.freeze({model:PRESSURE_SEED.model,canonicalEffort:PRESSURE_SEED.canonicalEffort,
+    seedVersion:PRESSURE_SEED.version,profiles:PRESSURE_SEED.profiles})
+]);
+
+// V2.24 empirical pressure, schema 1. No raw mappings, requests, or diagnostic objects.
+// 256 event rows, at most two vectors/row. Eviction watermark prevents replay of old events.
+const PRESSURE_KEY = `${P}:pressure-calibration-v224`;
+const PRESSURE_CAP = 256;
+const PRESSURE_FIELDS = ['displayLikeTokens','activeBranchBytes','mappingBytes','retainedBytes',
+  'retainedShare','toolResultBytes','hot128','hot256','strongContextMarkers','branchNodes','messageNodes'];
+let pressureStore = null, pressureRevision = 0, pressureBusy = false, pressureWriteBlocked = false;
+const pressureResults = new Map();
+
+function pressureNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function pressureLabel(value) {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0,120) : null;
+}
+function pressureEffort(value) {
+  const effort=pressureLabel(value)?.toLowerCase().replace(/\s+/g,' ') || null;
+  // Demonstrated UI/backend alias: Extra High / requestEffort=max. No guesses
+  // for Thinking, xhigh, or other labels without paired repository evidence.
+  return effort==='extra high' ? 'max' : effort;
+}
+function pressureVector(obs, role, before = Infinity, after = 0) {
+  if (!obs || !['direct','batch'].includes(obs.sourceFamily)) return null;
+  const time = pressureNumber(obs.fullCapturedAt);
+  if (!time || time > before || time < after || !(pressureNumber(obs.mappingBytes) > 0) ||
+      !(pressureNumber(obs.branchNodes) > 0) || !(pressureNumber(obs.displayLikeTokens) > 0)) return null;
+  return {sourceFamily:obs.sourceFamily,snapshotRole:role,fullCapturedAt:time,
+    ...Object.fromEntries(PRESSURE_FIELDS.map(k=>[k,pressureNumber(obs[k])]))};
+}
+function pressureBest(vectors) {
+  // Prefer complete BATCH representation, then most recent accepted observation.
+  return vectors.filter(Boolean).sort((a,b)=>Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch') ||
+    b.fullCapturedAt-a.fullCapturedAt)[0] || null;
+}
+function pressureOrder(a,b) {
+  return a.timestamp-b.timestamp || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+}
+function pressureCleanRow(row, preserveEffort = false) {
+  if (!row || !['success','max'].includes(row.outcome) || !pressureLabel(row.conversationId) ||
+      !Number.isSafeInteger(row.eventId) || row.eventId < 1 || !(pressureNumber(row.timestamp)>0)) return null;
+  const conversationId = pressureLabel(row.conversationId), outcome = row.outcome;
+  const canonical = pressureVector(row.canonical,row.canonical?.snapshotRole);
+  const postMax = outcome === 'max' ? pressureVector(row.postMax,'fresh-post-max',Infinity,row.timestamp) : null;
+  if (canonical && (!['pre-dispatch','fresh-post-max-fallback'].includes(canonical.snapshotRole) ||
+      canonical.snapshotRole==='pre-dispatch' && canonical.fullCapturedAt>row.timestamp ||
+      canonical.snapshotRole==='fresh-post-max-fallback' && canonical.fullCapturedAt<row.timestamp)) return null;
+  if (!canonical || outcome === 'success' && canonical.snapshotRole !== 'pre-dispatch') return null;
+  return {key:JSON.stringify([conversationId,outcome,row.eventId]),conversationId,eventId:row.eventId,outcome,
+    timestamp:row.timestamp,attemptId:Number.isSafeInteger(row.attemptId)?row.attemptId:null,
+    episodeId:outcome==='max'?row.eventId:null,model:pressureLabel(row.model),
+    effort:preserveEffort ? (typeof row.effort==='string' ? row.effort.slice(0,120) : null) : pressureEffort(row.effort),
+    identitySource:pressureLabel(row.identitySource),confirmationSource:pressureLabel(row.confirmationSource),
+    provenance:row.provenance==='v223-migration'?'v223-migration':'v224-observed',canonical,postMax};
+}
+function pressureBlank() {
+  return {schemaVersion:1,modelVersion:'v2242-seeded-dual-frontier-1',samples:[],watermark:null,
+    retentionCount:0,migration:{done:false,examinedKeys:0,skippedKeys:0,admittedEvents:0},lastError:null};
+}
+function pressureLoad() {
+  if (pressureStore) return pressureStore;
+  pressureStore = pressureBlank();
+  try {
+    const text = localStorage.getItem(PRESSURE_KEY);
+    if (!text) return pressureStore;
+    if (text.length > 1500000) throw Error('Oversize pressure store');
+    const data = eventStorageParse(text);
+    if (data?.schemaVersion !== 1 || !Array.isArray(data.samples) || data.samples.length > PRESSURE_CAP)
+      throw Error('Unsupported pressure schema');
+    const unique = new Map();
+    for (const raw of data.samples) {const row=pressureCleanRow(raw,true);if(row)unique.set(row.key,row);}
+    pressureStore.samples = [...unique.values()].sort(pressureOrder);
+    if (pressureNumber(data.watermark?.timestamp)>0 && typeof data.watermark.key==='string')
+      pressureStore.watermark = {timestamp:data.watermark.timestamp,key:data.watermark.key.slice(0,400)};
+    pressureStore.retentionCount = pressureNumber(data.retentionCount) || 0;
+    if (data.migration?.done === true) pressureStore.migration = {done:true,
+      examinedKeys:pressureNumber(data.migration.examinedKeys)||0,skippedKeys:pressureNumber(data.migration.skippedKeys)||0,
+      admittedEvents:pressureNumber(data.migration.admittedEvents)||0};
+  } catch (error) {pressureWriteBlocked=true;pressureStore.lastError=String(error.message).slice(0,200);}
+  return pressureStore;
+}
+function pressureUpsert(raw) {
+  const store = pressureLoad(), row = pressureCleanRow(raw);
+  if (!row) return false;
+  const index = store.samples.findIndex(s=>s.key===row.key), old = store.samples[index];
+  if (!old && store.watermark && pressureOrder(row,store.watermark)<=0) return false;
+  if (old) {
+    // Stable first evidence; promote fallback to pre-dispatch or DIRECT to BATCH once.
+    row.timestamp=old.timestamp;row.provenance=old.provenance;
+    row.model=old.model || row.model;row.effort=old.effort || row.effort;
+    row.identitySource=old.identitySource || row.identitySource;
+    const improve=(a,b)=>!a ? b : b && ((a.snapshotRole!=='pre-dispatch' && b.snapshotRole==='pre-dispatch') ||
+      (a.snapshotRole===b.snapshotRole && a.sourceFamily==='direct' && b.sourceFamily==='batch')) ? b : a;
+    row.canonical=improve(old.canonical,row.canonical);row.postMax=improve(old.postMax,row.postMax);
+    if (JSON.stringify(old)===JSON.stringify(row)) return false;
+    store.samples[index]=row;
+  } else store.samples.push(row);
+  store.samples.sort(pressureOrder);
+  while (store.samples.length>PRESSURE_CAP) {
+    const removed=store.samples.shift();store.watermark={timestamp:removed.timestamp,key:removed.key};store.retentionCount++;
+  }
+  pressureRevision++;pressureResults.clear();return true;
+}
+function pressureDerive(id, attempts, episodes, provenance, live = false) {
+  if (!Array.isArray(attempts?.attempts)) return 0;
+  const rows=[attempts.current,attempts.last,...attempts.attempts.slice(-10)].filter(Boolean);
+  const byId=new Map(rows.filter(a=>Number.isSafeInteger(a.id)).map(a=>[a.id,a]));
+  let changed=0;
+  const pre=a=>pressureBest(['batch','direct'].map(f=>pressureVector(a?.pre?.[f],'pre-dispatch',
+    a?.requestDetectedAt || a?.startedAt || 0)));
+  for (const a of byId.values()) {
+    if (a.conversationId!==id || a.trigger!=='network-generation-dispatch' || a.outcome!=='success' ||
+        !a.outcomeConfirmedBy || !pressureLabel(a.requestModel)) continue;
+    changed+=Number(pressureUpsert({conversationId:id,eventId:a.id,attemptId:a.id,outcome:'success',
+      timestamp:a.outcomeConfirmedAt,model:a.requestModel,effort:a.requestEffort,identitySource:'generation request',
+      confirmationSource:a.outcomeConfirmedBy,provenance,canonical:pre(a)}));
+  }
+  for (const e of (Array.isArray(episodes?.episodes)?episodes.episodes:[]).slice(-10)) {
+    if (!e || e.conversationId!==id || !['UI MAX banner','structured SSE error','HTTP generation error','blocked before dispatch']
+      .includes(e.confirmationSource)) continue;
+    const a=byId.get(e.relatedRealAttemptId), linked=a?.conversationId===id && a.trigger==='network-generation-dispatch';
+    // Unlinked historical episodes have no trustworthy model/effort identity: skip.
+    const liveIdentity=live && e.active && id===chatIdFromURL();
+    const model=linked ? a.requestModel : liveIdentity ? attemptSnapshotModel(id) : null;
+    if (!pressureLabel(model)) continue;
+    const postMax=pressureBest(['batch','direct'].map(f=>pressureVector(e[f],'fresh-post-max',Infinity,e.firstSeenAt)));
+    const canonical=linked ? pre(a) : null;
+    changed+=Number(pressureUpsert({conversationId:id,eventId:e.id,attemptId:linked?a.id:null,outcome:'max',
+      timestamp:e.firstSeenAt,model,effort:linked?a.requestEffort:attemptEffortHint(),
+      identitySource:linked?'generation request':'live MAX snapshot model / UI effort hint',
+      confirmationSource:e.confirmationSource,provenance,
+      canonical:canonical || (postMax ? {...postMax,snapshotRole:'fresh-post-max-fallback'} : null),postMax}));
+  }
+  return changed;
+}
+function pressureSave(id) {
+  const store=pressureLoad();
+  if(pressureWriteBlocked){store.lastError='Existing pressure store unreadable/unsupported; preserved, writes blocked';return;}
+  const result=meterStorageWrite(id || 'pressure-v224',PRESSURE_KEY,store);
+  store.lastError=result.saved ? null : 'Pressure calibration persistence failed; in-memory evidence retained';
+}
+function pressureMigrate() {
+  const store=pressureLoad();if(store.migration.done)return;
+  // One origin-name scan; read only V2.23 event stores, <=128 keys / 4 MiB total,
+  // <=1 MiB/key. Legacy inferred V2.22 MAX is never admitted. Old bytes untouched.
+  const groups=new Map();let budget=4*1024*1024;
+  for(let i=0;i<localStorage.length && store.migration.examinedKeys<128;i++) {
+    const key=localStorage.key(i),match=key?.match(new RegExp(`^${P}:(attempts-v223|max-episodes-v223):([^:]+)$`));
+    if(!match)continue;store.migration.examinedKeys++;
+    const text=localStorage.getItem(key);
+    if(!text || text.length>1024*1024 || text.length>budget){store.migration.skippedKeys++;continue;}
+    budget-=text.length;
+    try {
+      const data=eventStorageParse(text),group=groups.get(match[2]) || {};
+      if(match[1]==='attempts-v223' && data?.version!==3)throw Error('Unsupported historical attempt schema');
+      group[match[1]==='attempts-v223'?'attempts':'episodes']=data;groups.set(match[2],group);
+    }catch{store.migration.skippedKeys++;}
+  }
+  for(const [id,group]of groups) store.migration.admittedEvents+=pressureDerive(id,group.attempts,group.episodes,'v223-migration');
+  store.migration.done=true;
+  // An empty derivation leaves storage unchanged; its marker stays in memory
+  // until first useful evidence is persisted (a later empty reload may rescan).
+  if(store.samples.length)pressureSave(chatIdFromURL());
+}
+function pressureCollect(id) {
+  // Observation taps never control the validated lifecycle and never throw into it.
+  if(pressureBusy || !id)return;
+  pressureBusy=true;
+  try {
+    pressureMigrate();
+    const attempts=attemptCache.get(id),episodes=episodeCache.get(id);
+    if(pressureDerive(id,attempts,episodes,'v224-observed',true))pressureSave(id);
+  }catch(error){pressureLoad().lastError=String(error.message).slice(0,200);}
+  finally{pressureBusy=false;}
+}
+function pressureCurrent(id) {
+  const state=eventStaticState(id),store=loadAttemptState(id),a=store.current || store.last;
+  // Visible pressure follows the newest accepted current state; unlike event
+  // canonicalization, an older BATCH must not mask a newer DIRECT observation.
+  const canonical=['batch','direct'].map(f=>pressureVector(state[f],'current')).filter(Boolean)
+    .sort((a,b)=>b.fullCapturedAt-a.fullCapturedAt || Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch'))[0] || null;
+  const snapshotModel=pressureLabel(attemptSnapshotModel(id));
+  const model=pressureLabel(store.current?.requestModel) || snapshotModel || pressureLabel(a?.requestModel);
+  const hint=pressureEffort(attemptEffortHint());
+  const effort=hint || (model===a?.requestModel ? pressureEffort(a?.requestEffort) : null);
+  return {model,effort,identitySource:hint?'snapshot/request model + UI effort hint':'snapshot/request model + last matching request effort',canonical};
+}
+function pressureEffectiveMax(rows) {
+  const settings=new Map();
+  for(const row of rows) {
+    if(row.outcome!=='max' || !pressureLabel(row.conversationId) || !(row.canonical?.displayLikeTokens>0))continue;
+    const key=JSON.stringify([row.conversationId,pressureLabel(row.model),pressureEffort(row.effort)]);
+    const group=settings.get(key) || {conversationId:row.conversationId,effort:pressureEffort(row.effort),rows:[]};
+    group.rows.push(row);settings.set(key,group);
+  }
+  const byChat=new Map(),lex=(a,b)=>a<b?-1:a>b?1:0;
+  for(const group of settings.values()) {
+    const pre=group.rows.filter(s=>s.canonical.snapshotRole==='pre-dispatch');
+    // Supporting postMax is never another observation. Fallback canonical state
+    // is eligible only when this setting has no canonical pre-MAX vector.
+    const selected=pre.length ? pre : group.rows;
+    const distinct=new Map();
+    for(const row of selected) {
+      const signature=JSON.stringify([row.canonical.sourceFamily,...PRESSURE_FIELDS.map(k=>row.canonical[k]??null)]);
+      if(!distinct.has(signature) || pressureOrder(row,distinct.get(signature).row)<0)distinct.set(signature,{row,signature});
+    }
+    const states=[...distinct.values()].sort((a,b)=>a.row.canonical.displayLikeTokens-b.row.canonical.displayLikeTokens || lex(a.signature,b.signature));
+    const chat=byChat.get(group.conversationId) || {conversationId:group.conversationId,groups:[]};
+    chat.groups.push({effort:group.effort,rawEpisodes:group.rows.length,distinctPreVectorCount:pre.length?states.length:0,
+      distinctFallbackVectorCount:pre.length?0:states.length,preDisplayLikeRange:pre.length?
+        {min:states[0].row.canonical.displayLikeTokens,max:states.at(-1).row.canonical.displayLikeTokens}:null,
+      representative:states[0].row});
+    byChat.set(group.conversationId,chat);
+  }
+  const observations=[],summary=[];
+  for(const chat of [...byChat.values()].sort((a,b)=>lex(a.conversationId,b.conversationId))) {
+    chat.groups.sort((a,b)=>lex(JSON.stringify(a.effort),JSON.stringify(b.effort)));
+    const pre=chat.groups.filter(g=>g.representative.canonical.snapshotRole==='pre-dispatch');
+    // Even same-model effort pooling cannot give one chat multiple statistical
+    // votes. Preserve setting/state variation in the compact summary instead.
+    const group=(pre.length?pre:chat.groups).slice().sort((a,b)=>
+      a.representative.canonical.displayLikeTokens-b.representative.canonical.displayLikeTokens ||
+      lex(JSON.stringify(a.effort),JSON.stringify(b.effort)))[0];
+    observations.push(group.representative);
+    summary.push({conversationId:chat.conversationId,canonicalEfforts:chat.groups.slice(0,8).map(g=>g.effort),
+      settingGroupCount:chat.groups.length,settingGroupsOmittedCount:Math.max(0,chat.groups.length-8),
+      rawMaxEpisodeCount:chat.groups.reduce((n,g)=>n+g.rawEpisodes,0),
+      distinctPreVectorCount:chat.groups.reduce((n,g)=>n+g.distinctPreVectorCount,0),
+      selectedCanonicalEffort:group.effort,selectedRole:group.representative.canonical.snapshotRole,
+      selectedSourceFamily:group.representative.canonical.sourceFamily,anchorContribution:group.representative.canonical.displayLikeTokens,
+      settings:chat.groups.slice(0,8).map(g=>({canonicalEffort:g.effort,rawEpisodes:g.rawEpisodes,
+        distinctPreVectorCount:g.distinctPreVectorCount,distinctFallbackVectorCount:g.distinctFallbackVectorCount,
+        preDisplayLikeRange:g.preDisplayLikeRange}))});
+  }
+  return {observations,summary};
+}
+function pressureAxis(rows, vector, field, activeMax) {
+  const chats=new Map(),lex=(a,b)=>a<b?-1:a>b?1:0;
+  for(const row of rows) {
+    if(row.outcome!=='max' || !(pressureNumber(row.canonical?.[field])>0))continue;
+    const group=chats.get(row.conversationId) || [];group.push(row);chats.set(row.conversationId,group);
+  }
+  const contributions=[];
+  for(const [conversationId,group]of [...chats].sort((a,b)=>lex(a[0],b[0]))) {
+    // One upper contribution per independent chat, using only this axis's valid
+    // canonical values. Pre-MAX wins over fallback; supporting postMax is unused.
+    const pre=group.filter(r=>r.canonical.snapshotRole==='pre-dispatch');
+    const selected=(pre.length?pre:group).slice().sort((a,b)=>b.canonical[field]-a.canonical[field] ||
+      pressureOrder(a,b) || lex(JSON.stringify([pressureEffort(a.effort),a.canonical]),JSON.stringify([pressureEffort(b.effort),b.canonical])))[0];
+    contributions.push({conversationId,value:selected.canonical[field],eventId:selected.eventId,
+      canonicalEffort:pressureEffort(selected.effort),snapshotRole:selected.canonical.snapshotRole,
+      sourceFamily:selected.canonical.sourceFamily,fullCapturedAt:selected.canonical.fullCapturedAt});
+  }
+  const values=contributions.map(c=>c.value),n=values.length,anchor=n?Math.max(...values):null;
+  const currentValue=pressureNumber(vector?.[field]),ratio=anchor && currentValue!=null?currentValue/anchor:null;
+  return {field,anchor,ratio,independentMaxCount:n,observedMaxRange:n?{min:Math.min(...values),max:anchor}:null,
+    currentValue,exceededWhileAlive:!activeMax && ratio!=null && ratio>=1,
+    anchorRule:'maximum of per-conversation maximum positive canonical axis values; prefer pre-MAX over fallback',
+    confidence:'low',contributions:contributions.slice(0,16),contributionsOmittedCount:Math.max(0,n-16),
+    fallbackContributionCount:contributions.filter(c=>c.snapshotRole!=='pre-dispatch').length,
+    sourceFamilyMismatch:contributions.some(c=>c.sourceFamily!==vector?.sourceFamily)};
+}
+function pressureSeed(model, effort) {
+  const selected=ANONYMOUS_PRESSURE_SEEDS.find(s=>s.model===model && s.canonicalEffort===effort);
+  if(!selected)return null;
+  const text=selected.profiles.map(p=>p.displayLikeTokens),state=selected.profiles.map(p=>p.activeBranchBytes);
+  return {version:selected.seedVersion,model:selected.model,canonicalEffort:selected.canonicalEffort,
+    profileCount:selected.profiles.length,textFrontier:Math.max(...text),stateFrontier:Math.max(...state),
+    textRange:{min:Math.min(...text),max:Math.max(...text)},stateRange:{min:Math.min(...state),max:Math.max(...state)}};
+}
+function pressureSeedAxis(local, seed, activeMax) {
+  const text=local.field==='displayLikeTokens',seedAnchor=seed?(text?seed.textFrontier:seed.stateFrontier):null;
+  const seedRange=seed?(text?seed.textRange:seed.stateRange):null,localAnchor=local.anchor;
+  const anchor=seedAnchor && localAnchor?Math.max(seedAnchor,localAnchor):seedAnchor || localAnchor;
+  // Seed wins an exact tie; local can extend but never shrink a bundled frontier.
+  const frontierSource=anchor==null?null:seedAnchor && seedAnchor>= (localAnchor || 0)?'seed':'local';
+  const ratio=anchor && local.currentValue!=null?local.currentValue/anchor:null;
+  const ranges=[local.observedMaxRange,seedRange].filter(Boolean);
+  return {...local,anchor,ratio,exceededWhileAlive:!activeMax && ratio!=null && ratio>=1,
+    localAnchor,seedAnchor,frontierSource,seedMaxProfileCount:seed?.profileCount || 0,
+    localObservedMaxRange:local.observedMaxRange,seedObservedMaxRange:seedRange,
+    observedMaxRange:ranges.length?{min:Math.min(...ranges.map(r=>r.min)),max:anchor}:null,
+    anchorRule:seed?'max(anonymous seed upper frontier, independent local upper frontier); local may extend only':local.anchorRule};
+}
+function pressureCompute(samples, current, activeMax = false) {
+  const vector=current?.canonical,model=pressureLabel(current?.model),effort=pressureEffort(current?.effort);
+  const same=samples.filter(s=>pressureLabel(s.model)===model && s.canonical?.displayLikeTokens>0);
+  const exact=effort ? same.filter(s=>pressureEffort(s.effort)===effort) : [];
+  const maxCount=rows=>pressureEffectiveMax(rows).observations.length;
+  // Preserve independent-conversation tier sufficiency and canonical effort.
+  const useExact=effort && (maxCount(exact)>=2 || maxCount(same)<2 && maxCount(exact)>0);
+  const rows=useExact?exact:same,tier=!model || !maxCount(rows)?'insufficient':useExact?'exact-model-effort':'same-model';
+  const rawMaxima=rows.filter(s=>s.outcome==='max'),successes=rows.filter(s=>s.outcome==='success');
+  const effective=pressureEffectiveMax(rows),maxima=effective.observations,n=maxima.length;
+  const successConversations=new Set(successes.map(s=>s.conversationId));
+  // Built-in anonymous reference is selected independently from local tiering.
+  // It is never an event row, a local conversation, or a persistent sample.
+  const seed=pressureSeed(model,effort);
+  const localTextAxis=pressureAxis(rows,vector,'displayLikeTokens',activeMax);
+  const localStateAxis=pressureAxis(rows,vector,'activeBranchBytes',activeMax);
+  const textAxis=pressureSeedAxis(localTextAxis,seed,activeMax);
+  const stateAxis=pressureSeedAxis(localStateAxis,seed,activeMax);
+  const calibrationSource=seed?(n?'seed+local':'seed-only'):
+    localTextAxis.anchor && localStateAxis.anchor?'local-only':'calibrating';
+  const reason=!vector?'No valid current parser vector':!model?'Current model unknown':
+    !textAxis.anchor || !stateAxis.anchor?'No comparable empirical MAX anchor for both axes':
+    textAxis.ratio==null || stateAxis.ratio==null?'Current axis value missing or invalid':null;
+  // Do not silently score a partial model when one primary axis is unknown.
+  const ratio=reason?null:Math.max(textAxis.ratio,stateAxis.ratio);
+  const dominantAxis=ratio==null?null:textAxis.ratio===stateAxis.ratio?'tie':textAxis.ratio>stateAxis.ratio?'text':'state';
+  const score=activeMax || reason?null:Math.max(0,Math.min(99,Math.round(ratio*100)));
+  const confidence='low',confidenceReason='Provisional heterogeneous dual-axis MAX frontier; V2.24.2 confidence held LOW; anonymous seed never increases local confidence';
+  const anchor=textAxis.anchor,range=textAxis.observedMaxRange,spread=anchor?(range.max-range.min)/anchor:null;
+  const contradictory=successes.filter(s=>textAxis.anchor && s.canonical.displayLikeTokens>=textAxis.anchor ||
+    stateAxis.anchor && pressureNumber(s.canonical.activeBranchBytes)!=null && s.canonical.activeBranchBytes>=stateAxis.anchor);
+  const contradictorySuccessCount=contradictory.length,effectiveContradictorySuccessConversationCount=new Set(contradictory.map(s=>s.conversationId)).size;
+  const currentExceedsAnchorWhileAlive=textAxis.exceededWhileAlive || stateAxis.exceededWhileAlive;
+  const secondary={};
+  // Retain the old activeBranchBytes comparison for diagnostics compatibility;
+  // it is now explicitly scored by stateAxis. All other fields are unweighted.
+  for(const field of PRESSURE_FIELDS.filter(k=>k!=='displayLikeTokens')) {
+    const xs=maxima.map(s=>s.canonical[field]).filter(x=>pressureNumber(x)!=null);
+    secondary[field]={current:vector?.[field]??null,min:xs.length?Math.min(...xs):null,max:xs.length?Math.max(...xs):null};
+  }
+  return {modelVersion:'v2242-seeded-dual-frontier-1',state:activeMax?'current-max':reason?'calibrating':'scored',
+    score,confidence,confidenceReason,textAxis,stateAxis,calibrationSource,
+    seedVersion:seed?.version || null,seedProfileCount:seed?.profileCount || 0,seedMaxProfileCount:seed?.profileCount || 0,
+    seedModel:seed?.model || null,seedCanonicalEffort:seed?.canonicalEffort || null,
+    seedTextFrontier:seed?.textFrontier || null,seedStateFrontier:seed?.stateFrontier || null,
+    localIndependentMaxConversationCount:n,localTextFrontier:localTextAxis.anchor,localStateFrontier:localStateAxis.anchor,
+    effectiveTextFrontier:textAxis.anchor,effectiveStateFrontier:stateAxis.anchor,
+    effectiveTextFrontierSource:textAxis.frontierSource,effectiveStateFrontierSource:stateAxis.frontierSource,
+    combined:{dominantAxis,ratio,score,reason:activeMax?'Verified current MAX overrides numeric pressure':reason ||
+      'Maximum of text and serialized-state ratios; rounded whole score clamped to 0..99'},
+    currentSourceVector:vector || null,currentDisplayLikeTokens:vector?.displayLikeTokens??null,
+    model:model || null,effort:effort || null,canonicalEffort:effort || null,comparisonTier:tier,
+    comparableMaxCount:n,comparableSuccessCount:successConversations.size,
+    rawComparableMaxEpisodeCount:rawMaxima.length,effectiveMaxObservationCount:n,uniqueMaxConversationCount:n,
+    rawComparableSuccessCount:successes.length,effectiveSuccessObservationCount:successConversations.size,uniqueSuccessConversationCount:successConversations.size,
+    anchorContributionSummary:effective.summary.slice(0,16),anchorContributionSummaryOmittedCount:Math.max(0,effective.summary.length-16),
+    anchorContributionSummaryRole:'Legacy low-side representatives for provenance diagnostics only; axis contributions determine capacity',
+    empiricalMaxAnchor:anchor,anchorRange:range,anchorSpread:spread,anchorRule:textAxis.anchorRule,
+    ratioBeforeClamping:ratio,secondaryMetricComparison:secondary,currentExceedsAnchorWhileAlive,
+    contradictorySuccessCount,rawContradictorySuccessCount:contradictorySuccessCount,effectiveContradictorySuccessConversationCount,
+    postMaxFallbackPresent:!!(textAxis.fallbackContributionCount || stateAxis.fallbackContributionCount),
+    sourceFamilyMismatch:textAxis.sourceFamilyMismatch || stateAxis.sourceFamilyMismatch,unscoredReason:activeMax?null:reason};
+}
+function pressureResult(id) {
+  const current=pressureCurrent(id),active=!!eventActiveEpisode(id),key=JSON.stringify([pressureRevision,current,active]);
+  const cached=pressureResults.get(id);if(cached?.key===key)return cached.result;
+  const result=pressureCompute(pressureLoad().samples,current,active);
+  if(pressureResults.size>=16)pressureResults.delete(pressureResults.keys().next().value);
+  pressureResults.set(id,{key,result});return result;
+}
+function pressureSummary() {
+  const store=pressureLoad(),rows=store.samples,groups=Object.create(null);
+  for(const row of rows){const key=JSON.stringify([pressureLabel(row.model),pressureEffort(row.effort)]);const g=groups[key] ||= {success:0,max:0};g[row.outcome]++;}
+  return {schemaVersion:1,totalSamples:rows.length,totalVectors:rows.reduce((n,s)=>n+!!s.canonical+!!s.postMax,0),
+    successSamples:rows.filter(s=>s.outcome==='success').length,uniqueMaxEvents:rows.filter(s=>s.outcome==='max').length,
+    pendingMaxVectors:rows.filter(s=>s.outcome==='max' && !s.canonical).length,groupedByModelEffort:groups,
+    oldestTimestamp:rows[0]?.timestamp??null,newestTimestamp:rows.at(-1)?.timestamp??null,
+    retentionCap:PRESSURE_CAP,retentionCount:store.retentionCount,watermark:store.watermark,
+    dedupPolicy:'conversation + outcome + event ID; stable first evidence, fallback/source promotion only',
+    migration:store.migration,writeBlocked:pressureWriteBlocked,lastError:store.lastError};
+}
+function pressureText(result) {
+  return result.state==='current-max'?'PRESSURE MAX':result.state==='calibrating'?'PRESSURE — / 100 · CALIBRATING':
+    `PRESSURE ${result.score} / 100 · ${result.confidence.toUpperCase()}`;
+}
+
+// Schema 1 is an allowlisted anonymous metric projection, never a diagnostic dump.
+const ANONYMOUS_SAMPLE_METRICS = Object.freeze(['displayLikeTokens','activeBranchBytes','mappingBytes',
+  'retainedBytes','toolResultBytes','branchNodes','messageNodes','retainedShare','hot128','hot256','strongContextMarkers']);
+const ANONYMOUS_SAMPLE_HEADERS = Object.freeze(['schemaVersion','candidateVersion','model','canonicalEffort',
+  'outcome','snapshotRole','sourceFamily','verifiedCurrentMax','pressureState']);
+function anonymousPrivacyValid(value) {
+  // Inspect nested objects/arrays iteratively. Cycles, accessors, unusual values
+  // and excessive structure fail closed instead of being serialized accidentally.
+  const pending=[{value,depth:0}],seen=new Set();let count=0;
+  try {
+    while(pending.length) {
+      const item=pending.pop(),x=item.value;if(++count>1024 || item.depth>32)return false;
+      if(x==null || typeof x==='boolean')continue;
+      if(typeof x==='number'){if(!Number.isFinite(x))return false;continue;}
+      if(typeof x==='string'){
+        if(x.length>160 || /(?:https?:\/\/|www\.|[a-z]+:\/\/|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\d{4}-\d{2}-\d{2}T\d{2}:)/i.test(x))return false;
+        continue;
+      }
+      if(typeof x!=='object' || seen.has(x) || !['[object Object]','[object Array]'].includes(Object.prototype.toString.call(x)))return false;
+      seen.add(x);
+      for(const key of Reflect.ownKeys(x)) {
+        if(typeof key!=='string')return false;
+        const normalized=key.replace(/[^a-z0-9]/gi,'').toLowerCase();
+        if(/(?:conversationid|messageid|attemptid|episodeid|accountid|userid|assetid|timestamp|prompt|response|screenshot|filename|rawmapping|rawdiagnostic)/.test(normalized) ||
+          /(?:id|ids|url|urls|uri|uris|href|title|mapping|mappings|diagnostics|diagnosticblobs|rawbody|content|text)$/.test(normalized) ||
+          /(?:started|ended|created|updated|confirmed|completed|observed|captured)at$/.test(normalized) ||
+          ['time','date','capturedat','fullcapturedat','firstseenat','lastseenat','requestdetectedat','outcomeconfirmedat','rawdiagnosticblob','rawdiagnosticblobs','account','user','asset','file'].includes(normalized))return false;
+        const descriptor=Object.getOwnPropertyDescriptor(x,key);
+        if(!descriptor || descriptor.get || descriptor.set)return false;
+        pending.push({value:descriptor.value,depth:item.depth+1});
+      }
+    }
+    return true;
+  }catch{return false;}
+}
+function anonymousSampleValid(sample) {
+  if(!sample || Array.isArray(sample) || !anonymousPrivacyValid(sample))return false;
+  const allowed=[...ANONYMOUS_SAMPLE_HEADERS,...ANONYMOUS_SAMPLE_METRICS];
+  if(Object.keys(sample).some(k=>!allowed.includes(k)) || ANONYMOUS_SAMPLE_HEADERS.some(k=>!Object.hasOwn(sample,k)))return false;
+  if(sample.schemaVersion!==1 || !/^\d+\.\d+\.\d+$/.test(sample.candidateVersion) || typeof sample.candidateVersion!=='string' ||
+    typeof sample.model!=='string' || !/^[a-z][a-z0-9._-]{0,119}$/i.test(sample.model) ||
+    typeof sample.canonicalEffort!=='string' || !/^[a-z][a-z0-9 ._-]{0,39}$/.test(sample.canonicalEffort) ||
+    sample.canonicalEffort!==sample.canonicalEffort.trim().replace(/\s+/g,' ') || sample.canonicalEffort==='extra high' ||
+    !['direct','batch'].includes(sample.sourceFamily) || !['scored','calibrating','current-max'].includes(sample.pressureState))return false;
+  const max=sample.outcome==='max',success=sample.outcome==='success';
+  if(!max && !success || sample.verifiedCurrentMax!==max || max && sample.pressureState!=='current-max' || success && sample.pressureState==='current-max' ||
+    !(max?['pre-max','fallback','current-max']:['success-pre','current']).includes(sample.snapshotRole))return false;
+  for(const field of ANONYMOUS_SAMPLE_METRICS) {
+    const x=sample[field];
+    if(x==null){if(['displayLikeTokens','activeBranchBytes','mappingBytes','branchNodes'].includes(field))return false;continue;}
+    if(typeof x!=='number' || !Number.isFinite(x) || x<0)return false;
+  }
+  return sample.displayLikeTokens>0 && sample.activeBranchBytes>0 && sample.mappingBytes>0 && sample.branchNodes>0;
+}
+function anonymousProjectSample(identity, vector) {
+  if(!vector)return null;
+  const sample={schemaVersion:1,candidateVersion:'2.24.3',model:identity.model,canonicalEffort:identity.effort,
+    outcome:identity.outcome,snapshotRole:identity.role,sourceFamily:vector.sourceFamily,
+    ...Object.fromEntries(ANONYMOUS_SAMPLE_METRICS.map(k=>[k,typeof vector[k]==='number' && Number.isFinite(vector[k]) && vector[k]>=0?vector[k]:null])),
+    verifiedCurrentMax:identity.outcome==='max',pressureState:identity.pressureState};
+  return anonymousSampleValid(sample)?sample:null;
+}
+
+function anonymousReadState(id, namespace, cache) {
+  const cached=cache?.get(id);if(cached)return cached;
+  try {
+    const text=localStorage.getItem(`${P}:${namespace}${namespace==='pressure-calibration-v224'?'':':'+id}`);
+    return text && text.length<=1500000?eventStorageParse(text):null;
+  }catch{return null;}
+}
+function anonymousSampleForChat(id = chatIdFromURL()) {
+  // Read caches or persisted bytes directly, without normal load/restart paths:
+  // export cannot finalize an attempt, migrate, persist, or admit calibration.
+  if(!id || id!==chatIdFromURL())return null;
+  const attempts=anonymousReadState(id,'attempts-v223',attemptCache),episodes=anonymousReadState(id,'max-episodes-v223',episodeCache);
+  const life=anonymousReadState(id,'lifecycle-v216',lifecycleCache),snapshot=anonymousReadState(id,'snapshot',snapshotCache);
+  const local=pressureStore || anonymousReadState(id,'pressure-calibration-v224');
+  const samples=local?.schemaVersion===1 && Array.isArray(local.samples) && local.samples.length<=PRESSURE_CAP?
+    local.samples.map(s=>pressureCleanRow(s,true)).filter(Boolean):[];
+  const latestAttempt=attempts?.current || attempts?.last;
+  const model=pressureLabel(attempts?.current?.requestModel) || pressureLabel(snapshot?.structure?.contextTopology?.currentModel) || pressureLabel(latestAttempt?.requestModel);
+  const effort=pressureEffort(attemptEffortHint()) || (model===latestAttempt?.requestModel?pressureEffort(latestAttempt?.requestEffort):null);
+  if(!model || !effort)return null;
+  const rows=[attempts?.current,attempts?.last,...(Array.isArray(attempts?.attempts)?attempts.attempts:[])].filter(Boolean);
+  const matching=a=>a.conversationId===id && a.trigger==='network-generation-dispatch' && pressureLabel(a.requestModel)===model && pressureEffort(a.requestEffort)===effort;
+  const sourceVectors=(role,stableOnly=false)=>['batch','direct'].flatMap(f=>{
+    const family=life?.families?.[f];return (stableOnly?[family?.lastStable]:[family?.lastObservation,family?.lastStable,family?.lastInflight]).map(v=>pressureVector(v,role));
+  }).filter(Boolean).sort((a,b)=>b.fullCapturedAt-a.fullCapturedAt || Number(b.sourceFamily==='batch')-Number(a.sourceFamily==='batch'));
+  const current=sourceVectors('current')[0] || null;
+  const episode=Array.isArray(episodes?.episodes)?episodes.episodes.find(e=>e.id===episodes.activeId && e.active===true && e.conversationId===id && pressureNumber(e.firstSeenAt)>0 &&
+    Number.isSafeInteger(e.id) && e.id>0 && ['UI MAX banner','structured SSE error','HTTP generation error','blocked before dispatch'].includes(e.confirmationSource)):null;
+  let vector=null,role=null,outcome=null;
+  if(episode) {
+    const related=rows.find(a=>a.id===episode.relatedRealAttemptId);
+    if(related && !matching(related))return null;
+    const linked=related;
+    const compact=samples.filter(s=>s.conversationId===id && s.eventId===episode.id && s.outcome==='max' && s.model===model && pressureEffort(s.effort)===effort);
+    const pre=pressureBest([
+      ...compact.filter(s=>s.canonical.snapshotRole==='pre-dispatch').map(s=>pressureVector(s.canonical,'pre-dispatch',episode.firstSeenAt)),
+      ...['batch','direct'].map(f=>pressureVector(linked?.pre?.[f],'pre-dispatch',linked?.requestDetectedAt || linked?.startedAt || 0))
+    ]);
+    const fallback=pressureBest([
+      ...compact.filter(s=>s.canonical.snapshotRole==='fresh-post-max-fallback').map(s=>pressureVector(s.canonical,'fresh-post-max-fallback',Infinity,episode.firstSeenAt)),
+      ...['batch','direct'].map(f=>pressureVector(episode[f],'fresh-post-max-fallback',Infinity,episode.firstSeenAt))
+    ]);
+    vector=pre || fallback || sourceVectors('current-max').find(v=>v.fullCapturedAt>=episode.firstSeenAt) || null;
+    role=pre?'pre-max':fallback?'fallback':'current-max';outcome='max';
+  }else {
+    if(visibleHardMax() || attempts?.current && !attempts.current.outcome)return null;
+    const success=rows.filter(a=>a.conversationId===id && a.trigger==='network-generation-dispatch')
+      .sort((a,b)=>b.id-a.id)[0];
+    if(!success || !matching(success) || success.outcome!=='success' || !success.outcomeConfirmedBy || !(pressureNumber(success.outcomeConfirmedAt)>0))return null;
+    const pre=pressureBest(['batch','direct'].map(f=>pressureVector(success.pre?.[f],'pre-dispatch',success.requestDetectedAt || success.startedAt || 0)));
+    const stable=sourceVectors('current',true).find(v=>v.fullCapturedAt>=success.outcomeConfirmedAt);
+    vector=stable || pre;role=stable?'current':'success-pre';outcome='success';
+  }
+  const pressure=pressureCompute(samples,{model,effort,canonical:current},!!episode);
+  return anonymousProjectSample({model,effort,outcome,role,pressureState:pressure.state},vector);
+}
+async function copyAnonymousSample() {
+  const id=chatIdFromURL(),sample=anonymousSampleForChat(id);
+  if(!sample || !anonymousSampleValid(sample) || !anonymousPrivacyValid(sample))return false;
+  const text=JSON.stringify(sample,null,2);
+  if(text.length>4096 || chatIdFromURL()!==id)return false;
+  try {await navigator.clipboard.writeText(text);return true;}catch{return false;}
+}
+async function runAnonymousCopy() {
+  const state=quickActionState.anon;if(state.running)return false;
+  const serial=++quickActionState.serial,token=++state.token;
+  state.running=true;state.label='Copying…';quickActionState.last='Copying anonymous sample…';quickActionState.type='busy';paintQuickActions();
+  let ok=false;try{ok=await copyAnonymousSample();}catch{}
+  state.running=false;state.label=ok?'Copied ✓':'No safe sample ✕';
+  if(quickActionState.serial===serial){quickActionState.last=ok?'Anonymous sample copied ✓':'Anonymous copy unavailable or failed ✕';quickActionState.type=ok?'ok':'error';}
+  paintQuickActions();setTimeout(()=>{if(state.token!==token || state.running)return;state.label='Copy anon sample';paintQuickActions();},2200);
+  return ok;
+}
+
+function eventStorageError(id, error) {
+  const health = storageHealth.get(id) || {lastSaveSuccessful:null,serializedBytes:null};
+  health.lastError = redactDiagnosticText(error?.message || String(error)).slice(0,300);
+  health.lastSaveSuccessful = false;
+  storageHealth.set(id,health);
+}
+
+// Lossless storage codec: intern field names and repeated nested observations.
+// Logical in-memory/exported schemas stay unchanged; old plain JSON still loads.
+function eventStorageText(data, alwaysPack = false) {
+  const plain = JSON.stringify(data), keys = [], keyMap = new Map(), values = [], seen = new Map();
+  function encode(value) {
+    if (!value || typeof value !== 'object') return value;
+    const signature = JSON.stringify(value);
+    if (signature.length >= 160 && seen.has(signature)) return [2,seen.get(signature)];
+    let node;
+    if (Array.isArray(value)) node = [1,...value.map(encode)];
+    else {
+      node = [0];
+      for (const [key,item] of Object.entries(value)) {
+        if (item === undefined) continue;
+        if (!keyMap.has(key)) { keyMap.set(key,keys.length); keys.push(key); }
+        node.push(keyMap.get(key),encode(item));
+      }
+    }
+    if (signature.length >= 160) {
+      const index = values.length; values.push(node); seen.set(signature,index);
+      return [2,index];
+    }
+    return node;
+  }
+  const root = encode(data);
+  const packed = JSON.stringify({encoding:'v223-key-table-1',keys,values,root});
+  return alwaysPack || packed.length < plain.length ? packed : plain;
+}
+
+// A second, lossless compression tier is reserved for quota pressure. No attempt,
+// episode, source metric or trace row is removed to make the retry fit.
+function eventStorageRetryText(text) {
+  const bytes = new TextEncoder().encode(text), dict = new Map(), codes = [];
+  let next = 256, word = '';
+  for (const byte of bytes) {
+    const char = String.fromCharCode(byte), joined = word+char;
+    if (word === '' || dict.has(joined)) { word = joined; continue; }
+    codes.push(word.length === 1 ? word.charCodeAt(0) : dict.get(word));
+    if (next < 65536) dict.set(joined,next++);
+    word = char;
+  }
+  if (word) codes.push(word.length === 1 ? word.charCodeAt(0) : dict.get(word));
+  let binary = '';
+  for (const code of codes) binary += String.fromCharCode(code >> 8,code & 255);
+  const compressed = JSON.stringify({encoding:'v223-lzw-1',savedAt:JSON.parse(text)?.savedAt || null,data:btoa(binary)});
+  return compressed.length < text.length ? compressed : text;
+}
+
+function eventStorageParse(text) {
+  let data = JSON.parse(text);
+  if (data?.encoding === 'v223-lzw-1') {
+    const binary = atob(data.data), dict = [], output = [];
+    let next = 256, previous = '';
+    for (let i=0;i<256;i++) dict[i] = String.fromCharCode(i);
+    for (let i=0;i<binary.length;i+=2) {
+      const code = (binary.charCodeAt(i)<<8) | binary.charCodeAt(i+1);
+      const word = dict[code] ?? (code === next && previous ? previous+previous[0] : null);
+      if (word == null) throw new Error('Invalid compact storage code');
+      output.push(word);
+      if (previous && next < 65536) dict[next++] = previous+word[0];
+      previous = word;
+    }
+    const bytes = Uint8Array.from(output.join(''),c=>c.charCodeAt(0));
+    data = JSON.parse(new TextDecoder().decode(bytes));
+  }
+  if (data?.encoding !== 'v223-key-table-1') return data;
+  function decode(node) {
+    if (!Array.isArray(node)) return node;
+    if (node[0] === 2) return decode(data.values[node[1]]);
+    if (node[0] === 1) return node.slice(1).map(decode);
+    const object = {};
+    for (let i=1;i<node.length;i+=2) object[data.keys[node[i]]] = decode(node[i+1]);
+    return object;
+  }
+  return decode(data.root);
+}
+
+function eventStorageSavedText(data) {
+  // Timestamp the write envelope, not the research observations it contains.
+  const packed = JSON.parse(eventStorageText(data,true));
+  packed.savedAt = Date.now();
+  return JSON.stringify(packed);
+}
+
+function meterStorageInventory() {
+  const entries = [], seen = new Set(), namespaces = Object.create(null);
+  let bytes = 0, utf16Bytes = 0;
+  // Enumerate names across the origin, but read values only after exact ownership.
+  for (let i=0;i<localStorage.length;i++) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(`${P}:`) || seen.has(key)) continue;
+    seen.add(key);
+    const value = localStorage.getItem(key);
+    if (value == null) continue;
+    const size = new TextEncoder().encode(key).length + new TextEncoder().encode(value).length;
+    const namespace = key.slice(P.length+1).split(':')[0];
+    const row = namespaces[namespace] ||= {keys:0,bytes:0}; row.keys++; row.bytes += size;
+    entries.push({key,value,bytes:size}); bytes += size; utf16Bytes += 2*(key.length+value.length);
+  }
+  Object.assign(meterStorageTotals,{meterOwnedKeyCount:entries.length,meterOwnedBytes:bytes,
+    meterOwnedUtf16Bytes:utf16Bytes,meterOwnedNamespaces:namespaces,lastAuditAt:Date.now(),auditError:null});
+  return entries;
+}
+
+function eventStorageHealth(id, force = false) {
+  if (force || meterStorageTotals.lastAuditAt == null || Date.now()-meterStorageTotals.lastAuditAt >= 5000) {
+    try { meterStorageInventory(); }
+    catch (error) { meterStorageTotals.auditError = redactDiagnosticText(error?.message || String(error)).slice(0,300); }
+  }
+  const health = storageHealth.get(id) || {lastSaveSuccessful:null};
+  Object.assign(health,meterStorageTotals);
+  storageHealth.set(id,health);
+  return health;
+}
+
+function meterStorageActivity(value) {
+  let raw;
+  try {
+    raw = JSON.parse(value);
+    // New envelopes carry last-write time without interpreting source metrics.
+    if (Number.isFinite(raw?.savedAt) && raw.savedAt > 0) return raw.savedAt;
+    raw = eventStorageParse(value);
+  } catch { return null; }
+  const stack = [raw], dates = /^(?:time|capturedAt|fullCapturedAt|startedAt|sendIntentAt|dispatchAt|firstSeenAt|lastSeenAt|finalizedAt|outcomeConfirmedAt|telemetryFinalizedAt|responseObservedAt|responseCompletedAt|lastSavedAt)$/;
+  let newest = null, visited = 0;
+  while (stack.length && visited++ < 10000) {
+    const item = stack.pop();
+    if (!item || typeof item !== 'object') continue;
+    for (const [name,child] of Object.entries(item)) {
+      if (dates.test(name) && typeof child === 'number' && Number.isFinite(child) && child > 0) newest = Math.max(newest || 0,child);
+      else if (child && typeof child === 'object') stack.push(child);
+    }
+  }
+  return stack.length ? null : newest; // Unknown/incompletely examined dates fail closed.
+}
+
+function meterV223NeedsSources(data, episodes = false) {
+  if (!data || typeof data !== 'object') return true;
+  if (episodes) return !Array.isArray(data.episodes) || data.activeId != null || data.episodes.some(e=>e.active);
+  if (data.version !== 3 || !Array.isArray(data.attempts)) return true;
+  return !!data.current || !!data.pendingPreflight || data.attempts.some(a=>!a.telemetryFinalizedAt) ||
+    (data.sendIntents || []).some(i=>!i.dispatchAt && Date.now()-i.sendIntentAt <= 5000);
+}
+
+function meterStorageChatActive(id) {
+  const attempt = attemptCache.get(id), episodes = episodeCache.get(id);
+  if (attempt && meterV223NeedsSources(attempt)) return true;
+  if (episodes && meterV223NeedsSources(episodes,true)) return true;
+  for (const [key,isEpisode] of [[attemptKey(id),false],[`${P}:max-episodes-v223:${id}`,true]]) {
+    const text = localStorage.getItem(key);
+    if (text == null) continue;
+    try { if (meterV223NeedsSources(eventStorageParse(text),isEpisode)) return true; }
+    catch { return true; } // Unknown V2.23 ownership protects dependent caches.
+  }
+  return false;
+}
+
+function meterStorageCleanup(id, writeKey, recoveryPass = false) {
+  const now = Date.now();
+  if (!(recoveryPass && storageRecoveryRunning) && meterStorageTotals.cleanupAt != null && now-meterStorageTotals.cleanupAt < 30000) return 0;
+  Object.assign(meterStorageTotals,{cleanupAt:now,cleanupBytesReclaimed:0,cleanupRemovedKeyCount:0,
+    cleanupByNamespace:{},cleanupNamespaceTotals:{},cleanupEntries:[],cleanupError:null,
+    cleanupEligibleKeyCount:null,cleanupEligibleBytes:null,
+    cleanupPolicy:'quota only; superseded v218-v222 attempts then unreferenced non-current source caches; max 12 keys/pass, 4 recovery passes; 512 KiB target/pass'});
+  try {
+    const entries = meterStorageInventory(), groups = new Map(), candidates = [];
+    const protectedChats = new Set([id,chatIdFromURL()]);
+    for (const entry of entries) {
+      const match = /^(attempts-v(?:218|219|220|221|222)|snapshot|diag|lifecycle-v(?:21[6-9]|22[0-2])|attempts-v223|max-episodes-v223):([^:]+)$/.exec(entry.key.slice(P.length+1));
+      if (!match) continue;
+      const [namespace,chat] = match.slice(1);
+      entry.namespace = namespace; entry.chat = chat;
+      const group = groups.get(chat) || []; group.push(entry); groups.set(chat,group);
+      if (entry.key === writeKey) continue;
+      const obsolete = /^attempts-v(?:218|219|220|221|222)$/.test(namespace);
+      if (!obsolete && (!/^(snapshot|diag|lifecycle-v)/.test(namespace) || protectedChats.has(chat) || meterStorageChatActive(chat))) continue;
+      const activity = meterStorageActivity(entry.value);
+      // Superseded histories are explicitly reclaimable regardless of age/format.
+      // Rebuildable caches still fail closed on unrecognized/future timestamps.
+      if (!obsolete && (activity == null || activity > now)) continue;
+      candidates.push({...entry,activity,priority:obsolete ? 0 : 1,
+        reason:obsolete ? 'superseded attempt history' : 'unreferenced source cache'});
+    }
+    candidates.sort((a,b)=>a.priority-b.priority || Number(protectedChats.has(a.chat))-Number(protectedChats.has(b.chat)) ||
+      (a.activity ?? Infinity)-(b.activity ?? Infinity) || a.bytes-b.bytes || a.key.localeCompare(b.key));
+    meterStorageTotals.cleanupEligibleKeyCount = candidates.length;
+    meterStorageTotals.cleanupEligibleBytes = candidates.reduce((n,e)=>n+e.bytes,0);
+    const checked = new Set(), skipped = new Set();
+    for (const entry of candidates) {
+      if (meterStorageTotals.cleanupRemovedKeyCount >= 12 || meterStorageTotals.cleanupBytesReclaimed >= 512*1024) break;
+      if (!checked.has(entry.chat)) {
+        checked.add(entry.chat);
+        if (groups.get(entry.chat).some(e=>localStorage.getItem(e.key) !== e.value)) skipped.add(entry.chat);
+      }
+      if (skipped.has(entry.chat) || localStorage.getItem(entry.key) !== entry.value) continue;
+      if (entry.priority === 1 && meterStorageChatActive(entry.chat)) continue;
+      localStorage.removeItem(entry.key);
+      if (localStorage.getItem(entry.key) != null) continue;
+      const utf16Bytes = 2*(entry.key.length+entry.value.length);
+      meterStorageTotals.cleanupBytesReclaimed += entry.bytes;
+      meterStorageTotals.bytesReclaimed += entry.bytes;
+      meterStorageTotals.cleanupRemovedKeyCount++;
+      meterStorageTotals.cleanupByNamespace[entry.namespace] = (meterStorageTotals.cleanupByNamespace[entry.namespace] || 0)+1;
+      for (const table of [meterStorageTotals.cleanupNamespaceTotals,meterStorageTotals.reclaimedNamespaceTotals ||= {}]) {
+        const row = table[entry.namespace] ||= {keys:0,bytes:0,utf16Bytes:0};
+        row.keys++; row.bytes += entry.bytes; row.utf16Bytes += utf16Bytes;
+      }
+      meterStorageTotals.cleanupEntries.push({key:entry.key,namespace:entry.namespace,bytes:entry.bytes,utf16Bytes,reason:entry.reason});
+    }
+  } catch (error) { meterStorageTotals.cleanupError = redactDiagnosticText(error?.message || String(error)).slice(0,300); }
+  eventStorageHealth(id,true);
+  return meterStorageTotals.cleanupBytesReclaimed;
+}
+
+function eventIsQuotaError(error) {
+  return /quota/i.test(`${error?.name || ''} ${error?.message || ''}`) || error?.code === 22 || error?.code === 1014;
+}
+
+function meterRequiredState(id) {
+  const result = new Map([
+    [attemptKey(id),attemptCache.get(id) || storagePending.get(attemptKey(id))?.data || loadAttemptState(id)],
+    [snapshotKey(id),snapshotCache.get(id) || loadSnapshot(id)],
+    [lifecycleKey(id),lifecycleCache.get(id) || storagePending.get(lifecycleKey(id))?.data || loadLifecycle(id)],
+    [diagKey(id),diagnosticCache.get(id) || storagePending.get(diagKey(id))?.data || loadDiagnostic(id) || {}]
+  ]);
+  const key = `${P}:max-episodes-v223:${id}`;
+  const episodes = episodeCache.get(id);
+  if (episodes?.episodes.length || episodes?.activeId != null || localStorage.getItem(key) != null || storagePending.has(key)) result.set(key,episodes || eventEpisodes(id));
+  return result;
+}
+
+function meterStorageWrite(id, key, data) {
+  const health = storageHealth.get(id) || {};
+  storageHealth.set(id,health); storagePending.set(key,{id,data});
+  health.saveResultsByKey ||= {};
+  let text, quota = false;
+  function save(value, compact) {
+    const bytes = new TextEncoder().encode(value).length;
+    health.serializedBytesByKey = {...health.serializedBytesByKey,[key]:bytes};
+    health.serializedBytes = Object.values(health.serializedBytesByKey).reduce((a,b)=>a+b,0);
+    localStorage.setItem(key,value);
+    if (localStorage.getItem(key) !== value) throw new Error('Storage readback mismatch');
+    health.saveResultsByKey[key] = 'saved'; storagePending.delete(key);
+    health.lastSavedAt = Date.now();
+    if (compact) { health.compactRetryRecoveredAt = Date.now(); health.compactRetryBytes = bytes; }
+  }
+  try { text = eventStorageSavedText(data); save(text,false); }
+  catch (error) {
+    quota = eventIsQuotaError(error); eventStorageError(id,error);
+    health.failedSaveCount = (health.failedSaveCount || 0)+1; health.lastFailedSaveAt = Date.now();
+    health.saveResultsByKey[key] = 'failed';
+    if (text) {
+      try {
+        const compact = eventStorageRetryText(text);
+        if (compact.length < text.length) { health.compactRetryCount = (health.compactRetryCount || 0)+1; save(compact,true); }
+      } catch (error) { quota ||= eventIsQuotaError(error); eventStorageError(id,error); }
+    }
+  }
+  return {saved:health.saveResultsByKey[key] === 'saved',quota};
+}
+
+function meterStorageFinalResult(id, required) {
+  const health = storageHealth.get(id) || {};
+  health.requiredCurrentKeys = [...required.keys()];
+  health.unsavedKeyCount = health.requiredCurrentKeys.filter(key=>health.saveResultsByKey?.[key] !== 'saved' || localStorage.getItem(key) == null).length;
+  health.pendingWriteCount = [...storagePending.values()].filter(entry=>entry.id === id).length;
+  health.lastSaveSuccessful = health.unsavedKeyCount === 0 && health.pendingWriteCount === 0;
+  health.finalSaveResult = health.lastSaveSuccessful ? 'saved' : 'failed';
+  health.candidateVersion = '2.24.3';
+  storageHealth.set(id,health);
+  return health.lastSaveSuccessful;
+}
+
+function meterStorageRecover(id, quotaPressure) {
+  if (storageRecoveryRunning) return;
+  storageRecoveryRunning = true;
+  const targets = [...new Set([id,chatIdFromURL()].filter(Boolean))];
+  try {
+    const sets = new Map(targets.map(chat=>[chat,meterRequiredState(chat)]));
+    // Retry all required current keys, including keys that failed earlier.
+    function flush() {
+      let quota = false;
+      for (const [chat,required] of sets) {
+        for (const [key,data] of required) { const result = meterStorageWrite(chat,key,data); quota ||= !result.saved && result.quota; }
+        for (const [key,entry] of [...storagePending]) if (entry.id === chat && !required.has(key)) {
+          const result = meterStorageWrite(chat,key,entry.data); quota ||= !result.saved && result.quota;
+        }
+        meterStorageFinalResult(chat,required);
+      }
+      return quota;
+    }
+    quotaPressure = flush() || quotaPressure;
+    let passes = 0, reclaimed = 0;
+    const passResults = [], namespaceTotals = {};
+    while (quotaPressure && targets.some(chat=>storageHealth.get(chat).finalSaveResult !== 'saved') && passes < 4) {
+      const freed = meterStorageCleanup(id,null,passes > 0);
+      if (!freed) break;
+      passes++; reclaimed += freed;
+      const entries = meterStorageTotals.cleanupEntries.map(e=>({...e}));
+      passResults.push({pass:passes,keys:entries.length,bytes:freed,entries});
+      for (const e of entries) {
+        const row = namespaceTotals[e.namespace] ||= {keys:0,bytes:0,utf16Bytes:0};
+        row.keys++; row.bytes += e.bytes; row.utf16Bytes += e.utf16Bytes;
+      }
+      quotaPressure = flush();
+    }
+    for (const chat of targets) {
+      const health = storageHealth.get(chat);
+      health.recoveryPassCount = passes; health.recoveryBytesReclaimed = reclaimed;
+      health.recoveryPasses = passResults; health.recoveryNamespaceTotals = namespaceTotals;
+      if (reclaimed && health.lastSaveSuccessful) health.cleanupRetryRecoveredAt = Date.now();
+      eventStorageHealth(chat,true);
+    }
+  } catch (error) {
+    eventStorageError(id,error);
+    for (const chat of targets) {
+      const health = storageHealth.get(chat) || {};
+      health.lastSaveSuccessful = false; health.finalSaveResult = 'failed';
+      storageHealth.set(chat,health);
+    }
+  }
+  finally { storageRecoveryRunning = false; }
+}
+
+function eventSave(id, key, data) {
+  const result = meterStorageWrite(id,key,data);
+  if (storageRecoveryRunning) return;
+  const health = storageHealth.get(id);
+  const basic = [attemptKey(id),snapshotKey(id),lifecycleKey(id),diagKey(id)];
+  if (!result.saved || basic.some(key=>health.saveResultsByKey?.[key] !== 'saved' || localStorage.getItem(key) == null) || [...storagePending.values()].some(entry=>entry.id === id)) {
+    meterStorageRecover(id,!result.saved && result.quota);
+  } else meterStorageFinalResult(id,meterRequiredState(id));
+  eventStorageHealth(id);
+}
+
+function eventEpisodes(id) {
+  if (!id) return {nextId:1,episodes:[],activeId:null};
+  if (!episodeCache.has(id)) {
+    let data = null;
+    try { data = eventStorageParse(localStorage.getItem(`${P}:max-episodes-v223:${id}`)); }
+    catch (error) { eventStorageError(id,error); }
+    episodeCache.set(id,{nextId:1,episodes:[],activeId:null,...(data || {})});
+  }
+  return episodeCache.get(id);
+}
+
+function eventSaveEpisodes(id) {
+  const state = eventEpisodes(id);
+  state.episodes = state.episodes.slice(-10);
+  for (const e of state.episodes) e.captureHistory = e.captureHistory.slice(-30);
+  eventSave(id,`${P}:max-episodes-v223:${id}`,state);
+  pressureCollect(id);
+}
+
+function eventActiveEpisode(id) {
+  const state = eventEpisodes(id);
+  return state.episodes.find(e => e.id === state.activeId && e.active) || null;
+}
+
+function eventOpenEpisode(id, source, attemptId = null, detection = null) {
+  const state = eventEpisodes(id), now = Date.now();
+  let e = eventActiveEpisode(id);
+  if (!e) {
+    e = {id:state.nextId++,conversationId:id,firstSeenAt:now,lastSeenAt:now,active:true,
+      relatedRealAttemptId:attemptId,blockedBeforeDispatch:false,confirmationSource:source,
+      bannerDetection:detection,bannerEverVisible:!!detection,bannerClearedAt:null,
+      recoveryConfirmedLater:false,direct:null,batch:null,other:null,captureHistory:[]};
+    state.episodes.push(e); state.activeId = e.id;
+    scheduleBoundCapture({chatId:id,episodeId:e.id,reason:'new MAX episode'},250);
+  }
+  e.lastSeenAt = now;
+  if (detection) {
+    e.bannerDetection = detection; e.bannerEverVisible = true; e.lastBannerVisibleAt = now;
+    e.confirmationSource = 'UI MAX banner';
+  }
+  if (attemptId != null && e.relatedRealAttemptId == null) e.relatedRealAttemptId = attemptId;
+  eventSaveEpisodes(id);
+  return e;
+}
+
+function eventPollMax(id) {
+  if (id !== chatIdFromURL()) return;
+  const detection = detectMaxBanner(), e = eventActiveEpisode(id);
+  if (detection) {
+    if (pendingComposerEnter?.event.defaultPrevented && !pendingComposerEnter.bannerBefore) confirmComposerEnter('handled Enter followed by native MAX');
+    attemptMarkMax(id,'UI MAX banner');
+  } else if (e?.bannerEverVisible) {
+    e.active = false; e.bannerClearedAt = Date.now();
+    eventEpisodes(id).activeId = null;
+    eventSaveEpisodes(id);
+  }
+  // A transport-only episode stays active until UI clearance or explicit recovery.
+}
+
+function eventConfirmRecovery(id, a) {
+  if (id === chatIdFromURL() && visibleHardMax()) return;
+  const state = eventEpisodes(id);
+  const e = state.episodes.filter(x => x.firstSeenAt < a.startedAt).at(-1);
+  if (!e) return;
+  e.recoveryConfirmedLater = true; e.recoveryAttemptId = a.id; e.recoveryConfirmedAt = Date.now();
+  e.active = false;
+  if (state.activeId === e.id) state.activeId = null;
+  eventSaveEpisodes(id);
+}
+
+function detectMaxBanner() {
+  if (!document.body) return null;
+  const excluded = `[data-message-author-role], [data-testid^="conversation-turn"], article, #${P}`;
+  const selector = '[role="alert"], [role="status"], [data-testid*="toast"], [data-testid*="banner"], [data-testid*="error"], [class*="toast"], [class*="banner"], [class*="error"]';
+  for (const el of document.querySelectorAll(selector)) {
+    if (el.closest(excluded)) continue;
+    // Reject containers wrapping turns, too: an outer alert must not expose a quote.
+    if (el.querySelector('[data-message-author-role], [data-testid^="conversation-turn"], article')) continue;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || el.closest('[hidden], [aria-hidden="true"]')) continue;
+    const text = String(el.innerText || '').trim();
+    if (text.length > 1200) continue;
+    if (!/you(?:'|’)?ve reached the maximum length for this conversation|you have reached the maximum length for this conversation/i.test(text)) continue;
+    // Store only the known matched error phrase, not arbitrary surrounding content.
+    const matched = text.match(/you(?:'|’)?ve reached the maximum length for this conversation|you have reached the maximum length for this conversation/i)[0];
+    return {method:el.getAttribute('role') ? 'visible scoped alert/status' : 'visible scoped banner/error',
+      matchedText:matched,tag:el.tagName,role:el.getAttribute('role'),testid:el.getAttribute('data-testid')};
+  }
+  return null;
+}
+
+function eventBindingValid(binding) {
+  if (!binding?.chatId || binding.chatId !== chatIdFromURL()) return false;
+  if (binding.attemptId != null && !eventAttempt(binding.chatId,binding.attemptId)) return false;
+  if (binding.episodeId != null && eventActiveEpisode(binding.chatId)?.id !== binding.episodeId) return false;
+  return true;
+}
+
+function scheduleBoundCapture(binding, delay) {
+  if (!binding.chatId) return;
+  const frozen = {...binding};
+  setTimeout(() => {
+    if (eventBindingValid(frozen)) controlledCapture(frozen);
+  },delay);
+}
+
+function controlledCapture(binding) {
+  if (!eventBindingValid(binding)) return Promise.resolve(false);
+  const key = `${binding.chatId}:${binding.attemptId ?? ''}:${binding.episodeId ?? ''}`;
+  if (captureJobs.has(key)) return captureJobs.get(key);
+  const job = retryCapture(binding).finally(() => captureJobs.delete(key));
+  captureJobs.set(key,job);
+  return job;
+}
+
+function eventCapture(id, obs, binding) {
+  const e = eventActiveEpisode(id);
+  if (!e || obs.fullCapturedAt < e.firstSeenAt) return;
+  if (binding?.episodeId != null && binding.episodeId !== e.id) return;
+  if (binding?.chatId && binding.chatId !== id) return;
+  const family = obs.sourceFamily;
+  const capture = {...attemptCompactObservation(obs),episodeId:e.id,conversationId:id,capturedAt:Date.now()};
+  e[family] = capture;
+  e.captureHistory.push(capture);
+  eventSaveEpisodes(id);
+}
+
+function sendComposer(target) {
+  const editable = target?.closest?.('textarea, [contenteditable="true"], [role="textbox"]');
+  if (!editable || editable.closest(`[data-message-author-role], article, #${P}`)) return null;
+  const form = editable.closest('form');
+  if (!form || editable.isConnected === false || editable.disabled || editable.getAttribute('aria-disabled') === 'true') return null;
+  const rect = editable.getBoundingClientRect(), style = getComputedStyle(editable);
+  if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || editable.closest('[hidden], [aria-hidden="true"]')) return null;
+  // A visible composer form on the conversation page, not a search/login field.
+  const label = [editable.getAttribute('aria-label'),editable.getAttribute('placeholder'),
+    editable.getAttribute('data-placeholder'),editable.id,form.getAttribute('data-type')].join(' ');
+  if (!/ask|prompt|message|chat|composer/i.test(label) || /search|find|login|sign.in/i.test(label) || form.getAttribute('role') === 'search') return null;
+  return {editable,form};
+}
+
+function sendFormComposer(form) {
+  for (const editable of form?.querySelectorAll?.('textarea, [contenteditable="true"], [role="textbox"]') || []) {
+    const composer = sendComposer(editable);
+    if (composer && composer.form === form) return composer;
+  }
+  return null;
+}
+
+function sendComposerChars(editable) {
+  try { return String(editable.value ?? editable.innerText ?? editable.textContent ?? '').length; }
+  catch { return null; }
+}
+
+function recordSendIntent(kind, observation = {}) {
+  const id = observation.conversationId || chatIdFromURL();
+  if (!id || id !== chatIdFromURL()) return null;
+  const store = loadAttemptState(id), now = observation.time ?? Date.now();
+  const method = /enter/i.test(kind) ? 'enter' : /button/i.test(kind) ? 'button' : kind;
+  const intent = {sendIntentAt:now,conversationId:id,kind:method,submissionMethod:method,
+    composerChars:observation.chars ?? null,confirmedBy:observation.confirmedBy || 'observed submit control',
+    dispatchAt:null,attemptId:null,blockedBeforeDispatch:false};
+  store.sendIntents.push(intent); saveAttemptState(id,store);
+  setTimeout(() => {
+    if (id !== chatIdFromURL() || intent.dispatchAt || !detectMaxBanner()) return;
+    if (store.pendingRequestClassifications || store.unclassifiedConversationPosts.some(x => x.time >= intent.sendIntentAt && x.time <= intent.sendIntentAt+2500)) {
+      intent.correlationIncomplete = 'conversation POST observed, generation shape unresolved';
+      saveAttemptState(id,store);
+      return;
+    }
+    const e = eventOpenEpisode(id,'blocked before dispatch',null,detectMaxBanner());
+    e.blockedBeforeDispatch = true; e.sendIntentAt = intent.sendIntentAt;
+    intent.blockedBeforeDispatch = true; intent.maxEpisodeId = e.id;
+    eventSaveEpisodes(id); saveAttemptState(id,store); scheduleUpdate();
+  },Math.max(0,now+2500-Date.now()));
+  return intent;
+}
+
+function confirmComposerEnter(reason, form = null) {
+  const candidate = pendingComposerEnter;
+  if (!candidate || (form && candidate.form !== form)) return null;
+  pendingComposerEnter = null;
+  if (candidate.conversationId !== chatIdFromURL() || Date.now()-candidate.time > 5000) return null;
+  const intent = recordSendIntent('enter',{...candidate,confirmedBy:reason});
+  lastComposerSubmission = {form:candidate.form,time:candidate.time,intent};
+  return intent;
+}
+
+function installSendIntentHook() {
+  if (sendIntentHooked) return;
+  sendIntentHooked = true;
+  // Window capture runs before React/document bubble handlers can stop propagation.
+  const surface = page.addEventListener ? page : document;
+  surface.addEventListener('click', ev => {
+    const target = (ev.composedPath?.()[0] || ev.target)?.closest?.('button, [role="button"], input[type="submit"]');
+    if (!target || target.disabled || target.getAttribute('aria-disabled') === 'true' || target.closest(`#${P}`)) return;
+    const form = target.form || target.closest('form'), composer = sendFormComposer(form);
+    if (!composer) return;
+    const label = [target.getAttribute('aria-label'),target.getAttribute('data-testid'),target.getAttribute('title')].join(' ');
+    const submit = target.type === 'submit' || /^(?:send|submit)(?:\b|-)/i.test(label.trim());
+    if (!submit || /stop|voice|dictat/i.test(label)) return;
+    if (pendingComposerEnter?.form === form) { confirmComposerEnter('submit control activation',form); return; }
+    // Implicit keyboard activation can follow the key's dispatch/submit callback.
+    if (ev.detail === 0 && lastComposerSubmission?.form === form && lastComposerSubmission.intent?.submissionMethod === 'enter' && Date.now()-lastComposerSubmission.time < 500) return;
+    const intent = recordSendIntent('button',{chars:sendComposerChars(composer.editable)});
+    lastComposerSubmission = {form,time:Date.now(),intent};
+  },true);
+  surface.addEventListener('submit', ev => {
+    const form = ev.target, composer = sendFormComposer(form);
+    if (!composer) return;
+    if (pendingComposerEnter?.form === form) { confirmComposerEnter('composer form submit',form); return; }
+    if (lastComposerSubmission?.form === form && Date.now()-lastComposerSubmission.time < 500) return;
+    const intent = recordSendIntent('form',{chars:sendComposerChars(composer.editable),confirmedBy:'composer form submit'});
+    lastComposerSubmission = {form,time:Date.now(),intent};
+  },true);
+  surface.addEventListener('keydown', ev => {
+    pendingComposerEnter = null;
+    if (ev.key !== 'Enter' || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey || ev.isComposing || ev.keyCode === 229 || ev.repeat) return;
+    const composer = sendComposer(ev.composedPath?.()[0] || ev.target);
+    if (!composer) return;
+    const candidate = {...composer,time:Date.now(),conversationId:chatIdFromURL(),
+      chars:sendComposerChars(composer.editable),event:ev,bannerBefore:!!detectMaxBanner()};
+    pendingComposerEnter = candidate;
+    // Plain Enter is provisional: only actual submit/dispatch or a newly visible
+    // native MAX after the app handled Enter proves submission. Newline cancels it.
+    setTimeout(() => {
+      if (pendingComposerEnter !== candidate) return;
+      if (candidate.event.defaultPrevented && !candidate.bannerBefore && detectMaxBanner()) confirmComposerEnter('handled Enter followed by native MAX');
+      else pendingComposerEnter = null;
+    },5000);
+  },true);
+  surface.addEventListener('beforeinput', ev => {
+    if (/insertParagraph|insertLineBreak/.test(ev.inputType || '') && sendComposer(ev.target)?.form === pendingComposerEnter?.form) pendingComposerEnter = null;
+  },true);
+  surface.addEventListener('input', ev => {
+    // Covers browsers that omit beforeinput for a literal newline insertion.
+    if (ev.data?.includes('\n') && sendComposer(ev.target)?.form === pendingComposerEnter?.form) pendingComposerEnter = null;
+    const candidate = pendingComposerEnter;
+    if (candidate?.event.defaultPrevented && candidate.chars > 0 && sendComposer(ev.target)?.form === candidate.form && sendComposerChars(candidate.editable) === 0) confirmComposerEnter('handled Enter cleared composer');
+  },true);
+}
+
+function eventComparison(id) {
+  const store = loadAttemptState(id), episodes = eventEpisodes(id);
+  const success = store.attempts.filter(a => a.outcome === 'success').at(-1) || null;
+  const max = episodes.episodes.at(-1) || null;
+  const vector = c => c ? {retainedBytes:c.retainedBytes,activeBranchBytes:c.activeBranchBytes,
+    mappingBytes:c.mappingBytes,branchNodes:c.branchNodes,messageNodes:c.messageNodes,
+    toolResultBytes:c.toolResultBytes,hot128:c.hot128,hot256:c.hot256,strongContextMarkers:c.strongContextMarkers} : null;
+  const families = {};
+  for (const family of ['direct','batch']) {
+    const pre = vector(success?.pre?.[family]), fresh = vector(max?.[family]);
+    const deltas = pre && fresh ? Object.fromEntries(Object.keys(pre).map(k =>
+      [k,pre[k] != null && fresh[k] != null ? fresh[k]-pre[k] : null])) : null;
+    families[family] = {successPre:pre,maxFresh:fresh,deltas};
+  }
+  const stats = success?.streamStats;
+  return {description:'Descriptive correlation only; no metric establishes causation or capacity.',
+    lastRealSuccess:success ? {attemptId:success.id,promptChars:success.requestPromptChars,
+      model:success.requestModel,effort:success.requestEffort,requestBytes:success.requestBodyBytes,
+      sseBytes:stats?.totalBytes,sseChunks:stats?.chunkCount,
+      ttfbMs:stats?.firstByteAt && success.requestDetectedAt ? stats.firstByteAt-success.requestDetectedAt : null,
+      generationDurationMs:success.outcomeConfirmedAt-success.startedAt,confirmationSource:success.outcomeConfirmedBy} : null,
+    lastMaxEpisode:max ? {episodeId:max.id,relatedRealAttemptId:max.relatedRealAttemptId,
+      blockedBeforeDispatch:max.blockedBeforeDispatch,confirmationSource:max.confirmationSource} : null,families};
+}
+
+function eventStaticState(id) {
+  const life = loadLifecycle(id);
+  const latest = family => [family?.lastObservation,family?.lastStable,family?.lastInflight,family?.lastMaxEvent?.metrics]
+    .filter(Boolean).sort((a,b)=>(b.fullCapturedAt || b.time || 0)-(a.fullCapturedAt || a.time || 0))[0] || null;
+  return {direct:latest(life.families?.direct),batch:latest(life.families?.batch),latest:life.lastObservation};
+}
+
+function eventDiagnostics(id) {
+  const store = loadAttemptState(id), state = eventEpisodes(id), e = eventActiveEpisode(id);
+  const a = store.current || store.last;
+  const life = loadLifecycle(id);
+  return ['ChatGPT Conversation Size Meter V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
+    `MAX banner visible now: ${visibleHardMax()}`,`Current real attempt ID: ${store.current?.id ?? 'none'}`,
+    `Active MAX episode ID: ${e?.id ?? 'none'}`,
+    `Total distinct MAX episodes: ${state.nextId-1}; retained episodes: ${state.episodes.length}; current episode captures: ${e?.captureHistory.length ?? 0}`,
+    `Storage health: ${JSON.stringify(eventStorageHealth(id,true))}`,
+    'REAL ATTEMPTS',JSON.stringify({current:store.current,history:store.attempts,sendIntents:store.sendIntents}),
+    'MAX EPISODES',JSON.stringify(state.episodes),
+    `Fresh DIRECT: ${e?.direct ? JSON.stringify(e.direct) : 'No fresh DIRECT capture for this MAX episode'}`,
+    `Fresh BATCH: ${e?.batch ? JSON.stringify(e.batch) : 'No fresh BATCH capture for this MAX episode'}`,
+    'LAST SUCCESS VS LAST MAX',JSON.stringify(eventComparison(id)),
+    'GENERATION TRANSPORT',JSON.stringify({attemptId:a?.id,requestBytes:a?.requestBodyBytes,stream:a?.streamStats,
+      http:a?.generationHTTP,correlatedWebSocket:a?.transportStats,
+      transportClosedAt:a?.transportClosedAt,telemetryFinalizedAt:a?.telemetryFinalizedAt}),
+    'APP STATE NETWORK',JSON.stringify({http:store.appStateNetwork,uncorrelatedWebSocket:store.uncorrelatedWebSocket,unclassifiedConversationPosts:store.unclassifiedConversationPosts}),
+    'METER CAPTURE NETWORK',JSON.stringify(store.meterCaptureNetwork),
+    'POST-OUTCOME CORRELATION',JSON.stringify(a?.postCorrelation || null),
+    'STATIC STATE VECTOR',JSON.stringify(eventStaticState(id)),
+    'V2.24 PRESSURE CALIBRATION',JSON.stringify(pressureResult(id)),
+    'CALIBRATION SAMPLE SUMMARY',JSON.stringify(pressureSummary())];
+}
+
+function eventPanelMarkup(id) {
+  const store = loadAttemptState(id), state = eventEpisodes(id);
+  const a = store.current || store.last, e = eventActiveEpisode(id) || state.episodes.at(-1);
+  const section = (title, text) => `<div class="section-title">${title}</div><div class="capture-note" style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(text)}</div>`;
+  const fresh = family => e?.[family] ? JSON.stringify(e[family]) : `No fresh ${family.toUpperCase()} capture for this MAX episode`;
+  const comparison = eventComparison(id);
+  const summary = ['REAL ATTEMPTS — V2.23',`Current: ${store.current ? '#'+store.current.id+' RUNNING' : 'IDLE'}`,
+    `Latest: ${store.last ? '#'+store.last.id+' '+attemptStatusLabel(store.last) : 'none'}`,
+    attemptSummaryText(a),`Classifier: ${a?.generationClassifierReason || 'none'}`,
+    `Preflight match: ${a?.preflightMatchedBy || 'no preflight match'}`,
+    `Send intents: ${store.sendIntents.length}`].join('\n');
+  return section('REAL ATTEMPTS — V2.23',summary) +
+    section('MAX EPISODES',`Current: ${eventActiveEpisode(id) ? 'ACTIVE' : 'NONE'}; latest #${e?.id ?? 'none'}\nTotal distinct episodes: ${state.nextId-1}; retained: ${state.episodes.length}; current captures: ${eventActiveEpisode(id)?.captureHistory.length ?? 0}\nRelated real attempt: ${e?.relatedRealAttemptId ?? 'none'}\nBlocked before dispatch: ${e?.blockedBeforeDispatch ?? false}\nConfirmation: ${e?.confirmationSource || 'none'}\nDetection: ${JSON.stringify(e?.bannerDetection || null)}\n${fresh('direct')}\n${fresh('batch')}`) +
+    section('LAST SUCCESS vs LAST MAX',comparison.description) +
+    `<div class="stats-grid"><div><div class="label">LAST REAL SUCCESS</div><div class="value tiny-value">${esc(JSON.stringify(comparison.lastRealSuccess))}</div></div><div><div class="label">LAST MAX EPISODE</div><div class="value tiny-value">${esc(JSON.stringify(comparison.lastMaxEpisode))}</div></div></div>` +
+    section('SOURCE COMPARISON / NUMERIC DELTAS',JSON.stringify(comparison.families)) +
+    section('GENERATION TRANSPORT',`${attemptStreamSummary(a)}\n${a?.streamStats?.readErrorBenign ? 'Benign post-completion clone abort' : ''}\nHTTP: ${JSON.stringify(a?.generationHTTP || null)}\nCorrelated WS: ${attemptTransportSummary(a)}\nTransport closed: ${a?.transportClosedAt ?? 'pending'}; telemetry finalized: ${a?.telemetryFinalizedAt ?? 'pending'}`) +
+    section('POST-OUTCOME CORRELATION',attemptPostCorrelationText(a)) +
+    section('SOURCE-SEPARATED STATIC STATE VECTOR',`DIRECT: ${JSON.stringify(eventStaticState(id).direct)}\nBATCH: ${JSON.stringify(eventStaticState(id).batch)}\nRepresentations are descriptive; no universal threshold or remaining capacity is inferred.`) +
+    section('APP STATE NETWORK / METER CAPTURE NETWORK',`App HTTP rows: ${store.appStateNetwork.length}; uncorrelated WS rows: ${store.uncorrelatedWebSocket.length}; meter rows: ${store.meterCaptureNetwork.length}\nStorage: ${JSON.stringify(eventStorageHealth(id))}`);
+}
+
+
+function attemptKey(id = chatIdFromURL()) {
+  return id ? `${ATTEMPT_PREFIX}:${id}` : null;
+}
+function blankAttemptState() {
+  return {
+    version:3,
+    unclassifiedConversationPosts:[], pendingRequestClassifications:0, sendIntents:[], appStateNetwork:[], meterCaptureNetwork:[], uncorrelatedWebSocket:[],
+    nextId:1, nextPreflightId:1,
+    current:null,
+    last:null,
+    attempts:[],
+    pendingPreflight:null,
+    preflightHistory:[]
+  };
+}
+function loadAttemptState(id = chatIdFromURL()) {
+  if (!id) return blankAttemptState();
+  if (!attemptCache.has(id)) {
+    let x = null;
+    try { x = eventStorageParse(localStorage.getItem(attemptKey(id))); }
+    catch (error) { eventStorageError(id, error); }
+    const store = {...blankAttemptState(), ...(x || {})};
+    attemptCache.set(id, store);
+    // A new page cannot own the old page's response reader. Preserve its
+    // evidence and close correlation explicitly rather than inventing INFLIGHT.
+    for (const a of [store.current,...store.attempts].filter(Boolean)) {
+      if (!a.telemetryFinalizedAt) {
+        a.telemetryFinalizedAt = Date.now();
+        a.telemetryClosureReason = 'page restarted; transport closure unobserved';
+      }
+    }
+    if (store.current) {
+      const a = store.current;
+      a.status = a.outcome = 'unknown';
+      a.outcomeConfirmedBy = 'correlation incomplete: page restarted';
+      a.outcomeConfirmedAt = a.finalizedAt = Date.now();
+      attemptFinalize(store,a);
+      saveAttemptState(id,store);
+    }
+  }
+  return attemptCache.get(id);
+}
+function saveAttemptState(id, x) {
+  if (!id) return;
+  x.attempts = (x.attempts || []).slice(-10);
+  x.preflightHistory = (x.preflightHistory || []).slice(-10);
+  x.sendIntents = (x.sendIntents || []).slice(-20);
+  x.unclassifiedConversationPosts = (x.unclassifiedConversationPosts || []).slice(-20);
+  x.appStateNetwork = (x.appStateNetwork || []).slice(-40);
+  x.meterCaptureNetwork = (x.meterCaptureNetwork || []).slice(-40);
+  x.uncorrelatedWebSocket = (x.uncorrelatedWebSocket || []).slice(-40);
+  for (const a of [x.current, x.last, ...x.attempts].filter(Boolean)) {
+    a.networkEvents = (a.networkEvents || []).slice(-60);
+    a.transportEvents = (a.transportEvents || []).slice(-60);
+    if (a.streamStats) a.streamStats.recentEvents = (a.streamStats.recentEvents || []).slice(-40);
+  }
+  attemptCache.set(id, x);
+  eventSave(id, attemptKey(id), x);
+  pressureCollect(id);
+}
+function attemptLatestUserPromptChars() {
+  try {
+    const nodes=[...document.querySelectorAll('[data-message-author-role="user"]')];
+    if (nodes.length) return String(nodes[nodes.length-1].innerText||'').length;
+  } catch {}
+  return null;
+}
+function attemptEffortHint() {
+  try {
+    const allowed=new Set(['instant','thinking','medium','high','extra high']);
+    const xs=[...document.querySelectorAll('button')]
+      .map(x=>String(x.innerText||'').trim())
+      .filter(x=>allowed.has(x.toLowerCase()));
+    return xs.length ? xs[xs.length-1] : null;
+  } catch { return null; }
+}
+function attemptSnapshotModel(id = chatIdFromURL()) {
+  const snap=loadSnapshot(id);
+  return snap?.structure?.contextTopology?.currentModel || null;
+}
+function attemptCompactObservation(obs) {
+  if (!obs) return null;
+  return {
+    time:obs.time||Date.now(), fullCapturedAt:obs.fullCapturedAt||0,
+    source:obs.source||null,
+    sourceFamily:obs.sourceFamily||lifecycleSourceFamily(obs.source),
+    phase:obs.phase||null,
+    retainedBytes:nullableNumber(obs.retainedBytes),
+    retainedShare:nullableNumber(obs.retainedShare),
+    activeBranchBytes:nullableNumber(obs.activeBranchBytes),
+    mappingBytes:nullableNumber(obs.mappingBytes),
+    branchNodes:nullableNumber(obs.branchNodes),
+    messageNodes:nullableNumber(obs.messageNodes),
+    userMessages:nullableNumber(obs.userMessages),
+    assistantMessages:nullableNumber(obs.assistantMessages),
+    toolResults:nullableNumber(obs.toolResults),
+    toolResultBytes:nullableNumber(obs.toolResultBytes),
+    hot128:nullableNumber(obs.hot128), hot256:nullableNumber(obs.hot256),
+    toolCalls:nullableNumber(obs.toolCalls),
+    strongContextMarkers:nullableNumber(obs.strongContextMarkers),
+    systemRoleNodes:nullableNumber(obs.systemRoleNodes),
+    displayLikeTokens:nullableNumber(obs.displayLikeTokens),
+    payloadBytes:nullableNumber(obs.payloadBytes)
+  };
+}
+function attemptPeakObservation(a,b,field) {
+  if (!a) return b||null; if (!b) return a;
+  const av=nullableNumber(a[field]), bv=nullableNumber(b[field]);
+  if (av==null) return b; if (bv==null) return a;
+  return bv>av?b:a;
+}
+function attemptBaselineForFamily(lifecycle,family) {
+  return attemptCompactObservation(lifecycle?.families?.[family]?.lastStable);
+}
+function attemptStart(id,trigger='generation-start') {
+  if (!id || trigger !== 'network-generation-dispatch') return null;
+
+  const store=loadAttemptState(id);
+
+  if (
+    store.current &&
+    ['running','pending'].includes(store.current.status)
+  ) {
+    return store.current;
+  }
+
+  const lifecycle=loadLifecycle(id);
+
+  const a={
+    id:store.nextId||1,
+    conversationId:id,
+    startedAt:Date.now(),
+    trigger,
+    status:'running',
+    outcome:null,
+    outcomeStatus:null, transportClosedAt:null, telemetryFinalizedAt:null,
+    outcomeConfirmedBy:null,
+    outcomeConfirmedAt:null,
+
+    postCorrelation:{
+      scheduled:false,
+      startedAt:null,
+      lastCapturedAt:null,
+      captureCount:0,
+      snapshotsByFamily:{
+        direct:null,
+        batch:null,
+        other:null
+      },
+      deltasByFamily:{
+        direct:null,
+        batch:null,
+        other:null
+      }
+    },
+
+    promptChars:attemptLatestUserPromptChars(),
+    preSnapshotModel:attemptSnapshotModel(id),
+    effortHint:attemptEffortHint(),
+
+    requestDetectedAt:null,
+    requestURL:null,
+    requestPath:null,
+    requestMethod:null,
+    requestBodyBytes:null,
+    requestAction:null,
+    requestModel:null,
+    requestEffort:null,
+    requestPromptChars:null,
+    requestConversationId:null,
+    requestParentMessageId:null,
+    requestKeys:[],
+    requestParsed:false,
+
+    responseObservedAt:null,
+    responseCompletedAt:null,
+    responseStatus:null,
+    responseContentType:null,
+    responseBytes:null,
+    responseMaxTextDetected:false,
+
+    preflight:null,
+
+    streamStats:{
+      observed:false,
+      startedAt:null,
+      firstByteAt:null,
+      endedAt:null,
+      chunkCount:0,
+      totalBytes:0,
+      maxChunkBytes:0,
+      lastChunkAt:null,
+      status:null,
+      contentType:null,
+      doneSignals:0,
+      maxTextDetected:false,
+      eventCounts:{},
+      recentEvents:[],
+      readError:null,
+      readErrorBenign:false
+    },
+
+    domStats:{
+      observerEvents:0,
+      assistantChanges:0,
+      generationStarts:0,
+      generationStops:0,
+      lastAssistantCount:null,
+      lastAssistantChars:null,
+      lastMutationAt:null,
+      lastCaptureAt:null
+    },
+
+    transportEvents:[],
+    transportStats:{
+      websocketInCount:0,
+      websocketOutCount:0,
+      websocketInBytes:0,
+      websocketOutBytes:0,
+      websocketMaxBytes:0,
+      websocketURLs:[],
+      doneSignals:0
+    },
+    lastTransportActivityAt:null,
+    lastNetworkActivityAt:null,
+    successCandidate:null,
+
+    pre:{
+      currentSourceFamily:lifecycle.lastObservation?.sourceFamily||null,
+      direct:attemptBaselineForFamily(lifecycle,'direct'),
+      batch:attemptBaselineForFamily(lifecycle,'batch'),
+      other:attemptBaselineForFamily(lifecycle,'other')
+    },
+
+    firstCaptureByFamily:{direct:null,batch:null,other:null},
+    peakRetainedByFamily:{direct:null,batch:null,other:null},
+    peakActiveByFamily:{direct:null,batch:null,other:null},
+    lastCaptureByFamily:{direct:null,batch:null,other:null},
+
+    networkEvents:[],
+    networkMaxBytes:0,
+    networkFamilies:{},
+
+    generationEndedAt:null,
+    maxDetectedAt:null,
+    successConfirmedAt:null,
+    finalizedAt:null,
+
+    maxSnapshot:null,
+    post:null,
+    deltas:null
+  };
+
+  store.nextId=a.id+1;
+  store.current=a;
+  saveAttemptState(id,store);
+
+  return a;
+}
+function attemptRecordNetworkEvent(id, url, bytes, contentType = '', binding = null, category = 'app') {
+  if (!id) return;
+  const store = loadAttemptState(id);
+  const ev = {time:Date.now(), url:sanitizeURL(url), bytes:nullableNumber(bytes), contentType:String(contentType).slice(0,120)};
+  const a = eventAttempt(id, binding?.attemptId);
+  if (category === 'generation' && a) {
+    a.networkEvents.push(ev);
+    a.networkMaxBytes = Math.max(a.networkMaxBytes || 0, bytes || 0);
+    a.lastNetworkActivityAt = ev.time;
+    // HTTP summary and incremental SSE bytes describe the same response; never sum them.
+    a.generationHTTP = ev;
+  } else {
+    const key = category === 'meter' ? 'meterCaptureNetwork' : 'appStateNetwork';
+    store[key].push(ev);
+  }
+  saveAttemptState(id, store);
+}
+function attemptFinalize(store, a) {
+  a.outcomeStatus = a.outcome;
+  store.attempts = [...(store.attempts || []).filter(x => x.id !== a.id), a].slice(-10);
+  store.last = a;
+  if (store.current?.id === a.id) store.current = null;
+  store.domGraceUntil = Date.now() + 5000;
+  eventScheduleTelemetryTimeout(a.conversationId, a.id);
+}
+function attemptRecordFullCapture(id,obs) {
+  if (!id||!obs) return;
+
+  const store=loadAttemptState(id), a=store.current;
+
+  if (
+    !a ||
+    !['running','pending'].includes(a.status)
+  ) {
+    return;
+  }
+
+  const c=attemptCompactObservation(obs);
+  const family=
+    c.sourceFamily ||
+    lifecycleSourceFamily(c.source);
+
+  if (!a.firstCaptureByFamily[family]) {
+    a.firstCaptureByFamily[family]=c;
+  }
+
+  a.lastCaptureByFamily[family]=c;
+
+  a.peakRetainedByFamily[family]=
+    attemptPeakObservation(
+      a.peakRetainedByFamily[family],
+      c,
+      'retainedBytes'
+    );
+
+  a.peakActiveByFamily[family]=
+    attemptPeakObservation(
+      a.peakActiveByFamily[family],
+      c,
+      'activeBranchBytes'
+    );
+
+  if (c.phase === 'max') { attemptMarkMax(id, 'UI MAX banner'); return; }
+
+  if (
+    ['running','pending'].includes(a.status) &&
+    c.phase==='stable'
+  ) {
+    const pre=a.pre?.[family]||null;
+
+    if (
+      attemptSuccessCandidateFromCapture(
+        a,
+        c,
+        pre
+      )
+    ) {
+      a.successCandidate={
+        time:Date.now(),
+        family,
+        pre,
+        capture:c
+      };
+
+      store.current=a;
+      saveAttemptState(id,store);
+      attemptScheduleSettledSuccess(id);
+      return;
+    }
+  }
+
+  store.current=a;
+  saveAttemptState(id,store);
+}
+function attemptGenerationEnded(id) {
+  if (!id) return;
+
+  const store=loadAttemptState(id);
+  const a=store.current;
+
+  if (!a || a.status!=='running') return;
+
+  a.status='pending';
+  a.generationEndedAt=Date.now();
+
+  store.current=a;
+  saveAttemptState(id,store);
+}
+function attemptMarkMax(id, confirmation = 'UI MAX banner', relatedAttemptId = null) {
+  if (!id) return;
+  const store = loadAttemptState(id);
+  const existing = eventActiveEpisode(id);
+  const a = relatedAttemptId == null
+    ? (!existing || (existing.firstSeenAt >= store.current?.startedAt && existing.relatedRealAttemptId === store.current?.id) ? store.current : null)
+    : eventAttempt(id, relatedAttemptId);
+  const episode = eventOpenEpisode(id, confirmation, a?.id ?? null, detectMaxBanner());
+  if (a && !a.outcome) {
+    a.status = a.outcome = 'max';
+    a.outcomeConfirmedBy = confirmation;
+    a.outcomeConfirmedAt = a.maxDetectedAt = a.finalizedAt = Date.now();
+    a.maxEpisodeId = episode.id;
+    attemptFinalize(store, a);
+    saveAttemptState(id, store);
+    attemptSchedulePostOutcomeCaptures(id, a.id);
+  }
+}
+function attemptStatusLabel(a) {
+  if (!a) return 'READY';
+  return ({running:'RUNNING',pending:'FINALIZING',success:'SUCCESS',max:'MAX'})[a.status]||String(a.status||'UNKNOWN').toUpperCase();
+}
+function attemptFamilyPeakText(a,family) {
+  if (!a) return '—';
+  const r=a.peakRetainedByFamily?.[family], x=a.peakActiveByFamily?.[family];
+  if (!r&&!x) return '—';
+  return `${r?.retainedBytes!=null?fmt(r.retainedBytes)+'B retained':'— retained'} · ${x?.activeBranchBytes!=null?fmt(x.activeBranchBytes)+'B active':'— active'}`;
+}
+function attemptNetworkText(a) {
+  if (!a) return '—';
+  const fs=a.networkFamilies||{};
+  const parts=['direct','batch','other'].filter(k=>fs[k]).map(k=>`${lifecycleFamilyLabel(k)} ${fs[k].count||0} events / ${fmt(fs[k].maxBytes||0)}B max`);
+  return parts.length?parts.join(' · '):'—';
+}
+function attemptSummaryText(a) {
+  if (!a) return '—';
+
+  const end=a.finalizedAt||Date.now();
+
+  const dur=a.startedAt
+    ? Math.max(0,end-a.startedAt)
+    : null;
+
+  const promptChars =
+    a.requestPromptChars ??
+    a.promptChars ??
+    '—';
+
+  const model =
+    a.requestModel ||
+    a.preSnapshotModel ||
+    '—';
+
+  const effort =
+    a.requestEffort ||
+    a.effortHint ||
+    '—';
+
+  const confirmed =
+    a.outcomeConfirmedBy
+      ? ` · confirmed ${a.outcomeConfirmedBy}`
+      : '';
+
+  return (
+    `#${a.id} ${attemptStatusLabel(a)} · ` +
+    `${a.trigger || 'unknown-trigger'} · ` +
+    `prompt ${promptChars} chars · ` +
+    `request ${fmt(a.requestBodyBytes || 0)}B · ` +
+    `model ${model} · ` +
+    `effort ${effort} · ` +
+    `${dur!=null?(dur/1000).toFixed(1)+'s':'—'} · ` +
+    `response ${fmt(a.responseBytes || 0)}B · ` +
+    `generation HTTP max ${fmt(a.networkMaxBytes||0)}B` +
+    confirmed
+  );
+}
+function attemptRecentText(rows,limit=10) {
+  if (!Array.isArray(rows)||!rows.length) return '—';
+  return rows.slice(-limit).map(attemptSummaryText).join(' || ');
+}
+
+
+// ============================================================
+// Snapshot merging
+// ============================================================
+
+function mergeRecordsForChat(
+  id,
+  records,
+  {
+    full = false,
+    source = 'network update',
+    structure = null,
+    payloadBytes = null
+  } = {}
+) {
+  if (!id || !records?.length) return;
+
+  const snap = loadSnapshot(id);
+
+  if (full) {
+    // A full mapping describes the currently active branch. Replace instead of
+    // union-merging so old regenerated branches cannot inflate active metrics.
+    snap.records = records;
+    snap.full = true;
+    snap.fullCapturedAt = Date.now();
+    snap.source = source;
+    snap.structure = structure || snap.structure || null;
+
+    if (Number.isFinite(Number(payloadBytes))) {
+      snap.maxFullPayloadBytes = Math.max(
+        Number(snap.maxFullPayloadBytes) || 0,
+        Number(payloadBytes) || 0
+      );
+    }
+  } else {
+    const map = new Map(
+      snap.records.map(r => [r.id, r])
+    );
+
+    for (const rec of records) {
+      const old = map.get(rec.id);
+
+      if (!old || rec.chars >= old.chars) {
+        map.set(rec.id, rec);
+      }
+    }
+
+    snap.records = [...map.values()];
+
+    if (!snap.full) {
+      snap.source = source;
+    }
+  }
+
+  snap.capturedAt = Date.now();
+  saveSnapshot(id, snap);
+  scheduleUpdate();
+}
+
+function acceptCandidate(candidate, sourceURL = '', payloadBytes = null) {
+  if (!candidate?.records?.length) return;
+
+  const current = chatIdFromURL();
+
+  const candidateId = candidate.conversationId
+    ? String(candidate.conversationId)
+    : null;
+
+  if (
+    candidateId &&
+    current &&
+    candidateId !== current
+  ) {
+    return;
+  }
+
+  const id = candidateId || current;
+  if (!id) return;
+
+  mergeRecordsForChat(
+    id,
+    candidate.records,
+    {
+      full: candidate.full,
+      source: candidate.full
+        ? candidate.source
+        : 'network incremental update',
+      structure: candidate.structure || null,
+      payloadBytes: candidate.full ? payloadBytes : null
+    }
+  );
+
+  if (candidate.full) {
+    recordLifecycleFullCapture(id, sourceURL, payloadBytes);
+  }
+
+  const previousDiag = loadDiagnostic(id) || {};
+
+  saveDiagnostic(id, {
+    lastSourceURL: sourceURL,
+    lastCandidateRecords: candidate.records.length,
+    lastCandidateFull: !!candidate.full,
+    mappingNodes: candidate.mappingNodes ?? previousDiag.mappingNodes ?? null,
+    maxFullPayloadBytes: candidate.full && Number.isFinite(Number(payloadBytes))
+      ? Math.max(
+          Number(previousDiag.maxFullPayloadBytes) || 0,
+          Number(payloadBytes) || 0
+        )
+      : Number(previousDiag.maxFullPayloadBytes) || null
+  });
+}
+
+
+// ============================================================
+// JSON / SSE network inspection
+// ============================================================
+
+function inspectJSON(obj, sourceURL = '', payloadBytes = null) {
+  try {
+    const candidate = findBestCandidate(obj);
+    if (candidate) acceptCandidate(candidate, sourceURL, payloadBytes);
+  } catch (e) {
+    console.debug('[Chat Size V2.10.1] JSON inspection failed', e);
+  }
+}
+
+function inspectSSE(text, sourceURL = '') {
+  if (!text || !text.includes('data:')) return;
+
+  const lines = text.split(/\r?\n/);
+
+  for (const line of lines) {
+    if (!line.startsWith('data:')) continue;
+
+    const payload = line.slice(5).trim();
+
+    if (
+      !payload ||
+      payload === '[DONE]'
+    ) {
+      continue;
+    }
+
+    try {
+      inspectJSON(
+        JSON.parse(payload),
+        sourceURL
+      );
+    } catch {}
+  }
+}
+
+function interestingURL(url) {
+  const s = String(url || '');
+
+  return (
+    /\/backend-api\/conversation(?:\/|\?|$)/i.test(s) ||
+    /\/backend-api\/conversations(?:\/|\?|$)/i.test(s) ||
+    /\/conversation(?:\/|\?|$)/i.test(s) ||
+    /conversation_id=/i.test(s)
+  );
+}
+
+async function inspectResponse(response, url, binding = {chatId:chatIdFromURL()}, category = 'app') {
+  const result = {path:attemptRequestPath(url),status:response.status ?? null,responseBytes:null,
+    contentType:String(response.headers.get('content-type') || '').slice(0,120),acceptedFull:false,sourceFamily:null};
+  try {
+    if (!interestingURL(url)) return result;
+    const text = await response.clone().text();
+    const id = binding.chatId, bytes = new TextEncoder().encode(text).length;
+    result.responseBytes = bytes;
+    if (!text && category !== 'meter' && !(binding.attemptId != null && result.status != null &&
+        (result.status < 200 || result.status >= 300))) return result; // Empty non-2xx generations still terminate.
+    if (category === 'meter') captureMeterNetwork(binding,url,bytes,result.contentType);
+    else attemptRecordNetworkEvent(id,url,bytes,result.contentType,binding,category);
+    if (category !== 'meter') {
+      attemptObservePreflightResponse(id,url,response,text,bytes,binding.preflightId);
+      attemptObserveGenerationResponse(id,url,response,text,bytes,binding);
+    }
+    // Recheck chat AND episode after the body await, before any parser writes.
+    if (id !== chatIdFromURL() || (category === 'meter' &&
+        (!eventBindingValid(binding) || binding.retryToken?.cancelled ||
+         (binding.retryToken && (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId)))) {
+      result.reason = 'binding cancelled'; return result;
+    }
+    if (category === 'meter' && (result.status < 200 || result.status >= 300 || bytes > 64*1024*1024)) {
+      result.reason = 'HTTP error or oversized capture'; return result;
+    }
+    saveDiagnostic(id,{lastObservedURL:sanitizeURL(url),lastObservedBytes:bytes,lastObservedCharacters:text.length,lastObservedType:result.contentType});
+    const sequence = loadAttemptState(id).captureSequence || 0;
+    const previous = activeCaptureBinding;
+    activeCaptureBinding = binding;
+    try {
+      const trimmed = text.trim();
+      let json = false;
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try { const parsed = JSON.parse(trimmed); inspectJSON(parsed,sanitizeURL(url),bytes); json = true; } catch {}
+      }
+      if (!json) inspectSSE(text,sanitizeURL(url));
+    } finally { activeCaptureBinding = previous; }
+    // The unchanged parser/candidate path must actually publish a NEW full capture.
+    const snap = loadSnapshot(id), obs = loadLifecycle(id).lastObservation;
+    result.acceptedFull = !!(snap.full && snap.records.length && snap.structure &&
+      (loadAttemptState(id).captureSequence || 0) > sequence &&
+      (!binding.retryToken || snap.fullCapturedAt >= binding.retryToken.startedAt));
+    if (result.acceptedFull) result.sourceFamily = obs?.sourceFamily ?? null;
+    result.reason = result.acceptedFull ? 'new parser-valid full snapshot' : 'no parser-valid full snapshot';
+    if (category === 'app' && binding.captureRoute) binding.captureRoute.result = {...result};
+    return result;
+  } catch {
+    if (category === 'meter') captureMeterNetwork(binding,url,null,result.contentType);
+    result.reason = 'response read failed'; return result;
+  }
+}
+
+function inspectRequestBody(url, init) {
+  try {
+    if (!interestingURL(url)) return;
+
+    const body = init?.body;
+    if (typeof body !== 'string') return;
+
+    const parsed = JSON.parse(body);
+
+    const candidate = findBestCandidate(parsed);
+
+    if (candidate) {
+      candidate.full = false;
+      acceptCandidate(
+        candidate,
+        `request:${String(url)}`
+      );
+    }
+  } catch {}
+}
+
+
+
+
+function attemptIsPreflightRequest(url, method, parsedBody = null) {
+  const m = String(method || 'GET').toUpperCase();
+  if (m !== 'POST') return false;
+
+  const path = attemptRequestPath(url);
+
+  if (
+    /\/backend-api\/f\/conversation\/prepare$/i.test(path) ||
+    /\/backend-api\/conversation\/prepare$/i.test(path) ||
+    /\/conversation\/prepare$/i.test(path)
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    parsedBody &&
+    typeof parsedBody === 'object' &&
+    /\/conversation\/prepare$/i.test(path) &&
+    (
+      'client_prepare_state' in parsedBody ||
+      'client_prepare_dispatch' in parsedBody ||
+      'client_prepare_source' in parsedBody
+    )
+  );
+}
+
+function attemptSafeJSONParse(text) {
+  try {
+    return JSON.parse(String(text || ''));
+  } catch {
+    return null;
+  }
+}
+
+function attemptShallowKeys(obj) {
+  return (
+    obj &&
+    typeof obj === 'object' &&
+    !Array.isArray(obj)
+  )
+    ? Object.keys(obj).slice(0,80)
+    : [];
+}
+
+function attemptExtractTransportHints(root) {
+  if (!root || typeof root !== 'object') return {};
+  const out = {};
+  for (const key of ['request_id','websocket_request_id','conversation_id','parent_message_id']) {
+    if (typeof root[key] === 'string' && /^[a-zA-Z0-9_-]{1,120}$/.test(root[key])) out[key] = root[key];
+  }
+  return out;
+}
+
+function attemptPreflightMeta(url, method, body) {
+  const parsed = attemptParseJSONBody(body);
+
+  return {
+    time:Date.now(),
+    requestURL:sanitizeURL(url),
+    requestPath:attemptRequestPath(url),
+    requestMethod:String(method || 'POST').toUpperCase(),
+    requestBodyBytes:attemptBodyBytes(body),
+    conversationId:
+      parsed?.conversation_id ??
+      parsed?.conversationId ??
+      null,
+    parentMessageId:
+      parsed?.parent_message_id ??
+      parsed?.parentMessageId ??
+      null,
+    model:parsed?.model != null ? String(parsed.model) : null,
+    effort:attemptFindEffortValue(parsed),
+    action:parsed?.action != null ? String(parsed.action) : null,
+    requestKeys:attemptShallowKeys(parsed),
+    requestDispatchHints:attemptExtractTransportHints(parsed),
+
+    responseAt:null,
+    responseStatus:null,
+    responseBytes:null,
+    responseContentType:null,
+    responseKeys:[],
+    responseDispatchHints:{}
+  };
+}
+
+function attemptRecordPreflightRequest(id, url, method, body) {
+  if (!id) return;
+
+  const store = loadAttemptState(id);
+  const pre = attemptPreflightMeta(url, method, body);
+
+  pre.id = store.nextPreflightId++;
+  store.pendingPreflight = pre;
+
+  const rows = Array.isArray(store.preflightHistory)
+    ? store.preflightHistory
+    : [];
+
+  rows.push(pre);
+  store.preflightHistory = rows.slice(-40);
+
+  saveAttemptState(id, store);
+  return pre;
+}
+
+function attemptUpdatePreflightHistory(store, pre) {
+  const rows = Array.isArray(store.preflightHistory)
+    ? store.preflightHistory
+    : [];
+
+  if (
+    rows.length &&
+    rows[rows.length-1]?.id === pre?.id
+  ) {
+    rows[rows.length-1] = pre;
+  } else {
+    rows.push(pre);
+  }
+
+  store.preflightHistory = rows.slice(-40);
+}
+
+function attemptObservePreflightResponse(
+  id,
+  url,
+  response,
+  text,
+  payloadBytes,
+  preflightId = null
+) {
+  if (!id) return false;
+
+  const path = attemptRequestPath(url);
+
+  if (!/\/conversation\/prepare$/i.test(path)) {
+    return false;
+  }
+
+  const store = loadAttemptState(id);
+  const pre = preflightId != null ? store.preflightHistory.find(x => x.id === preflightId) : store.pendingPreflight;
+  if (!pre) return false;
+
+  const parsed = attemptSafeJSONParse(text);
+
+  pre.responseAt = Date.now();
+  pre.responseStatus =
+    response && Number.isFinite(Number(response.status))
+      ? Number(response.status)
+      : null;
+  pre.responseBytes = nullableNumber(payloadBytes);
+  pre.responseContentType =
+    response?.headers?.get?.('content-type') || null;
+  pre.responseKeys = attemptShallowKeys(parsed);
+  pre.responseDispatchHints =
+    attemptExtractTransportHints(parsed);
+
+  if (!pre.matchedAttemptId) store.pendingPreflight = pre;
+  attemptUpdatePreflightHistory(store, pre);
+  saveAttemptState(id, store);
+
+  return true;
+}
+
+function attemptTakeRecentPreflight(id, maxAgeMs = 30000, meta = {}) {
+  const store = loadAttemptState(id), now = Date.now();
+  const rows = store.preflightHistory.filter(p => !p.matchedAttemptId && now - p.time >= 0 && now - p.time <= maxAgeMs);
+  const compatible = rows.filter(p =>
+    !(p.conversationId && meta.requestConversationId && p.conversationId !== meta.requestConversationId) &&
+    !(p.parentMessageId && meta.requestParentMessageId && p.parentMessageId !== meta.requestParentMessageId) &&
+    !(p.action && meta.requestAction && p.action !== meta.requestAction));
+  const full = compatible.filter(p => p.conversationId && p.conversationId === meta.requestConversationId && p.parentMessageId && p.parentMessageId === meta.requestParentMessageId);
+  const chat = compatible.filter(p => p.conversationId && p.conversationId === meta.requestConversationId);
+  const pre = (full.length ? full : chat.length ? chat : compatible).at(-1);
+  if (!pre) return null;
+  pre.matchedBy = full.length ? 'conversation+parent' : chat.length ? 'conversation' : 'recency fallback';
+  pre.matchedAttemptId = store.current?.id;
+  if (store.pendingPreflight?.time === pre.time) store.pendingPreflight = null;
+  saveAttemptState(id, store);
+  return pre;
+}
+
+function attemptDataBytes(data) {
+  if (typeof data === 'string') {
+    try {
+      return new TextEncoder().encode(data).length;
+    } catch {
+      return data.length;
+    }
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return data.byteLength;
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    return data.byteLength;
+  }
+
+  if (data && typeof data.size === 'number') {
+    return Number(data.size) || 0;
+  }
+
+  return 0;
+}
+
+function attemptTransportPreview() { return null; }
+
+function attemptTransportEventKind(data) {
+  const obj = typeof data === 'string' ? attemptSafeJSONParse(data) : null;
+  return safeEventKind(obj?.type || obj?.event || obj?.status);
+}
+
+function attemptTransportLooksDone(data) {
+  return attemptSSEEventNames(String(data || '')).some(x => ['[DONE]','finished_successfully','message_stream_complete'].includes(x));
+}
+
+function attemptRecentTransportText(a, limit = 12) {
+  const rows = Array.isArray(a?.transportEvents)
+    ? a.transportEvents
+    : [];
+
+  if (!rows.length) return '—';
+
+  return rows
+    .slice(-limit)
+    .map(x => (
+      `${x.transport}:${x.direction} ` +
+      `${fmt(x.bytes || 0)}B` +
+      `${x.kind ? ` ${x.kind}` : ''}`
+    ))
+    .join(' || ');
+}
+
+function attemptRecordTransportEvent(id, transport, direction, url, data) {
+  if (!id) return;
+  const store = loadAttemptState(id), a = store.current;
+  const parsed = typeof data === 'string' ? attemptSafeJSONParse(data) : null;
+  const ev = {time:Date.now(), transport, direction, url:sanitizeURL(url), bytes:attemptDataBytes(data), kind:attemptTransportEventKind(data)};
+  // Time proximity alone cannot establish ownership of a control WebSocket.
+  const requestId = a?.preflight?.responseDispatchHints?.websocket_request_id || a?.preflight?.requestDispatchHints?.websocket_request_id;
+  const related = a && ((requestId && parsed?.websocket_request_id === requestId) ||
+    (parsed?.conversation_id === id && parsed?.parent_message_id && parsed.parent_message_id === a.requestParentMessageId));
+  if (!related) { store.uncorrelatedWebSocket.push(ev); saveAttemptState(id,store); return; }
+  a.transportEvents.push(ev);
+  const stats = a.transportStats;
+  const incoming = direction === 'in';
+  stats[incoming ? 'websocketInCount' : 'websocketOutCount']++;
+  stats[incoming ? 'websocketInBytes' : 'websocketOutBytes'] += ev.bytes;
+  stats.websocketMaxBytes = Math.max(stats.websocketMaxBytes, ev.bytes);
+  stats.websocketURLs = [...new Set([...stats.websocketURLs, ev.url])].slice(-12);
+  a.lastTransportActivityAt = ev.time;
+  saveAttemptState(id,store);
+  if (attemptLooksLikeMaxErrorText(data)) attemptMarkMax(id,'structured WebSocket error',a.id);
+}
+
+function attemptSuccessCandidateFromCapture(a, c, pre) {
+  return Boolean(
+    a &&
+    c &&
+    pre &&
+    pre.assistantMessages != null &&
+    c.assistantMessages != null &&
+    c.assistantMessages > pre.assistantMessages
+  );
+}
+
+function attemptScheduleSettledSuccess(id) {
+  clearTimeout(attemptSettleTimer);
+
+  attemptSettleTimer = setTimeout(() => {
+    const store = loadAttemptState(id);
+    const a = store.current;
+
+    if (!a?.successCandidate) return;
+    if (visibleHardMax()) return;
+
+    /*
+      Require either explicit completion evidence or that ChatGPT is no
+      longer visibly generating. This prevents a temporary pause in a long
+      answer from being finalized too early.
+    */
+    const completionEvidence =
+      Number(a.responseCompletedAt || 0) > 0 ||
+      Number(a.transportStats?.doneSignals || 0) > 0 ||
+      !visibleGenerationActive();
+
+    if (!completionEvidence) {
+      attemptScheduleSettledSuccess(id);
+      return;
+    }
+
+    const activity = Math.max(
+      Number(a.lastTransportActivityAt || 0),
+      Number(a.responseCompletedAt || 0),
+      Number(a.generationEndedAt || 0),
+      Number(a.successCandidate?.time || 0)
+    );
+
+    if (Date.now() - activity < 1800) {
+      attemptScheduleSettledSuccess(id);
+      return;
+    }
+
+    const c = a.successCandidate.capture;
+    const pre = a.successCandidate.pre;
+
+    a.status='success';
+    a.outcome='success';
+    a.successConfirmedAt=Date.now();
+    a.finalizedAt=Date.now();
+    a.post=c;
+
+    a.deltas={
+      sourceFamily:c.sourceFamily,
+      retainedBytes:
+        pre?.retainedBytes!=null && c.retainedBytes!=null
+          ? c.retainedBytes-pre.retainedBytes
+          : null,
+      activeBranchBytes:
+        pre?.activeBranchBytes!=null && c.activeBranchBytes!=null
+          ? c.activeBranchBytes-pre.activeBranchBytes
+          : null,
+      mappingBytes:
+        pre?.mappingBytes!=null && c.mappingBytes!=null
+          ? c.mappingBytes-pre.mappingBytes
+          : null,
+      branchNodes:
+        pre?.branchNodes!=null && c.branchNodes!=null
+          ? c.branchNodes-pre.branchNodes
+          : null,
+      assistantMessages:
+        pre?.assistantMessages!=null && c.assistantMessages!=null
+          ? c.assistantMessages-pre.assistantMessages
+          : null,
+      toolResults:
+        pre?.toolResults!=null && c.toolResults!=null
+          ? c.toolResults-pre.toolResults
+          : null,
+      strongContextMarkers:
+        pre?.strongContextMarkers!=null && c.strongContextMarkers!=null
+          ? c.strongContextMarkers-pre.strongContextMarkers
+          : null
+    };
+
+    attemptFinalize(store,a);
+    saveAttemptState(id,store);
+  },2200);
+}
+
+function attemptTransportSummary(a) {
+  if (!a) return '—';
+
+  const s = a.transportStats || {};
+  const parts = [];
+
+  if (
+    s.websocketInCount ||
+    s.websocketOutCount
+  ) {
+    parts.push(
+      `WS in ${s.websocketInCount||0}/${fmt(s.websocketInBytes||0)}B`
+    );
+    parts.push(
+      `WS out ${s.websocketOutCount||0}/${fmt(s.websocketOutBytes||0)}B`
+    );
+    parts.push(
+      `WS max ${fmt(s.websocketMaxBytes||0)}B`
+    );
+  }
+
+  if (s.doneSignals) {
+    parts.push(`done ${s.doneSignals}`);
+  }
+
+  return parts.length ? parts.join(' · ') : '—';
+}
+
+function attemptPreflightSummary(pre) {
+  if (!pre) return '—';
+
+  const hints = {
+    ...(pre.requestDispatchHints || {}),
+    ...(pre.responseDispatchHints || {})
+  };
+
+  return (
+    `${pre.requestPath || 'prepare'} · ` +
+    `${fmt(pre.requestBodyBytes || 0)}B request · ` +
+    `${pre.responseStatus ?? '—'} / ` +
+    `${fmt(pre.responseBytes || 0)}B response · ` +
+    `hints ${Object.keys(hints).length}`
+  );
+}
+
+
+
+function attemptNetworkTotalCount(a) {
+  const families = a?.networkFamilies;
+
+  if (
+    !families ||
+    typeof families !== 'object'
+  ) {
+    return 0;
+  }
+
+  return Object.values(families)
+    .reduce(
+      (sum, x) => sum + (Number(x?.count) || 0),
+      0
+    );
+}
+
+function attemptSSECompletionSignals(stats) {
+  const counts = stats?.eventCounts || {};
+  const signals = [];
+
+  const add = (key, label) => {
+    if (Number(counts[key]) > 0) {
+      signals.push(label);
+    }
+  };
+
+  add('[DONE]', '[DONE]');
+  add('finished_successfully', 'finished_successfully');
+  add('message_stream_complete', 'message_stream_complete');
+  add('message_end', 'message_end');
+  add('done', 'done');
+
+  return signals;
+}
+
+function attemptSSEConfirmationLabel(a) {
+  const signals = attemptSSECompletionSignals(
+    a?.streamStats
+  );
+
+  if (!signals.length) {
+    return 'SSE completion';
+  }
+
+  return `SSE ${signals.slice(0,3).join(' + ')}`;
+}
+
+function attemptUpdateStoredAttempt(store, a) {
+  if (!store || !a) return;
+
+  if (
+    store.last &&
+    Number(store.last.id) === Number(a.id)
+  ) {
+    store.last = a;
+  }
+
+  const rows = Array.isArray(store.attempts)
+    ? store.attempts
+    : [];
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (Number(rows[i]?.id) === Number(a.id)) {
+      rows[i] = a;
+      break;
+    }
+  }
+
+  store.attempts = rows;
+}
+
+function attemptPostDelta(pre, c) {
+  if (!pre || !c) return null;
+
+  const delta = (field) => (
+    pre[field] != null &&
+    c[field] != null
+      ? c[field] - pre[field]
+      : null
+  );
+
+  return {
+    sourceFamily:c.sourceFamily,
+    retainedBytes:delta('retainedBytes'),
+    activeBranchBytes:delta('activeBranchBytes'),
+    mappingBytes:delta('mappingBytes'),
+    branchNodes:delta('branchNodes'),
+    messageNodes:delta('messageNodes'),
+    assistantMessages:delta('assistantMessages'),
+    userMessages:delta('userMessages'),
+    toolResults:delta('toolResults'),
+    toolCalls:delta('toolCalls'),
+    strongContextMarkers:delta('strongContextMarkers'),
+    displayLikeTokens:delta('displayLikeTokens')
+  };
+}
+
+function attemptRecordPostOutcomeCapture(id, obs) {
+  if (!id || !obs) return;
+  const binding = activeCaptureBinding;
+  const store = loadAttemptState(id);
+  // Explicit job identity wins; unsolicited app state attaches only to the latest
+  // outcome if no newer generation has started.
+  const a = binding?.attemptId != null ? eventAttempt(id, binding.attemptId) : (!store.current ? store.last : null);
+  if (!a?.finalizedAt || Date.now() - a.finalizedAt > 20000) return;
+  if (binding?.chatId && binding.chatId !== id) return;
+  const c = attemptCompactObservation(obs), family = c.sourceFamily;
+  const p = a.postCorrelation;
+  if (!p) return;
+  p.lastCapturedAt = Date.now(); p.captureCount++;
+  p.snapshotsByFamily[family] = {...c, attemptId:a.id, conversationId:id};
+  p.deltasByFamily[family] = attemptPostDelta(a.pre?.[family], c);
+  a.post = c; a.deltas = p.deltasByFamily[family];
+  attemptUpdateStoredAttempt(store, a);
+  saveAttemptState(id, store);
+}
+
+function attemptSchedulePostOutcomeCaptures(id, attemptId) {
+  const a = eventAttempt(id, attemptId);
+  if (!a?.postCorrelation || a.postCorrelation.scheduled) return;
+  a.postCorrelation.scheduled = true;
+  a.postCorrelation.startedAt = Date.now();
+  saveAttemptState(id, loadAttemptState(id));
+  for (const delay of [250,1200,3200]) {
+    scheduleBoundCapture({chatId:id, attemptId, reason:'post-outcome'}, delay);
+  }
+}
+
+function attemptFinalizeSuccessFromSSE(
+  id,
+  confirmation = null
+) {
+  if (!id) return false;
+
+  const store = loadAttemptState(id);
+  const a = store.current;
+
+  if (
+    !a ||
+    !['running','pending'].includes(a.status)
+  ) {
+    return false;
+  }
+
+  if (chatIdFromURL() === id && visibleHardMax()) {
+    return false;
+  }
+
+  const signals = attemptSSECompletionSignals(
+    a.streamStats
+  );
+
+  if (!signals.length) {
+    return false;
+  }
+
+  a.status = 'success';
+  a.outcome = 'success';
+  a.outcomeConfirmedBy =
+    confirmation ||
+    attemptSSEConfirmationLabel(a);
+  a.outcomeConfirmedAt = Date.now();
+  a.successConfirmedAt = Date.now();
+  a.finalizedAt = Date.now();
+
+  if (
+    a.streamStats?.readError &&
+    signals.length
+  ) {
+    a.streamStats.readErrorBenign = true;
+  }
+
+  const attemptId = a.id;
+
+  attemptFinalize(store, a);
+  saveAttemptState(id, store);
+  eventConfirmRecovery(id, a);
+
+
+  attemptSchedulePostOutcomeCaptures(
+    id,
+    attemptId
+  );
+
+  return true;
+}
+
+function attemptScheduleSSESuccess(id) {
+  attemptFinalizeSuccessFromSSE(id);
+}
+
+function attemptOutcomeConfirmationText(a) {
+  if (!a) return '—';
+
+  return (
+    a.outcomeConfirmedBy ||
+    (
+      a.outcome === 'success'
+        ? 'success (legacy/unattributed)'
+        : a.outcome === 'max'
+          ? 'MAX (legacy/unattributed)'
+          : '—'
+    )
+  );
+}
+
+function attemptPostCorrelationText(a) {
+  const p = a?.postCorrelation;
+
+  if (!p) return '—';
+
+  const parts = [];
+
+  for (const family of ['direct','batch','other']) {
+    const c = p.snapshotsByFamily?.[family];
+
+    if (!c) continue;
+
+    const d = p.deltasByFamily?.[family];
+
+    parts.push(
+      `${lifecycleFamilyLabel(family)} ` +
+      `${fmt(c.retainedBytes || 0)}B retained / ` +
+      `${fmt(c.activeBranchBytes || 0)}B active` +
+      (
+        d?.assistantMessages != null
+          ? ` · Δassistant ${d.assistantMessages >= 0 ? '+' : ''}${d.assistantMessages}`
+          : ''
+      )
+    );
+  }
+
+  if (!parts.length) {
+    return p.scheduled
+      ? 'scheduled / awaiting source snapshot'
+      : '—';
+  }
+
+  return parts.join(' || ');
+}
+
+
+function attemptEnsureStreamStats(a) {
+  if (!a.streamStats) {
+    a.streamStats = {
+      observed:false,
+      startedAt:null,
+      firstByteAt:null,
+      endedAt:null,
+      chunkCount:0,
+      totalBytes:0,
+      maxChunkBytes:0,
+      lastChunkAt:null,
+      status:null,
+      contentType:null,
+      doneSignals:0,
+      maxTextDetected:false,
+      eventCounts:{},
+      recentEvents:[],
+      readError:null,
+      readErrorBenign:false
+    };
+  }
+
+  if (!a.streamStats.eventCounts) {
+    a.streamStats.eventCounts = {};
+  }
+
+  if (!Array.isArray(a.streamStats.recentEvents)) {
+    a.streamStats.recentEvents = [];
+  }
+
+  return a.streamStats;
+}
+
+function attemptSSEEventNames(text) {
+  const names = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('event:')) {
+      const kind = safeEventKind(line.slice(6).trim());
+      if (kind) names.push(kind);
+    } else if (line.startsWith('data:')) {
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') { names.push('[DONE]'); continue; }
+      const obj = attemptSafeJSONParse(payload);
+      if (obj) {
+        const kind = safeEventKind(obj.type || obj.event || obj.status);
+        if (kind) names.push(kind);
+        if (obj.message?.status === 'finished_successfully') names.push('finished_successfully');
+      }
+    }
+  }
+  return [...new Set(names)];
+}
+
+function attemptRecordStreamEventNames(stats, names) {
+  for (const raw of names || []) {
+    const name = String(raw || '').slice(0,120);
+    if (!name) continue;
+
+    stats.eventCounts[name] =
+      (Number(stats.eventCounts[name]) || 0) + 1;
+
+    const recent = stats.recentEvents;
+    recent.push({
+      time:Date.now(),
+      event:name
+    });
+    stats.recentEvents = recent.slice(-40);
+  }
+}
+
+function attemptStreamHasDoneSignal(text, names = []) {
+  return names.some(x => ['[DONE]','finished_successfully','message_stream_complete'].includes(x));
+}
+
+function attemptRecordStreamChunk(
+  id,
+  url,
+  response,
+  bytes,
+  textChunk,
+  attemptId = null
+) {
+  if (!id) return;
+
+  const store = loadAttemptState(id);
+  const a = eventAttempt(id, attemptId);
+
+  if (
+    !a ||
+    a.telemetryFinalizedAt ||
+    !attemptRequestMatches(a, url)
+  ) {
+    return;
+  }
+
+  const stats = attemptEnsureStreamStats(a);
+  const now = Date.now();
+
+  stats.observed = true;
+  stats.startedAt = stats.startedAt || now;
+  stats.firstByteAt = stats.firstByteAt || now;
+  stats.chunkCount++;
+  stats.totalBytes += Number(bytes) || 0;
+  stats.maxChunkBytes = Math.max(
+    Number(stats.maxChunkBytes) || 0,
+    Number(bytes) || 0
+  );
+  stats.lastChunkAt = now;
+
+  if (stats.status == null) {
+    stats.status =
+      response && Number.isFinite(Number(response.status))
+        ? Number(response.status)
+        : null;
+  }
+
+  if (!stats.contentType) {
+    stats.contentType =
+      response?.headers?.get?.('content-type') || null;
+  }
+
+  const key = `${id}:${a.id}`;
+  const joined = (streamBuffers.get(key) || '') + textChunk;
+  const cut = joined.lastIndexOf('\n');
+  const complete = cut >= 0 ? joined.slice(0,cut+1) : '';
+  streamBuffers.set(key, (cut >= 0 ? joined.slice(cut+1) : joined).slice(-262144));
+  const names = attemptSSEEventNames(complete);
+  attemptRecordStreamEventNames(stats, names);
+
+  const maxText = attemptLooksLikeMaxErrorText(complete);
+
+  if (maxText) {
+    stats.maxTextDetected = true;
+  }
+
+  const done = attemptStreamHasDoneSignal(
+    complete,
+    names
+  );
+
+  if (done) {
+    stats.doneSignals++;
+  }
+
+  a.responseObservedAt =
+    a.responseObservedAt ||
+    now;
+  a.responseStatus =
+    stats.status ??
+    a.responseStatus ??
+    null;
+  a.responseContentType =
+    stats.contentType ||
+    a.responseContentType ||
+    null;
+  a.responseBytes = stats.totalBytes;
+  a.lastTransportActivityAt = now;
+  a.streamStats = stats;
+
+  attemptUpdateStoredAttempt(store, a);
+  saveAttemptState(id, store);
+
+  if (maxText) {
+    attemptMarkMax(
+      id,
+      'structured SSE error', a.id
+    );
+    return;
+  }
+
+  if (done && !a.outcome && !(stats.status != null && (stats.status < 200 || stats.status >= 300))) {
+    attemptGenerationEnded(id);
+    attemptScheduleSSESuccess(id);
+  }
+}
+
+function attemptFinishStream(
+  id,
+  url,
+  response,
+  error = null,
+  attemptId = null
+) {
+  if (!id) return;
+
+  const store = loadAttemptState(id);
+  const a = eventAttempt(id, attemptId);
+
+  if (
+    !a ||
+    a.telemetryFinalizedAt ||
+    !attemptRequestMatches(a, url)
+  ) {
+    return;
+  }
+
+  const key = `${id}:${a.id}`;
+  const tail = streamBuffers.get(key);
+  if (tail) {
+    streamBuffers.delete(key); // Flush the retained tail once, without joining it to itself.
+    attemptRecordStreamChunk(id,url,response,0,tail+'\n',a.id);
+  }
+  streamBuffers.delete(key);
+  const stats = attemptEnsureStreamStats(a);
+  const now = Date.now();
+
+  stats.observed = true;
+  stats.startedAt = stats.startedAt || now;
+  stats.endedAt = now;
+  a.transportClosedAt = a.telemetryFinalizedAt = now;
+  a.telemetryClosureReason = error ? 'stream read error' : 'stream ended';
+
+  if (error) {
+    stats.readError = String(
+      error?.message ||
+      error
+    );
+    stats.readError = redactDiagnosticText(stats.readError).slice(0,500);
+  }
+
+  const completionSignals =
+    attemptSSECompletionSignals(stats);
+
+  if (
+    stats.readError &&
+    completionSignals.length
+  ) {
+    /*
+      ChatGPT may abort the cloned BodyStreamBuffer after the useful SSE
+      sequence has already delivered finished_successfully/[DONE].
+      That is not a failed generation.
+    */
+    stats.readErrorBenign = /BodyStreamBuffer was aborted/i.test(stats.readError);
+  }
+
+  if (stats.status == null) {
+    stats.status =
+      response &&
+      Number.isFinite(Number(response.status))
+        ? Number(response.status)
+        : null;
+  }
+
+  if (!stats.contentType) {
+    stats.contentType =
+      response?.headers?.get?.('content-type') ||
+      null;
+  }
+
+  a.responseObservedAt =
+    a.responseObservedAt ||
+    now;
+  a.responseCompletedAt = now;
+  a.responseStatus =
+    stats.status ??
+    a.responseStatus ??
+    null;
+  a.responseContentType =
+    stats.contentType ||
+    a.responseContentType ||
+    null;
+  a.responseBytes =
+    stats.totalBytes;
+  a.streamStats = stats;
+
+  attemptUpdateStoredAttempt(store, a);
+  saveAttemptState(id, store);
+
+  if (!a.outcome && a.responseStatus != null && (a.responseStatus < 200 || a.responseStatus >= 300)) {
+    eventFinalizeError(id,a,`HTTP generation failure (${a.responseStatus})`);
+    return;
+  }
+
+  if (completionSignals.length && !a.outcome) {
+    attemptGenerationEnded(id);
+
+    attemptFinalizeSuccessFromSSE(
+      id,
+      attemptSSEConfirmationLabel(a)
+    );
+
+    return;
+  }
+
+  /*
+    No authoritative SSE completion signal: preserve V2.21's slower
+    assistant-progress/DOM/MAX fallback.
+  */
+  if (!a.outcome) {
+    if (error) eventFinalizeError(id,a,'correlation incomplete: clone stream read error');
+    else { attemptGenerationEnded(id); attemptSchedulePostResponseCapture(id); }
+  }
+}
+
+function attemptInspectResponseStream(response, url, binding) {
+  try {
+    const id = binding?.chatId;
+
+    if (!id) return false;
+
+    const store = loadAttemptState(id);
+    const a = eventAttempt(id,binding?.attemptId);
+
+    if (
+      !a ||
+      !['running','pending'].includes(a.status) ||
+      !attemptRequestMatches(a, url)
+    ) {
+      return false;
+    }
+
+    if (
+      !response ||
+      typeof response.clone !== 'function'
+    ) {
+      return false;
+    }
+
+    const clone = response.clone();
+    const body = clone.body;
+
+    if (
+      !body ||
+      typeof body.getReader !== 'function'
+    ) {
+      return false;
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+
+    /*
+      Read the CLONE only. The page's original Response and its body are
+      untouched.
+    */
+    (async () => {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+
+          if (done) break;
+
+          const bytes =
+            value?.byteLength ??
+            value?.length ??
+            0;
+
+          const textChunk = value
+            ? decoder.decode(value, { stream:true })
+            : '';
+
+          attemptRecordStreamChunk(
+            id,
+            url,
+            response,
+            bytes,
+            textChunk,
+            a.id
+          );
+        }
+
+        const tail = decoder.decode();
+
+        if (tail) {
+          attemptRecordStreamChunk(
+            id,
+            url,
+            response,
+            0,
+            tail,
+            a.id
+          );
+        }
+
+        attemptFinishStream(
+          id,
+          url,
+          response,
+          null,
+          a.id
+        );
+      } catch (e) {
+        attemptFinishStream(
+          id,
+          url,
+          response,
+          e,
+          a.id
+        );
+      }
+    })();
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attemptStreamSummary(a) {
+  const s = a?.streamStats;
+
+  if (!s?.observed) return '—';
+
+  const firstByteMs =
+    s.firstByteAt && a?.startedAt
+      ? s.firstByteAt - a.startedAt
+      : null;
+
+  const durationMs =
+    s.endedAt && s.firstByteAt
+      ? s.endedAt - s.firstByteAt
+      : null;
+
+  const errorText =
+    s.readError
+      ? (
+          s.readErrorBenign
+            ? ` · benign abort: ${s.readError}`
+            : ` · read error: ${s.readError}`
+        )
+      : '';
+
+  return (
+    `${s.chunkCount || 0} chunks · ` +
+    `${fmt(s.totalBytes || 0)}B total · ` +
+    `${fmt(s.maxChunkBytes || 0)}B max chunk · ` +
+    `TTFB ${firstByteMs != null ? firstByteMs + 'ms' : '—'} · ` +
+    `stream ${durationMs != null ? (durationMs/1000).toFixed(2)+'s' : 'open'} · ` +
+    `done ${s.doneSignals || 0}` +
+    errorText
+  );
+}
+
+function attemptStreamEventsText(a, limit = 20) {
+  const counts = a?.streamStats?.eventCounts;
+
+  if (!counts || typeof counts !== 'object') {
+    return '—';
+  }
+
+  const rows = Object.entries(counts)
+    .sort((x,y) => Number(y[1]) - Number(x[1]))
+    .slice(0,limit);
+
+  return rows.length
+    ? rows.map(([k,v]) => `${k}:${v}`).join(', ')
+    : '—';
+}
+
+function attemptDOMAssistantSignature() {
+  try {
+    const turns = [
+      ...document.querySelectorAll(
+        'main [data-testid^="conversation-turn"]'
+      )
+    ];
+
+    if (turns.length) {
+      const lastAssistantTurn = [...turns]
+        .reverse()
+        .find(turn =>
+          turn.querySelector?.(
+            '[data-message-author-role="assistant"]'
+          ) ||
+          /assistant/i.test(
+            String(turn.getAttribute?.('data-testid') || '')
+          )
+        );
+
+      const text = String(
+        lastAssistantTurn?.innerText || ''
+      );
+
+      return {
+        signature:
+          `${turns.length}:${text.length}:${text.slice(-120)}`,
+        count:turns.length,
+        chars:text.length
+      };
+    }
+
+    const nodes = [
+      ...document.querySelectorAll(
+        '[data-message-author-role="assistant"]'
+      )
+    ];
+
+    const count = nodes.length;
+    const last = count
+      ? String(nodes[count-1]?.innerText || '')
+      : '';
+
+    return {
+      signature:
+        `${count}:${last.length}:${last.slice(-120)}`,
+      count,
+      chars:last.length
+    };
+  } catch {
+    return {
+      signature:'',
+      count:0,
+      chars:0
+    };
+  }
+}
+
+function attemptMutationRelevant(mutations) {
+  if (!Array.isArray(mutations)) {
+    mutations = [...(mutations || [])];
+  }
+
+  return mutations.some(m => {
+    const target = m?.target;
+
+    if (
+      panel &&
+      target &&
+      (
+        target === panel ||
+        panel.contains?.(target)
+      )
+    ) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function attemptHandleDOMMutation() {
+  const id = chatIdFromURL();
+  if (!id) return;
+  eventPollMax(id);
+  const store = loadAttemptState(id), a = store.current;
+  const sig = attemptDOMAssistantSignature();
+  if (a) {
+    a.domStats.observerEvents++;
+    a.domStats.lastMutationAt = Date.now();
+    if (sig.signature !== attemptDOMLastSignature) {
+      a.domStats.assistantChanges++;
+      if (Date.now()-attemptDOMLastCaptureAt > 2500) {
+        attemptDOMLastCaptureAt = Date.now();
+        scheduleBoundCapture({chatId:id,attemptId:a.id,reason:'inflight'},100);
+      }
+    }
+    saveAttemptState(id,store);
+  }
+  attemptDOMLastSignature = sig.signature;
+  attemptDOMLastGenerating = visibleGenerationActive();
+}
+
+function installAttemptDOMObserver() {
+  if (
+    attemptDOMObserver ||
+    !document.body
+  ) {
+    return;
+  }
+
+  attemptDOMLastGenerating =
+    visibleGenerationActive();
+
+  attemptDOMLastSignature =
+    attemptDOMAssistantSignature().signature;
+
+  attemptDOMObserver = new MutationObserver(
+    mutations => {
+      if (!attemptMutationRelevant(mutations)) {
+        return;
+      }
+
+      clearTimeout(attemptDOMTimer);
+
+      attemptDOMTimer = setTimeout(
+        attemptHandleDOMMutation,
+        100
+      );
+    }
+  );
+
+  attemptDOMObserver.observe(
+    document.body,
+    {
+      childList:true,
+      subtree:true,
+      characterData:true,
+      attributes:true,
+      attributeFilter:[
+        'data-testid',
+        'aria-label',
+        'aria-busy',
+        'disabled'
+      ]
+    }
+  );
+}
+
+function attemptDOMSummary(a) {
+  const d = a?.domStats;
+
+  if (!d) return '—';
+
+  return (
+    `${d.observerEvents || 0} observer events · ` +
+    `${d.assistantChanges || 0} assistant changes · ` +
+    `${d.generationStarts || 0} starts / ` +
+    `${d.generationStops || 0} stops`
+  );
+}
+
+
+function installWebSocketHook() {
+  if (websocketHooked) return;
+  websocketHooked = true;
+
+  try {
+    const OriginalWebSocket = page.WebSocket;
+
+    if (typeof OriginalWebSocket !== 'function') {
+      return;
+    }
+
+    const WrappedWebSocket = new Proxy(
+      OriginalWebSocket,
+      {
+        construct(target, args) {
+          const ws = Reflect.construct(
+            target,
+            args,
+            target
+          );
+
+          const url = String(
+            args?.[0] ||
+            ws.url ||
+            ''
+          );
+
+          try {
+            const originalSend = ws.send;
+
+            ws.send = function(data) {
+              try {
+                attemptRecordTransportEvent(
+                  chatIdFromURL(),
+                  'websocket',
+                  'out',
+                  url,
+                  data
+                );
+              } catch {}
+
+              return originalSend.call(this, data);
+            };
+
+            ws.addEventListener(
+              'message',
+              ev => {
+                try {
+                  attemptRecordTransportEvent(
+                    chatIdFromURL(),
+                    'websocket',
+                    'in',
+                    url,
+                    ev.data
+                  );
+                } catch {}
+              }
+            );
+          } catch {}
+
+          return ws;
+        }
+      }
+    );
+
+    page.WebSocket = WrappedWebSocket;
+  } catch (e) {
+    console.warn(
+      '[Chat Size V2.20] Could not hook WebSocket:',
+      e
+    );
+  }
+}
+
+
+function attemptURLParts(url) {
+  try {
+    const u = new URL(String(url || ''), location.origin);
+    return {
+      href: u.href,
+      pathname: u.pathname,
+      search: u.search || ''
+    };
+  } catch {
+    return {
+      href: String(url || ''),
+      pathname: String(url || '').split('?')[0],
+      search: ''
+    };
+  }
+}
+
+function attemptRequestPath(url) {
+  return attemptURLParts(url).pathname || '';
+}
+
+function attemptBodyBytes(body) {
+  if (typeof body === 'string') {
+    try {
+      return new TextEncoder().encode(body).length;
+    } catch {
+      return body.length;
+    }
+  }
+
+  if (body instanceof URLSearchParams) {
+    const s = body.toString();
+    try {
+      return new TextEncoder().encode(s).length;
+    } catch {
+      return s.length;
+    }
+  }
+
+  if (body && typeof body.size === 'number') {
+    return Number(body.size) || null;
+  }
+
+  return null;
+}
+
+function attemptParseJSONBody(body) {
+  if (typeof body !== 'string') return null;
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+function attemptGenerationBodyHints(parsed) {
+  return !!generationClassifierReason(parsed);
+}
+
+function attemptIsGenerationRequest(url, method, parsedBody = null) {
+  return String(method).toUpperCase() === 'POST' &&
+    /^\/backend-api\/(?:f\/)?conversation(?:\/[^/]+)?$/.test(attemptRequestPath(url)) &&
+    !/\/prepare$/.test(attemptRequestPath(url)) &&
+    attemptGenerationBodyHints(parsedBody);
+}
+
+function attemptTextFromContent(value) {
+  if (value == null) return '';
+
+  if (typeof value === 'string') return value;
+
+  if (Array.isArray(value)) {
+    return value
+      .map(attemptTextFromContent)
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (typeof value !== 'object') return '';
+
+  if (Array.isArray(value.parts)) {
+    return value.parts
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (
+          part &&
+          typeof part === 'object' &&
+          typeof part.text === 'string'
+        ) {
+          return part.text;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (typeof value.text === 'string') {
+    return value.text;
+  }
+
+  return '';
+}
+
+function attemptPromptCharsFromRequest(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const messages = Array.isArray(parsed.messages)
+    ? parsed.messages
+    : [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const role =
+      msg?.author?.role ||
+      msg?.role ||
+      msg?.message?.author?.role ||
+      null;
+
+    if (role && role !== 'user') continue;
+
+    const text =
+      attemptTextFromContent(msg?.content) ||
+      attemptTextFromContent(msg?.message?.content);
+
+    if (text) return text.length;
+  }
+
+  return null;
+}
+
+function attemptFindEffortValue(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const direct = [
+    parsed.reasoning_effort,
+    parsed.thinking_effort,
+    parsed.effort,
+    parsed.thinking_level,
+    parsed.reasoning?.effort,
+    parsed.metadata?.reasoning_effort,
+    parsed.metadata?.thinking_effort
+  ];
+
+  for (const v of direct) {
+    if (
+      typeof v === 'string' ||
+      typeof v === 'number'
+    ) {
+      return String(v);
+    }
+  }
+
+  return null;
+}
+
+function attemptRequestMeta(url, method, body) {
+  const parsed = attemptParseJSONBody(body);
+  const path = attemptRequestPath(url);
+
+  return {
+    requestDetectedAt: Date.now(),
+    generationClassifierReason:generationClassifierReason(parsed),
+    requestURL: sanitizeURL(url),
+    requestPath: path,
+    requestMethod: String(method || 'GET').toUpperCase(),
+    requestBodyBytes: attemptBodyBytes(body),
+    requestAction:
+      parsed && parsed.action != null
+        ? String(parsed.action)
+        : null,
+    requestModel:
+      parsed && parsed.model != null
+        ? String(parsed.model)
+        : null,
+    requestEffort: attemptFindEffortValue(parsed),
+    requestPromptChars: attemptPromptCharsFromRequest(parsed),
+    requestConversationId:
+      parsed?.conversation_id ??
+      parsed?.conversationId ??
+      null,
+    requestParentMessageId:
+      parsed?.parent_message_id ??
+      parsed?.parentMessageId ??
+      null,
+    requestKeys:
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? Object.keys(parsed).slice(0, 80)
+        : [],
+    requestParsed: Boolean(parsed)
+  };
+}
+
+function attemptSameRequest(a, meta) {
+  if (!a || !meta) return false;
+
+  return (
+    a.requestPath &&
+    meta.requestPath &&
+    a.requestPath === meta.requestPath &&
+    Math.abs(
+      Number(meta.requestDetectedAt || 0) -
+      Number(a.requestDetectedAt || a.startedAt || 0)
+    ) < 2500
+  );
+}
+
+function attemptFinalizeUnknownCurrent(
+  id,
+  reason = 'superseded'
+) {
+  const store = loadAttemptState(id);
+  const a = store.current;
+
+  if (!a) return;
+
+  a.status = 'unknown';
+  a.outcome = 'unknown';
+  a.unknownReason = reason;
+  a.finalizedAt = Date.now();
+
+  attemptFinalize(store, a);
+  saveAttemptState(id, store);
+}
+
+function attemptApplyRequestMeta(id, meta) {
+  const store = loadAttemptState(id);
+  const a = store.current;
+
+  if (!a) return;
+
+  Object.assign(a, {
+    requestDetectedAt:
+      meta.requestDetectedAt ??
+      a.requestDetectedAt ??
+      Date.now(),
+    requestURL:
+      meta.requestURL ??
+      a.requestURL ??
+      null,
+    requestPath:
+      meta.requestPath ??
+      a.requestPath ??
+      null,
+    requestMethod:
+      meta.requestMethod ??
+      a.requestMethod ??
+      null,
+    requestBodyBytes:
+      meta.requestBodyBytes ??
+      a.requestBodyBytes ??
+      null,
+    requestAction:
+      meta.requestAction ??
+      a.requestAction ??
+      null,
+    requestModel:
+      meta.requestModel ??
+      a.requestModel ??
+      null,
+    requestEffort:
+      meta.requestEffort ??
+      a.requestEffort ??
+      null,
+    requestPromptChars:
+      meta.requestPromptChars ??
+      a.requestPromptChars ??
+      null,
+    requestConversationId:
+      meta.requestConversationId ??
+      a.requestConversationId ??
+      null,
+    requestParentMessageId:
+      meta.requestParentMessageId ??
+      a.requestParentMessageId ??
+      null,
+    requestKeys:
+      Array.isArray(meta.requestKeys) && meta.requestKeys.length
+        ? meta.requestKeys
+        : a.requestKeys || [],
+    requestParsed:
+      Boolean(meta.requestParsed || a.requestParsed)
+  });
+
+  if (a.requestPromptChars != null) {
+    a.promptChars = a.requestPromptChars;
+  }
+
+  if (a.requestModel) {
+    a.requestModelDetected = a.requestModel;
+  }
+
+  if (a.requestEffort) {
+    a.requestEffortDetected = a.requestEffort;
+  }
+
+  store.current = a;
+  saveAttemptState(id, store);
+}
+
+function attemptStartFromNetwork(id, meta) {
+  if (!id) return null;
+  if (id === chatIdFromURL()) confirmComposerEnter('generation dispatch');
+  const previous = loadAttemptState(id).current;
+  if (previous) attemptFinalizeUnknownCurrent(id, 'superseded by newer real dispatch');
+  attemptStart(id, 'network-generation-dispatch');
+  attemptApplyRequestMeta(id, meta);
+  const preflight = attemptTakeRecentPreflight(id, 30000, meta);
+  const store = loadAttemptState(id), a = store.current;
+  a.preflight = preflight;
+  a.preflightMatchedBy = preflight?.matchedBy || 'no preflight match';
+  a.generationClassifierReason = meta.generationClassifierReason;
+  const intent = store.sendIntents.filter(x => !x.dispatchAt && Date.now()-x.sendIntentAt <= 5000).at(-1);
+  if (intent) {
+    intent.dispatchAt = Date.now(); intent.attemptId = a.id;
+    a.sendIntentAt = intent.sendIntentAt;
+    a.sendIntentToDispatchMs = intent.dispatchAt-intent.sendIntentAt;
+    intent.intentToDispatchMs = a.sendIntentToDispatchMs;
+    a.submissionMethod = intent.submissionMethod;
+    if (intent.blockedBeforeDispatch) {
+      intent.initialBlockedObservationAt = intent.sendIntentAt + 2500;
+      intent.blockedBeforeDispatch = false;
+      const e = eventEpisodes(id).episodes.find(x => x.id === intent.maxEpisodeId);
+      if (e) {
+        e.lateDispatchAt = intent.dispatchAt;
+        e.blockedBeforeDispatch = store.sendIntents.some(x => x.maxEpisodeId === e.id && x.blockedBeforeDispatch);
+        eventSaveEpisodes(id);
+      }
+    }
+  }
+  saveAttemptState(id, store);
+  return a;
+}
+
+function attemptEnrichRequestBody(id, url, method, body) {
+  const parsed = attemptParseJSONBody(body);
+
+  if (
+    !attemptIsGenerationRequest(url, method, parsed)
+  ) {
+    return false;
+  }
+
+  const meta = attemptRequestMeta(url, method, body);
+  attemptStartFromNetwork(id, meta);
+  return true;
+}
+
+function attemptInspectOutgoingRequest(url, method, body, requestObject = null, expectedChatId = chatIdFromURL()) {
+  const id = expectedChatId;
+  if (!id) return false;
+  if (body == null && requestObject?.clone && String(method).toUpperCase() === 'POST') {
+    const store = loadAttemptState(id);
+    store.pendingRequestClassifications++;
+    try {
+      return Promise.resolve(requestObject.clone().text()).then(text =>
+        attemptInspectOutgoingRequest(url, method, text, null, id)).catch(() => false)
+        .finally(() => { store.pendingRequestClassifications--; saveAttemptState(id,store); });
+    } catch { store.pendingRequestClassifications--; return false; }
+  }
+  const parsed = attemptParseJSONBody(body);
+  if (attemptIsPreflightRequest(url, method, parsed)) {
+    const pre = attemptRecordPreflightRequest(id, url, method, body); return {preflightId:pre.id};
+  }
+  if (!attemptIsGenerationRequest(url, method, parsed)) {
+    if (String(method).toUpperCase() === 'POST' && /\/conversation$/.test(attemptRequestPath(url))) {
+      const store = loadAttemptState(id);
+      store.unclassifiedConversationPosts.push({time:Date.now(),url:sanitizeURL(url),reason:'generation shape not established'});
+      saveAttemptState(id,store);
+    }
+    return false;
+  }
+  return attemptStartFromNetwork(id, attemptRequestMeta(url, method, body));
+}
+
+function attemptRequestMatches(a, url) {
+  if (!a?.requestPath) return false;
+  return a.requestPath === attemptRequestPath(url);
+}
+
+function attemptLooksLikeMaxErrorText(text) {
+  // Only an explicit error envelope can confirm transport MAX. Assistant
+  // content/deltas, including quoted diagnostics and JSON, are never searched.
+  if (typeof text !== 'string') return false;
+  const objects = [];
+  const full = attemptSafeJSONParse(text);
+  if (full) objects.push(full);
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('data:')) {
+      const obj = attemptSafeJSONParse(line.slice(5).trim());
+      if (obj) objects.push(obj);
+    }
+  }
+  return objects.some(obj => {
+    if (!obj || typeof obj !== 'object' || obj.message?.author || obj.delta || obj.choices) return false;
+    const error = obj.error || (['error','conversation_error'].includes(obj.type || obj.event) ? obj : null);
+    if (!error) return false;
+    const code = typeof error === 'object' ? error.code || error.type || '' : '';
+    const message = typeof error === 'string' ? error : error.message || error.detail || '';
+    return /^(conversation_too_long|conversation_max_length|conversation_length_exceeded|max_conversation_length)$/.test(code) ||
+      /maximum length for this conversation|conversation is too long/i.test(message);
+  });
+}
+
+function attemptSchedulePostResponseCapture(id) {
+  const a = loadAttemptState(id).current;
+  if (!a) return;
+  const attemptId = a.id;
+  for (const delay of [250,1200,3200]) scheduleBoundCapture({chatId:id,attemptId,reason:'response-complete'},delay);
+  setTimeout(() => {
+    const pending = eventAttempt(id,attemptId);
+    if (pending && !pending.outcome) eventFinalizeError(id,pending,'correlation incomplete: no explicit completion or MAX');
+  },12000);
+}
+
+function attemptObserveGenerationResponse(id, url, response, text, payloadBytes, binding = null) {
+  if (!id || binding?.attemptId == null) return;
+  const a = eventAttempt(id,binding.attemptId);
+  if (!a || !attemptRequestMatches(a,url)) return;
+  if (binding.streamObserved) return; // incremental reader owns stream totals/outcome
+  a.responseStatus = nullableNumber(response?.status);
+  a.responseContentType = response?.headers?.get?.('content-type') || null;
+  a.responseBytes = payloadBytes;
+  a.responseObservedAt = a.responseCompletedAt = Date.now();
+  saveAttemptState(id,loadAttemptState(id));
+  if (attemptLooksLikeMaxErrorText(text)) {
+    attemptMarkMax(id, a.responseStatus >= 400 ? 'HTTP generation error' : 'structured SSE error', a.id);
+  } else if (a.responseStatus != null && (a.responseStatus < 200 || a.responseStatus >= 300)) {
+    eventFinalizeError(id,a,`HTTP generation failure (${a.responseStatus})`);
+  } else {
+    const names = attemptSSEEventNames(text);
+    attemptRecordStreamEventNames(a.streamStats,names);
+    if (names.length && attemptStreamHasDoneSignal(text,names)) attemptFinalizeSuccessFromSSE(id);
+    else { attemptGenerationEnded(id); attemptSchedulePostResponseCapture(id); }
+  }
+  a.transportClosedAt = a.telemetryFinalizedAt = Date.now();
+  saveAttemptState(id,loadAttemptState(id));
+}
+
+function attemptObserveXHRGenerationResponse(
+  id,
+  url,
+  status,
+  contentType,
+  text,
+  payloadBytes,
+  binding = null
+) {
+  const fakeResponse = {
+    status,
+    headers: {
+      get(name) {
+        return String(name).toLowerCase() === 'content-type'
+          ? contentType || ''
+          : '';
+      }
+    }
+  };
+
+  attemptObserveGenerationResponse(
+    id,
+    url,
+    fakeResponse,
+    text,
+    payloadBytes,
+    binding
+  );
+}
+
+
+// ============================================================
+// Install page network hooks at document-start
+// ============================================================
+
+function installNetworkHooks() {
+  if (networkHooked) return;
+  networkHooked = true;
+
+  installWebSocketHook();
+
+  try {
+    const originalFetch = page.fetch;
+
+    if (typeof originalFetch === 'function') {
+      meterFetch = originalFetch.bind(page);
+      page.fetch = function(...args) {
+        let url = '';
+        let method = 'GET';
+        let body = null;
+        let requestObject = null;
+
+        try {
+          requestObject =
+            args[0] &&
+            typeof args[0] === 'object'
+              ? args[0]
+              : null;
+
+          url =
+            typeof args[0] === 'string'
+              ? args[0]
+              : args[0]?.url || args[0]?.href || '';
+
+          method =
+            String(
+              args[1]?.method ||
+              args[0]?.method ||
+              'GET'
+            ).toUpperCase();
+
+          body =
+            args[1]?.body ??
+            null;
+        } catch {}
+
+        /*
+          V2.19 primary attempt-start signal.
+          This runs synchronously before originalFetch.
+        */
+        const requestChatId = chatIdFromURL();
+        const captureRoute = captureObserveRequest(url,method,requestObject,args[1],requestChatId);
+        const detected = attemptInspectOutgoingRequest(url,method,body,requestObject,requestChatId);
+        const bindingPromise = Promise.resolve(detected).then(a => ({
+          chatId:requestChatId, attemptId:a?.id ?? null,
+          preflightId:a?.preflightId ?? null, captureRoute
+        }));
+
+        /*
+          Preserve the original V2.10.1.1 request-body message merge.
+        */
+        inspectRequestBody(
+          url,
+          args[1]
+        );
+
+        const promise = originalFetch.apply(
+          this,
+          args
+        );
+
+        Promise.resolve(promise)
+          .then(async resp => {
+            const binding = await bindingPromise;
+            binding.streamObserved = attemptInspectResponseStream(resp,url,binding);
+            await inspectResponse(resp,url,binding,binding.attemptId != null ? 'generation' : 'app');
+          })
+          .catch(async error => {
+            const binding = await bindingPromise;
+            const a = eventAttempt(binding.chatId,binding.attemptId);
+            if (a) {
+              eventFinalizeError(binding.chatId,a,'generation fetch rejected');
+              a.transportClosedAt = a.telemetryFinalizedAt = Date.now();
+              saveAttemptState(binding.chatId,loadAttemptState(binding.chatId));
+            }
+          });
+
+        return promise;
+      };
+    }
+  } catch (e) {
+    console.warn(
+      '[Chat Size V2.21] Could not hook fetch:',
+      e
+    );
+  }
+
+  try {
+    const XHR = page.XMLHttpRequest;
+
+    if (XHR?.prototype) {
+      const originalOpen = XHR.prototype.open;
+      const originalSend = XHR.prototype.send;
+
+      XHR.prototype.open = function(
+        method,
+        url,
+        ...rest
+      ) {
+        try {
+          this.__cgptMeterURL = String(url || '');
+          this.__cgptMeterMethod = String(method || '');
+        } catch {}
+
+        return originalOpen.call(
+          this,
+          method,
+          url,
+          ...rest
+        );
+      };
+
+      XHR.prototype.send = function(body) {
+        try {
+          const detected = attemptInspectOutgoingRequest(
+            this.__cgptMeterURL,
+            this.__cgptMeterMethod,
+            body,
+            null
+          );
+
+          this.__cgptMeterBinding = {chatId:chatIdFromURL(),attemptId:detected?.id ?? null,preflightId:detected?.preflightId ?? null};
+
+          if (
+            interestingURL(this.__cgptMeterURL) &&
+            typeof body === 'string'
+          ) {
+            inspectRequestBody(
+              this.__cgptMeterURL,
+              {
+                body,
+                method: this.__cgptMeterMethod
+              }
+            );
+          }
+
+          this.addEventListener('load', () => {
+            const binding = this.__cgptMeterBinding;
+            const text = typeof this.responseText === 'string' ? this.responseText : '';
+            const response = {status:this.status,headers:{get:()=>this.getResponseHeader?.('content-type') || ''},clone:()=>({text:async()=>text})};
+            inspectResponse(response,this.__cgptMeterURL,binding,binding.attemptId != null ? 'generation' : 'app');
+          });
+          for (const event of ['error','abort','timeout']) this.addEventListener(event, () => {
+            const binding = this.__cgptMeterBinding, a = eventAttempt(binding.chatId,binding.attemptId);
+            if (!a) return;
+            eventFinalizeError(binding.chatId,a,`generation XHR ${event}`);
+            a.transportClosedAt = a.telemetryFinalizedAt = Date.now();
+            saveAttemptState(binding.chatId,loadAttemptState(binding.chatId));
+          });
+        } catch {}
+
+        return originalSend.call(
+          this,
+          body
+        );
+      };
+    }
+  } catch (e) {
+    console.warn(
+      '[Chat Size V2.21] Could not hook XHR:',
+      e
+    );
+  }
+}
+
+installNetworkHooks();
+installSendIntentHook();
+
+
+// ============================================================
+// Direct capture attempts
+// ============================================================
+
+function captureRouteKind(url, id) {
+  try {
+    const u = new URL(url,location.origin);
+    if (u.origin !== location.origin || u.username || u.password || u.hash) return null;
+    const encoded = encodeURIComponent(id);
+    if (u.pathname === `/backend-api/conversation/${encoded}` || u.pathname === `/backend-api/conversations/${encoded}`) return 'direct';
+    if (u.pathname === '/backend-api/conversations/batch') return 'batch';
+  } catch {}
+  return null;
+}
+
+function captureObserveRequest(url, method, request, init, id) {
+  const kind = id && captureRouteKind(url,id);
+  if (!kind || !['GET','POST'].includes(method) || (kind === 'direct' && method !== 'GET')) return null;
+  try {
+    const u = new URL(url,location.origin);
+    const template = request?.clone ? new Request(request.clone(),init || {}) : new Request(u.href,{...init,method});
+    // Retain only read-route request forms, in memory for ten minutes / twelve routes.
+    // No body/header/credential is copied into diagnostics or localStorage.
+    const ready = (async()=>{
+      if (method === 'POST' && (await template.clone().text()).length > 16384) return null;
+      return template;
+    })().catch(()=>null);
+    const route = {id,url:u.href,method,kind,seenAt:Date.now(),ready,result:null};
+    const key = `${id}:${method}:${u.href}`;
+    captureRoutes.delete(key); captureRoutes.set(key,route);
+    for (const [name,value] of captureRoutes) if (Date.now()-value.seenAt > 600000) captureRoutes.delete(name);
+    while (captureRoutes.size > 12) captureRoutes.delete(captureRoutes.keys().next().value);
+    return route;
+  } catch { return null; }
+}
+
+function captureRetryKey(binding) {
+  return `${binding.chatId}:${binding.attemptId ?? ''}:${binding.episodeId ?? ''}`;
+}
+
+function captureMeterNetwork(binding, url, bytes, contentType) {
+  if (binding.meterRequest?.recorded) return;
+  if (binding.meterRequest) binding.meterRequest.recorded = true;
+  attemptRecordNetworkEvent(binding.chatId,url,bytes,contentType,binding,'meter');
+}
+
+function captureObservedFull(route) {
+  return !!(route.result?.acceptedFull && route.result.status >= 200 && route.result.status < 300);
+}
+
+function captureRouteDiagnostics(id) {
+  return [...captureRoutes.values()].filter(r=>r.id === id && Date.now()-r.seenAt <= 600000).map(r=>({
+    path:attemptRequestPath(r.url),method:r.method,seenAt:r.seenAt,
+    status:r.result?.status ?? null,responseBytes:r.result?.responseBytes ?? null,
+    contentType:r.result?.contentType ?? '',parserAcceptedFull:r.result?.acceptedFull ?? null,
+    sourceFamily:r.result?.sourceFamily ?? null,
+    replayEligible:r.kind === 'direct' || captureObservedFull(r)
+  }));
+}
+
+function captureRetryRoutes(id, manual) {
+  const direct = [], batch = [], seen = new Set();
+  const add = route=>{
+    const key = `${route.method}:${new URL(route.url,location.origin).href}`;
+    if (seen.has(key)) return;
+    seen.add(key); (route.kind === 'batch' ? batch : direct).push(route);
+  };
+  const observed = [...captureRoutes.values()].filter(r=>r.id === id && Date.now()-r.seenAt <= 600000);
+  // A naturally observed parser-accepted form beats URL/size guesses. A BATCH
+  // replay additionally requires proof that this exact form yielded this chat.
+  observed.sort((a,b)=>Number(!captureObservedFull(a))-Number(!captureObservedFull(b)) || b.seenAt-a.seenAt);
+  for (const r of observed) if (r.kind === 'direct' || (manual && captureObservedFull(r))) add(r);
+  // Resource timing proves the per-chat URL, but not a BATCH method or POST body.
+  // Never synthesize a BATCH form from timing alone.
+  try {
+    for (const item of performance.getEntriesByType('resource').slice(-30).reverse()) {
+      if (captureRouteKind(item.name,id) === 'direct') add({url:item.name,method:'GET',kind:'direct',provenance:'observed resource URL'});
+    }
+  } catch {}
+  // Backwards-compatible single GET only; no undocumented include_messages query.
+  add({url:`/backend-api/conversation/${encodeURIComponent(id)}`,method:'GET',kind:'direct',provenance:'legacy fallback'});
+  const paths = new Set(), choices = [];
+  for (const route of direct) {
+    const path = new URL(route.url,location.origin).pathname;
+    if (paths.has(path)) continue;
+    paths.add(path); choices.push(route);
+  }
+  return [...choices.slice(0,2),...batch.slice(0,1)];
+}
+
+async function tryDirectURL(url, binding = {chatId:chatIdFromURL()}, route = {method:'GET'}) {
+  binding = {...binding,meterRequest:{recorded:false,dispatched:false}};
+  const token = binding.retryToken;
+  const failure = reason=>({path:attemptRequestPath(url),method:route.method,status:null,responseBytes:null,contentType:'',acceptedFull:false,sourceFamily:null,reason});
+  if (!meterFetch || !eventBindingValid(binding) || token?.cancelled) return failure('binding cancelled or fetch unavailable');
+  let timer;
+  const controller = new AbortController();
+  try {
+    const remaining = token ? Math.max(0,token.deadline-Date.now()) : 30000;
+    if (!remaining) return failure('retry deadline exceeded');
+    const work = (async()=>{
+      const request = route.ready ? await route.ready : null;
+      if (route.ready && !request) return failure('observed request form unavailable');
+      if (token?.cancelled || !eventBindingValid(binding)) return failure('binding cancelled');
+      binding.meterRequest.dispatched = true;
+      const resp = request
+        ? await meterFetch(request.clone(),{signal:controller.signal,cache:'no-store'})
+        : await meterFetch(url,{method:'GET',credentials:'include',cache:'no-store',signal:controller.signal});
+      return {...await inspectResponse(resp,url,binding,'meter'),method:route.method};
+    })();
+    return await Promise.race([work,new Promise(resolve=>{
+      timer = setTimeout(()=>{
+        if (token) token.cancelled = true;
+        if (binding.meterRequest.dispatched) captureMeterNetwork(binding,url,null,'');
+        controller.abort();resolve(failure('retry deadline exceeded'));
+      },remaining);
+    })]);
+  } catch {
+    if (binding.meterRequest.dispatched) captureMeterNetwork(binding,url,null,'');
+    return failure('capture request failed');
+  }
+  finally { clearTimeout(timer); }
+}
+
+async function retryCapture(binding = null) {
+  const id = chatIdFromURL();
+  if (!id || (binding?.chatId && binding.chatId !== id)) return false;
+  binding = {...(binding || {chatId:id,reason:'manual Retry Capture'}),episodeId:binding?.episodeId ?? eventActiveEpisode(id)?.id ?? null};
+  if (!eventBindingValid(binding)) return false;
+  const token = {startedAt:Date.now(),deadline:Date.now()+30000,cancelled:false};
+  binding.retryToken = token;
+  const trace = {version:'2.24.3',retryId:++retrySerial,conversationId:id,episodeId:binding.episodeId,
+    startedAt:token.startedAt,observedRoutes:captureRouteDiagnostics(id),requests:[],sourceFamily:null,responseBytes:null,result:'running'};
+  retryTraces.set(captureRetryKey(binding),trace);
+  while (retryTraces.size > 12) retryTraces.delete(retryTraces.keys().next().value);
+  const finish = result=>{
+    trace.result = result; trace.finishedAt = Date.now();
+    saveDiagnostic(id,{lastRetry:trace});
+    return result === 'captured';
+  };
+  try {
+    for (const route of captureRetryRoutes(id,binding.reason === 'manual Retry Capture')) {
+      if (!eventBindingValid(binding) || (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId || token.cancelled) return finish('cancelled');
+      const row = await tryDirectURL(route.url,binding,route);
+      trace.requests.push(row);
+      if (!eventBindingValid(binding) || (eventActiveEpisode(id)?.id ?? null) !== binding.episodeId || token.cancelled) return finish('cancelled');
+      if (row.acceptedFull) {
+        trace.sourceFamily = row.sourceFamily; trace.responseBytes = row.responseBytes;
+        scheduleUpdate(); return finish('captured');
+      }
+    }
+    scheduleUpdate(); return finish('no fresh mapping');
+  } catch { return finish('capture failed'); }
+}
+
+
+// ============================================================
+// Stats
+// ============================================================
+
+function safeNumber(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+
+function tokenEstimateForChars(chars) {
+  const n = safeNumber(chars);
+  return n == null ? null : estimateTokens(n);
+}
+
+function compactCounts(obj, limit = 7) {
+  if (!obj || typeof obj !== 'object') return '—';
+
+  const entries = Object.entries(obj)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+
+  if (!entries.length) return '—';
+
+  const shown = entries
+    .slice(0, limit)
+    .map(([k, v]) => `${k}:${v}`);
+
+  if (entries.length > limit) {
+    shown.push(`+${entries.length - limit} more`);
+  }
+
+  return shown.join(', ');
+}
+
+function compactByteCounts(obj, limit = 7) {
+  if (!obj || typeof obj !== 'object') return '—';
+
+  const entries = Object.entries(obj)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+
+  if (!entries.length) return '—';
+
+  const shown = entries
+    .slice(0, limit)
+    .map(([k, v]) => `${k}:${fmt(Number(v) || 0)}B`);
+
+  if (entries.length > limit) {
+    shown.push(`+${entries.length - limit} more`);
+  }
+
+  return shown.join(', ');
+}
+
+function compactBranchDetails(details, limit = 8) {
+  if (!Array.isArray(details) || !details.length) return '—';
+
+  const shown = details.slice(-limit).map(x => {
+    return (
+      `d${x.depth}:` +
+      `${x.children}ch/` +
+      `${x.alternateChildren}alt/` +
+      `${x.alternateSubtreeNodes}nodes`
+    );
+  });
+
+  if (details.length > limit) {
+    shown.unshift(`+${details.length - limit} earlier`);
+  }
+
+  return shown.join(', ');
+}
+
+function describeLargest(record) {
+  if (!record || !Number.isFinite(Number(record.bytes))) return '—';
+
+  const parts = [
+    `${fmt(Number(record.bytes))} B`,
+    record.role || 'unknown',
+    record.contentType || 'unknown'
+  ];
+
+  if (record.toolName) {
+    parts.push(record.toolName);
+  }
+
+  return parts.join(' · ');
+}
+
+function calculateStats() {
+  const id = chatIdFromURL();
+  const snap = loadSnapshot(id);
+  const diag = loadDiagnostic(id) || {};
+  const structure = snap.structure || {};
+  const topology = structure.contextTopology || null;
+  const retainedState = topology?.retainedState || null;
+  const experimentalRisk = v213AssessRisk(retainedState);
+  const lifecycle = loadLifecycle(id);
+  const lifecycleGeneratingNow = visibleGenerationActive();
+
+  const lifecycleDirect = lifecycle.families?.direct || blankLifecycleFamily();
+  const lifecycleBatch = lifecycle.families?.batch || blankLifecycleFamily();
+  const lifecycleOther = lifecycle.families?.other || blankLifecycleFamily();
+
+  const lifecycleCurrentSourceFamily =
+    lifecycle.lastObservation?.sourceFamily ||
+    lifecycleSourceFamily(lifecycle.lastObservation?.source || '');
+
+  const canonicalDirectStable = lifecycleDirect.lastStable || null;
+  const canonicalDirectRetainedBytes =
+    nullableNumber(canonicalDirectStable?.retainedBytes);
+
+  const canonicalDirectRiskBand =
+    v215BandFromRetainedBytes(canonicalDirectRetainedBytes);
+
+  const canonicalDirectRiskAvailable =
+    canonicalDirectRiskBand !== 'unknown';
+
+  const attemptState = loadAttemptState(id);
+  const runtimeAttempt = attemptState.current || attemptState.last || null;
+
+  const chars = snap.records.reduce(
+    (sum, r) => sum + (r.chars || 0),
+    0
+  );
+
+  const userMessages = snap.records.filter(
+    r => r.role === 'user'
+  ).length;
+
+  const assistantMessages = snap.records.filter(
+    r => r.role === 'assistant'
+  ).length;
+
+  const samples = loadVerifiedMaxSamples();
+  const sampleTokens = samples
+    .map(x => Number(x.archiveTokens))
+    .filter(Number.isFinite);
+
+  const activeAllTextChars =
+    safeNumber(structure.activeAllTextChars) ?? chars;
+
+  const activeRoleBasedTextChars =
+    safeNumber(structure.activeDisplayTextChars) ?? chars;
+
+  const activeDisplayLikeTextChars =
+    safeNumber(structure.activeDisplayLikeTextChars) ??
+    activeRoleBasedTextChars;
+
+  const activeHiddenTextChars =
+    safeNumber(structure.activeHiddenTextChars) ??
+    Math.max(0, activeAllTextChars - activeRoleBasedTextChars);
+
+  return {
+    id,
+    full: !!snap.full,
+    source: snap.source,
+    capturedAt: snap.capturedAt,
+    fullCapturedAt: snap.fullCapturedAt,
+
+    // Legacy role-based user/assistant text on active ancestry.
+    chars: activeRoleBasedTextChars,
+    tokens: tokenEstimateForChars(activeRoleBasedTextChars),
+    messages: snap.records.length,
+    userMessages,
+    assistantMessages,
+
+    // Heuristic display-like text (excludes known thoughts/recaps/tool outputs).
+    activeDisplayLikeMessages: safeNumber(structure.activeDisplayLikeMessages),
+    activeDisplayLikeTextChars,
+    activeDisplayLikeTextTokens: tokenEstimateForChars(activeDisplayLikeTextChars),
+
+    // Active branch diagnostics.
+    activeBranchNodes: safeNumber(structure.activeBranchNodes),
+    activeMessageNodes: safeNumber(structure.activeMessageNodes),
+    activeDisplayMessages: safeNumber(structure.activeDisplayMessages),
+    activeAllTextChars,
+    activeAllTextTokens: tokenEstimateForChars(activeAllTextChars),
+    activeHiddenMessageNodes: safeNumber(structure.activeHiddenMessageNodes),
+    activeHiddenTextChars,
+    activeHiddenTextTokens: tokenEstimateForChars(activeHiddenTextChars),
+    activeEmptyMessageNodes: safeNumber(structure.activeEmptyMessageNodes),
+
+    activeExplicitToolRoleNodes: safeNumber(structure.activeExplicitToolRoleNodes),
+    activeToolishNodes: safeNumber(structure.activeToolishNodes),
+    activeToolCallNodes: safeNumber(structure.activeToolCallNodes),
+    activeToolResultNodes: safeNumber(structure.activeToolResultNodes),
+    activeToolCallBytes: safeNumber(structure.activeToolCallBytes),
+    activeToolResultBytes: safeNumber(structure.activeToolResultBytes),
+    activeToolCallNames: structure.activeToolCallNames || null,
+    activeToolResultNames: structure.activeToolResultNames || null,
+    activeRecipientCounts: structure.activeRecipientCounts || null,
+
+    activeContextLikeNodes: safeNumber(structure.activeContextLikeNodes),
+    activeAttachmentNodes: safeNumber(structure.activeAttachmentNodes),
+    activeImageNodes: safeNumber(structure.activeImageNodes),
+    activeFileNodes: safeNumber(structure.activeFileNodes),
+    activeAudioNodes: safeNumber(structure.activeAudioNodes),
+    activeVideoNodes: safeNumber(structure.activeVideoNodes),
+
+    activeImageGenCallNodes: safeNumber(structure.activeImageGenCallNodes),
+    activeImageGenResultNodes: safeNumber(structure.activeImageGenResultNodes),
+    activeGeneratedImageNodes: safeNumber(structure.activeGeneratedImageNodes),
+    activeUploadedImageNodes: safeNumber(structure.activeUploadedImageNodes),
+
+    activeUniqueAssetIds: safeNumber(structure.activeUniqueAssetIds),
+    activeUniqueImageAssetIds: safeNumber(structure.activeUniqueImageAssetIds),
+    activeUniqueFileAssetIds: safeNumber(structure.activeUniqueFileAssetIds),
+    activeUniqueGeneratedImageAssetIds:
+      safeNumber(structure.activeUniqueGeneratedImageAssetIds),
+    activeUniqueUploadedImageAssetIds:
+      safeNumber(structure.activeUniqueUploadedImageAssetIds),
+    activeImageReferenceOccurrences:
+      safeNumber(structure.activeImageReferenceOccurrences),
+    activeFileReferenceOccurrences:
+      safeNumber(structure.activeFileReferenceOccurrences),
+
+    activeAssetNodeBytes: safeNumber(structure.activeAssetNodeBytes),
+    activeImageNodeBytes: safeNumber(structure.activeImageNodeBytes),
+    activeFileNodeBytes: safeNumber(structure.activeFileNodeBytes),
+
+    activeModelCounts: structure.activeModelCounts || null,
+    activeGpt6ProMessageNodes: safeNumber(structure.activeGpt6ProMessageNodes),
+    activeRoleCounts: structure.activeRoleCounts || null,
+    activeContentTypeCounts: structure.activeContentTypeCounts || null,
+    activeNodeBytesByRole: structure.activeNodeBytesByRole || null,
+    activeNodeBytesByContentType: structure.activeNodeBytesByContentType || null,
+    activeLargestNode: structure.activeLargestNode || null,
+    activeLargestToolResult: structure.activeLargestToolResult || null,
+    activeLargestImageNode: structure.activeLargestImageNode || null,
+
+    activeBranchSerializedBytes: safeNumber(structure.activeBranchSerializedBytes),
+
+    // Whole mapping / branch topology.
+    mappingNodes:
+      safeNumber(structure.mappingNodes) ??
+      safeNumber(diag.mappingNodes),
+    offBranchNodes: safeNumber(structure.offBranchNodes),
+    leafNodes: safeNumber(structure.leafNodes),
+    branchPoints: safeNumber(structure.branchPoints),
+    maxChildren: safeNumber(structure.maxChildren),
+
+    activeBranchPoints: safeNumber(structure.activeBranchPoints),
+    activeBranchPointDepths: structure.activeBranchPointDepths || null,
+    lastBranchPointDepth: safeNumber(structure.lastBranchPointDepth),
+    nodesSinceLastBranchPoint: safeNumber(structure.nodesSinceLastBranchPoint),
+    alternateSubtreeNodesTotal: safeNumber(structure.alternateSubtreeNodesTotal),
+    alternateSubtreeNodesMax: safeNumber(structure.alternateSubtreeNodesMax),
+    branchPointDetails: structure.branchPointDetails || null,
+
+    mappingMessageNodes: safeNumber(structure.mappingMessageNodes),
+    mappingEmptyMessageNodes: safeNumber(structure.mappingEmptyMessageNodes),
+    mappingAllTextChars: safeNumber(structure.mappingAllTextChars),
+    mappingDisplayTextChars: safeNumber(structure.mappingDisplayTextChars),
+    mappingDisplayLikeTextChars: safeNumber(structure.mappingDisplayLikeTextChars),
+    mappingHiddenMessageNodes: safeNumber(structure.mappingHiddenMessageNodes),
+    mappingHiddenTextChars: safeNumber(structure.mappingHiddenTextChars),
+
+    mappingExplicitToolRoleNodes: safeNumber(structure.mappingExplicitToolRoleNodes),
+    mappingToolishNodes: safeNumber(structure.mappingToolishNodes),
+    mappingToolCallNodes: safeNumber(structure.mappingToolCallNodes),
+    mappingToolResultNodes: safeNumber(structure.mappingToolResultNodes),
+    mappingToolCallBytes: safeNumber(structure.mappingToolCallBytes),
+    mappingToolResultBytes: safeNumber(structure.mappingToolResultBytes),
+    mappingToolCallNames: structure.mappingToolCallNames || null,
+    mappingToolResultNames: structure.mappingToolResultNames || null,
+    mappingRecipientCounts: structure.mappingRecipientCounts || null,
+
+    mappingContextLikeNodes: safeNumber(structure.mappingContextLikeNodes),
+    mappingAttachmentNodes: safeNumber(structure.mappingAttachmentNodes),
+    mappingImageNodes: safeNumber(structure.mappingImageNodes),
+    mappingFileNodes: safeNumber(structure.mappingFileNodes),
+    mappingAudioNodes: safeNumber(structure.mappingAudioNodes),
+    mappingVideoNodes: safeNumber(structure.mappingVideoNodes),
+
+    mappingImageGenCallNodes: safeNumber(structure.mappingImageGenCallNodes),
+    mappingImageGenResultNodes: safeNumber(structure.mappingImageGenResultNodes),
+    mappingGeneratedImageNodes: safeNumber(structure.mappingGeneratedImageNodes),
+    mappingUploadedImageNodes: safeNumber(structure.mappingUploadedImageNodes),
+
+    mappingUniqueAssetIds: safeNumber(structure.mappingUniqueAssetIds),
+    mappingUniqueImageAssetIds: safeNumber(structure.mappingUniqueImageAssetIds),
+    mappingUniqueFileAssetIds: safeNumber(structure.mappingUniqueFileAssetIds),
+    mappingUniqueGeneratedImageAssetIds:
+      safeNumber(structure.mappingUniqueGeneratedImageAssetIds),
+    mappingUniqueUploadedImageAssetIds:
+      safeNumber(structure.mappingUniqueUploadedImageAssetIds),
+    mappingImageReferenceOccurrences:
+      safeNumber(structure.mappingImageReferenceOccurrences),
+    mappingFileReferenceOccurrences:
+      safeNumber(structure.mappingFileReferenceOccurrences),
+
+    mappingAssetNodeBytes: safeNumber(structure.mappingAssetNodeBytes),
+    mappingImageNodeBytes: safeNumber(structure.mappingImageNodeBytes),
+    mappingFileNodeBytes: safeNumber(structure.mappingFileNodeBytes),
+
+    mappingModelCounts: structure.mappingModelCounts || null,
+    mappingGpt6ProMessageNodes: safeNumber(structure.mappingGpt6ProMessageNodes),
+    mappingRoleCounts: structure.mappingRoleCounts || null,
+    mappingContentTypeCounts: structure.mappingContentTypeCounts || null,
+    mappingNodeBytesByRole: structure.mappingNodeBytesByRole || null,
+    mappingNodeBytesByContentType: structure.mappingNodeBytesByContentType || null,
+    mappingLargestNode: structure.mappingLargestNode || null,
+    mappingLargestToolResult: structure.mappingLargestToolResult || null,
+    mappingLargestImageNode: structure.mappingLargestImageNode || null,
+
+    mappingSerializedBytes: safeNumber(structure.mappingSerializedBytes),
+
+
+    topologySnapshotPresent: Boolean(topology),
+    topologyOk: topology?.ok !== false,
+    topologyError: topology?.error || null,
+
+    currentDepth: nullableNumber(topology?.currentDepth),
+    currentModel: topology?.currentModel || null,
+    modelSegments: topology?.modelSegments || null,
+    modelSegmentCount: nullableNumber(topology?.modelSegmentCount),
+    gpt6ProSegmentCount: nullableNumber(topology?.gpt6ProSegmentCount),
+    longestGpt6ProSegment: topology?.longestGpt6ProSegment || null,
+    latestGpt6ProSegment: topology?.latestGpt6ProSegment || null,
+
+    gpt6ProDepthCount: nullableNumber(topology?.gpt6ProDepthCount),
+    gpt6ProDepths: topology?.gpt6ProDepths || null,
+    firstGpt6ProDepth: nullableNumber(topology?.firstGpt6ProDepth),
+    lastGpt6ProDepth: nullableNumber(topology?.lastGpt6ProDepth),
+    nodesSinceLastGpt6Pro: nullableNumber(topology?.nodesSinceLastGpt6Pro),
+
+    imageGenDepthCount: nullableNumber(topology?.imageGenDepthCount),
+    imageGenDepths: topology?.imageGenDepths || null,
+    generatedImageDepthCount: nullableNumber(topology?.generatedImageDepthCount),
+    generatedImageDepths: topology?.generatedImageDepths || null,
+    lastImageGenDepth: nullableNumber(topology?.lastImageGenDepth),
+    nodesSinceLastImageGen: nullableNumber(topology?.nodesSinceLastImageGen),
+
+    strongContextMarkerCount: nullableNumber(topology?.strongContextMarkerCount),
+    strongContextMarkerDepths: topology?.strongContextMarkerDepths || null,
+    lastStrongContextMarkerDepth: nullableNumber(topology?.lastStrongContextMarkerDepth),
+    nodesSinceLastStrongContextMarker:
+      nullableNumber(topology?.nodesSinceLastStrongContextMarker),
+
+    recapMarkerCount: nullableNumber(topology?.recapMarkerCount),
+    recapDepths: topology?.recapDepths || null,
+    nodesSinceLastRecap: nullableNumber(topology?.nodesSinceLastRecap),
+
+    branchPointsAfterLastImageGen:
+      nullableNumber(topology?.branchPointsAfterLastImageGen),
+    branchPointsAfterLastGpt6Pro:
+      nullableNumber(topology?.branchPointsAfterLastGpt6Pro),
+    branchPointsNearImageGen32:
+      nullableNumber(topology?.branchPointsNearImageGen32),
+    branchPointsNearGpt6Pro32:
+      nullableNumber(topology?.branchPointsNearGpt6Pro32),
+    nearestBranchDistanceToLastImageGen:
+      nullableNumber(topology?.nearestBranchDistanceToLastImageGen),
+    nearestBranchDistanceToLastGpt6Pro:
+      nullableNumber(topology?.nearestBranchDistanceToLastGpt6Pro),
+
+    imageGenPairCount: nullableNumber(topology?.imageGenPairCount),
+    imageGenUnpairedResults: nullableNumber(topology?.imageGenUnpairedResults),
+    imageGenInferredCallNames: topology?.imageGenInferredCallNames || null,
+    imageGenPairDistanceMin: nullableNumber(topology?.imageGenPairDistanceMin),
+    imageGenPairDistanceMax: nullableNumber(topology?.imageGenPairDistanceMax),
+    imageGenPairDistanceAverage:
+      nullableNumber(topology?.imageGenPairDistanceAverage),
+
+    recentWindows: topology?.recentWindows || null,
+    sinceLastContext: topology?.sinceLastContext || null,
+
+
+    // V2.12 retained-state profiler.
+    retainedStatePresent: Boolean(retainedState),
+    retainedStateOk: retainedState?.ok !== false,
+
+    activeSpecialNodeBytes:
+      nullableNumber(retainedState?.activeSpecialNodeBytes),
+    activeSpecialSharePercent:
+      nullableNumber(retainedState?.activeSpecialSharePercent),
+
+    retainedStateProxyBytes:
+      nullableNumber(retainedState?.retainedStateProxyBytes),
+    retainedStateProxySharePercent:
+      nullableNumber(retainedState?.retainedStateProxySharePercent),
+
+    retainedActiveToolResultBytes:
+      nullableNumber(retainedState?.activeToolResultBytes),
+    retainedActiveImageLikeBytes:
+      nullableNumber(retainedState?.activeImageLikeBytes),
+    retainedActiveGpt6ProBytes:
+      nullableNumber(retainedState?.activeGpt6ProBytes),
+
+    retainedDepthBuckets100:
+      retainedState?.depthBuckets100 || null,
+    retainedHottestBuckets:
+      retainedState?.hottestBuckets || null,
+    retainedHotWindows:
+      retainedState?.hotWindows || null,
+
+    retainedBranchDetails:
+      retainedState?.branchRetention?.details || null,
+    retainedAlternateSubtreeBytesTotal:
+      nullableNumber(
+        retainedState?.branchRetention?.alternateSubtreeBytesTotal
+      ),
+    retainedAlternateSubtreeBytesMax:
+      nullableNumber(
+        retainedState?.branchRetention?.alternateSubtreeBytesMax
+      ),
+
+    retainedUniqueAssetsObserved:
+      nullableNumber(
+        retainedState?.assetPersistence?.uniqueAssetsObserved
+      ),
+    retainedImageGenAssociatedAssetIds:
+      nullableNumber(
+        retainedState?.assetPersistence?.imageGenAssociatedAssetIds
+      ),
+    retainedAssetsExistingByLastImage:
+      nullableNumber(
+        retainedState?.assetPersistence?.assetsExistingByLastImage
+      ),
+    retainedAssetsReferencedAfterLastImage:
+      nullableNumber(
+        retainedState?.assetPersistence?.assetsReferencedAfterLastImage
+      ),
+    retainedImageGenAssetsReferencedAfterLastImage:
+      nullableNumber(
+        retainedState?.assetPersistence?.imageGenAssetsReferencedAfterLastImage
+      ),
+    retainedAssetReferenceNodesAfterLastImage:
+      nullableNumber(
+        retainedState?.assetPersistence?.persistentAssetReferenceNodesAfterLastImage
+      ),
+
+    retainedProSegments:
+      retainedState?.proSegments || null,
+
+    retainedImageGenResultCount:
+      nullableNumber(
+        retainedState?.imageGenResults?.count
+      ),
+    retainedImageGenResultTotalBytes:
+      nullableNumber(
+        retainedState?.imageGenResults?.totalBytes
+      ),
+    retainedImageGenResultAverageBytes:
+      nullableNumber(
+        retainedState?.imageGenResults?.averageBytes
+      ),
+    retainedLargestImageGenResultBytes:
+      nullableNumber(
+        retainedState?.imageGenResults?.largestBytes
+      ),
+    retainedTopImageGenResults:
+      retainedState?.imageGenResults?.top || null,
+
+
+    // V2.13 experimental MAX-risk band.
+    experimentalRiskAvailable:
+      Boolean(experimentalRisk?.available),
+    experimentalRiskBand:
+      experimentalRisk?.band || 'unknown',
+    experimentalRiskBaseBand:
+      experimentalRisk?.baseBand || 'unknown',
+    experimentalRiskElevatedByHotspot:
+      Boolean(experimentalRisk?.elevatedByHotspot),
+    experimentalRiskHotspot128:
+      Boolean(experimentalRisk?.hotspot128),
+    experimentalRiskHotspot256:
+      Boolean(experimentalRisk?.hotspot256),
+
+    experimentalDensityFlag:
+      Boolean(experimentalRisk?.densityFlag),
+    experimentalExtremeDensityFlag:
+      Boolean(experimentalRisk?.extremeDensityFlag),
+    experimentalDensityLevel:
+      experimentalRisk?.densityLevel || 'unknown',
+    experimentalDensityReasons:
+      experimentalRisk?.densityReasons || null,
+
+    experimentalRiskRetainedBytes:
+      nullableNumber(experimentalRisk?.retainedBytes),
+    experimentalRiskDeltaToObservedMaxFloorBytes:
+      nullableNumber(experimentalRisk?.deltaToObservedMaxFloorBytes),
+    experimentalRiskProxyShare:
+      nullableNumber(experimentalRisk?.proxyShare),
+    experimentalRiskHot128Bytes:
+      nullableNumber(experimentalRisk?.hot128Bytes),
+    experimentalRiskHot256Bytes:
+      nullableNumber(experimentalRisk?.hot256Bytes),
+    experimentalRiskHot512Bytes:
+      nullableNumber(experimentalRisk?.hot512Bytes),
+    experimentalRiskReasons:
+      experimentalRisk?.reasons || null,
+
+
+    lifecycleGeneratingNow,
+    lifecycleCurrentSourceFamily,
+    lifecycleDirect,
+    lifecycleBatch,
+    lifecycleOther,
+    lifecycleCanonicalSource: 'direct',
+    lifecycleCanonicalDirectStable: canonicalDirectStable,
+    lifecycleCanonicalRetainedBytes: canonicalDirectRetainedBytes,
+    lifecycleCanonicalRiskBand: canonicalDirectRiskBand,
+    lifecycleCanonicalRiskAvailable: canonicalDirectRiskAvailable,
+    lifecycleLastObservation: lifecycle.lastObservation || null,
+    lifecycleSourceSwitches: lifecycle.sourceSwitches || null,
+    lifecycleSourceSwitchCount: Array.isArray(lifecycle.sourceSwitches)
+      ? lifecycle.sourceSwitches.length
+      : 0,
+    lifecycleMaxEventCount: Array.isArray(lifecycle.maxEvents)
+      ? lifecycle.maxEvents.length
+      : 0,
+    lifecycleLastMaxEvent: lifecycle.lastMaxEvent || null,
+    lifecycleObservations: lifecycle.observations || null,
+
+    runtimeAttemptCurrent: attemptState.current || null,
+    runtimeAttemptLast: attemptState.last || null,
+    runtimeAttemptDisplay: runtimeAttempt,
+    runtimeAttemptCount: Array.isArray(attemptState.attempts)
+      ? attemptState.attempts.length
+      : 0,
+    runtimeAttemptHistory: attemptState.attempts || null,
+
+    // Network capture sizes.
+    lastPayloadBytes: safeNumber(diag.lastObservedBytes),
+    maxObservedPayloadBytes: safeNumber(diag.maxObservedPayloadBytes),
+    maxFullPayloadBytes:
+      safeNumber(snap.maxFullPayloadBytes) ??
+      safeNumber(diag.maxFullPayloadBytes),
+
+    liveMaximum: visibleHardMax(),
+    verifiedMaxSamples: samples.length,
+    verifiedMaxMin: sampleTokens.length ? Math.min(...sampleTokens) : null,
+    verifiedMaxMax: sampleTokens.length ? Math.max(...sampleTokens) : null
+  };
+}
+
+
+const V215_RISK_CALIBRATION = Object.freeze({
+  /*
+    V2.15 PRIMARY SIGNAL
+      absolute retained-state proxy bytes
+
+    Empirical longitudinal evidence so far:
+      highest confirmed healthy retained proxy: 6,826,995 B
+      verified MAX sample #1 retained proxy:     7,015,394 B
+      verified MAX sample #2 retained proxy:     7,293,688 B
+
+    The primary warning bands intentionally surround that observed region.
+    These values describe THIS SCRIPT'S heuristic proxy, not an OpenAI
+    byte limit and not "remaining context."
+  */
+  lowUpperBytes:       5_000_000,
+  elevatedUpperBytes:  6_000_000,
+  highUpperBytes:      6_500_000,
+  veryHighUpperBytes:  7_000_000,
+
+  highestHealthyObservedBytes: 6_826_995,
+  smallestObservedMaxBytes:    7_015_394,
+  secondObservedMaxBytes:      7_293_688,
+
+  // Density remains a separate advisory only.
+  dense128Bytes:   1_000_000,
+  dense256Bytes:   1_500_000,
+  extreme128Bytes: 1_500_000,
+  extreme256Bytes: 2_000_000
+});
+
+function v213RiskRank(band) {
+  return ({
+    unknown: -1,
+    green: 0,
+    yellow: 1,
+    orange: 2,
+    red: 3
+  })[band] ?? -1;
+}
+
+function v213BandFromProxyShare(share) {
+  const x = nullableNumber(share);
+
+  if (x == null) return 'unknown';
+  if (x < V215_RISK_CALIBRATION.proxyGreenUpper) return 'green';
+  if (x < V215_RISK_CALIBRATION.proxyYellowUpper) return 'yellow';
+  if (x < V215_RISK_CALIBRATION.proxyOrangeUpper) return 'orange';
+  return 'red';
+}
+
+
+function v215BandFromRetainedBytes(bytes) {
+  const x = nullableNumber(bytes);
+
+  if (x == null) return 'unknown';
+  if (x < V215_RISK_CALIBRATION.lowUpperBytes) return 'green';
+  if (x < V215_RISK_CALIBRATION.elevatedUpperBytes) return 'yellow';
+  if (x < V215_RISK_CALIBRATION.highUpperBytes) return 'orange';
+  if (x < V215_RISK_CALIBRATION.veryHighUpperBytes) return 'red';
+  return 'limit';
+}
+
+function v215ObservedDeltaText(retainedBytes) {
+  const x = nullableNumber(retainedBytes);
+
+  if (x == null) return 'Unavailable';
+
+  const floor = V215_RISK_CALIBRATION.smallestObservedMaxBytes;
+  const delta = floor - x;
+
+  if (delta > 0) {
+    return `${fmt(delta)}B below the smallest observed MAX sample`;
+  }
+
+  if (delta < 0) {
+    return `${fmt(Math.abs(delta))}B above the smallest observed MAX sample`;
+  }
+
+  return 'equal to the smallest observed MAX sample';
+}
+
+
+function v213AssessRisk(retainedState) {
+  if (!retainedState || retainedState.ok === false) {
+    return {
+      available: false,
+      band: 'unknown',
+      baseBand: 'unknown',
+
+      retainedBytes: null,
+      proxyShare: null,
+      deltaToObservedMaxFloorBytes: null,
+
+      hot128Bytes: null,
+      hot256Bytes: null,
+      hot512Bytes: null,
+
+      hotspot128: false,
+      hotspot256: false,
+      densityFlag: false,
+      extremeDensityFlag: false,
+      densityLevel: 'unknown',
+
+      elevatedByHotspot: false,
+      reasons: ['Retained-state profiler unavailable'],
+      densityReasons: []
+    };
+  }
+
+  const retainedBytes =
+    nullableNumber(retainedState.retainedStateProxyBytes);
+
+  const proxyShare =
+    nullableNumber(retainedState.retainedStateProxySharePercent);
+
+  const hot128Bytes =
+    nullableNumber(retainedState.hotWindows?.w128?.specialNodeBytes);
+
+  const hot256Bytes =
+    nullableNumber(retainedState.hotWindows?.w256?.specialNodeBytes);
+
+  const hot512Bytes =
+    nullableNumber(retainedState.hotWindows?.w512?.specialNodeBytes);
+
+  /*
+    V2.15 PRIMARY BAND:
+    absolute retained-state proxy bytes only.
+  */
+  const band = v215BandFromRetainedBytes(retainedBytes);
+  const baseBand = band;
+
+  const hotspot128 =
+    hot128Bytes != null &&
+    hot128Bytes >= V215_RISK_CALIBRATION.dense128Bytes;
+
+  const hotspot256 =
+    hot256Bytes != null &&
+    hot256Bytes >= V215_RISK_CALIBRATION.dense256Bytes;
+
+  const extreme128 =
+    hot128Bytes != null &&
+    hot128Bytes >= V215_RISK_CALIBRATION.extreme128Bytes;
+
+  const extreme256 =
+    hot256Bytes != null &&
+    hot256Bytes >= V215_RISK_CALIBRATION.extreme256Bytes;
+
+  const densityFlag = hotspot128 || hotspot256;
+  const extremeDensityFlag = extreme128 || extreme256;
+
+  const densityLevel =
+    extremeDensityFlag
+      ? 'extreme'
+      : densityFlag
+        ? 'dense'
+        : 'normal';
+
+  const deltaToObservedMaxFloorBytes =
+    retainedBytes == null
+      ? null
+      : V215_RISK_CALIBRATION.smallestObservedMaxBytes - retainedBytes;
+
+  const reasons = [];
+
+  if (retainedBytes != null) {
+    reasons.push(
+      `absolute retained proxy ${fmt(retainedBytes)}B`
+    );
+    reasons.push(
+      v215ObservedDeltaText(retainedBytes)
+    );
+  }
+
+  if (proxyShare != null) {
+    reasons.push(
+      `secondary share ${proxyShare.toFixed(1)}%`
+    );
+  }
+
+  const densityReasons = [];
+
+  if (hotspot128) {
+    densityReasons.push(
+      `128-node historical window ${fmt(hot128Bytes)}B`
+    );
+  }
+
+  if (hotspot256) {
+    densityReasons.push(
+      `256-node historical window ${fmt(hot256Bytes)}B`
+    );
+  }
+
+  if (!densityFlag) {
+    densityReasons.push(
+      'no dense-history advisory threshold crossed'
+    );
+  }
+
+  return {
+    available: band !== 'unknown',
+    band,
+    baseBand,
+
+    retainedBytes,
+    proxyShare,
+    deltaToObservedMaxFloorBytes,
+
+    hot128Bytes,
+    hot256Bytes,
+    hot512Bytes,
+
+    hotspot128,
+    hotspot256,
+    extreme128,
+    extreme256,
+    densityFlag,
+    extremeDensityFlag,
+    densityLevel,
+
+    elevatedByHotspot: false,
+
+    reasons,
+    densityReasons
+  };
+}
+
+function v213RiskLabel(band) {
+  return ({
+    green: 'LOW',
+    yellow: 'ELEVATED',
+    orange: 'HIGH',
+    red: 'VERY HIGH',
+    limit: 'OBSERVED MAX ZONE',
+    unknown: 'UNKNOWN'
+  })[band] || 'UNKNOWN';
+}
+
+function v213RiskThemeClass(band) {
+  return ({
+    green: 'normal',
+    yellow: 'large',
+    orange: 'warning',
+    red: 'critical',
+    limit: 'critical',
+    unknown: 'waiting'
+  })[band] || 'waiting';
+}
+
+
+function v214DensityLabel(level) {
+  return ({
+    normal: 'NORMAL',
+    dense: 'DENSE HISTORY',
+    extreme: 'EXTREME HISTORY',
+    unknown: 'UNKNOWN'
+  })[level] || 'UNKNOWN';
+}
+
+function v214DensityExplanation(risk) {
+  if (!risk) return 'Density advisory unavailable.';
+
+  const parts = Array.isArray(risk.densityReasons)
+    ? risk.densityReasons
+    : [];
+
+  return parts.join(' · ') || 'No density details available';
+}
+
+
+function v213RiskExplanation(risk) {
+  if (!risk?.available) {
+    return 'Experimental risk unavailable until a fresh V2.15 retained-state snapshot is captured.';
+  }
+
+  const parts = Array.isArray(risk.reasons)
+    ? risk.reasons
+    : [];
+
+  return parts.join(' · ') || 'No primary-risk details available';
+}
+
+
+function getStatus(s) {
+  const a = s.runtimeAttemptCurrent || s.runtimeAttemptLast;
+  return {text:a ? `Real attempt #${a.id}: ${attemptStatusLabel(a)}` : 'Real attempts: IDLE',
+    cls:s.id === chatIdFromURL() && eventActiveEpisode(s.id) ? 'maximum' : a?.outcome === 'success' ? 'normal' : a?.outcome === 'max' || a?.outcome === 'error' ? 'warning' : a ? 'warning' : 'waiting'};
+}
+
+function statusColor(cls) {
+  if (cls === 'maximum') return '#ff7777';
+  if (cls === 'waiting') return '#a8b0ba';
+  return '#70f3b6';
+}
+
+const quickActionState = {
+  serial:0,last:'No quick action yet',type:'muted',
+  copy:{running:false,label:'Copy diagnostics',token:0},
+  retry:{running:false,label:'Retry capture',token:0},
+  anon:{running:false,label:'Copy anon sample',token:0}
+};
+
+function quickActionsMarkup() {
+  const button = (action,normal)=>{
+    const state = quickActionState[action];
+    return `<button data-action="${action}" ${state.running ? 'disabled aria-busy="true"' : ''}>${esc(state.label || normal)}</button>`;
+  };
+  return `<div class="quick-actions">${button('copy','Copy diagnostics')}${button('retry','Retry capture')}${button('anon','Copy anon sample')}
+    <div class="last-action ${esc(quickActionState.type)}" data-quick-status role="status" aria-live="polite" aria-atomic="true">Last action: ${esc(quickActionState.last)}</div></div>`;
+}
+
+function paintQuickActions() {
+  if (!panel) return;
+  for (const action of ['copy','retry','anon']) {
+    const button = panel.querySelector(`[data-action="${action}"]`), state = quickActionState[action];
+    if (!button) continue;
+    button.textContent = state.label; button.disabled = state.running;
+    button.setAttribute?.('aria-busy',String(state.running));
+  }
+  const status = panel.querySelector('[data-quick-status]');
+  if (status) {status.textContent = 'Last action: '+quickActionState.last;status.className = 'last-action '+quickActionState.type;}
+}
+
+async function runQuickAction(action) {
+  const state = quickActionState[action];
+  if (!state || state.running) return false;
+  const serial = ++quickActionState.serial, token = ++state.token;
+  const binding = {chatId:chatIdFromURL(),episodeId:eventActiveEpisode(chatIdFromURL())?.id ?? null,reason:'manual Retry Capture'};
+  state.running = true; state.label = action === 'copy' ? 'Copying…' : 'Capturing…';
+  quickActionState.last = action === 'copy' ? 'Copying diagnostics…' : 'Capturing fresh source…';
+  quickActionState.type = 'busy'; paintQuickActions();
+  let ok = false, trace = null;
+  try {
+    ok = action === 'copy' ? await copyStats() : await controlledCapture(binding);
+    if (action === 'retry') trace = retryTraces.get(captureRetryKey(binding));
+  } catch {}
+  state.running = false;
+  state.label = action === 'copy' ? (ok ? 'Copied ✓' : 'Copy failed ✕') : (ok ? 'Captured ✓' : 'No fresh mapping ✕');
+  if (quickActionState.serial === serial) {
+    quickActionState.last = action === 'copy' ? (ok ? 'Diagnostics copied ✓' : 'Copy failed ✕') :
+      (ok ? `Fresh ${String(trace?.sourceFamily || 'source').toUpperCase()} captured ✓ · ${fmt(trace?.responseBytes)}B` :
+        `No fresh mapping ✕${trace?.result === 'cancelled' ? ' · capture cancelled' : ''}`);
+    quickActionState.type = ok ? 'ok' : 'error';
+  }
+  paintQuickActions();
+  setTimeout(()=>{
+    if (state.token !== token || state.running) return;
+    state.label = action === 'copy' ? 'Copy diagnostics' : 'Retry capture'; paintQuickActions();
+  },2200);
+  return ok;
+}
+
+let uiFeedback = {
+  text: '',
+  type: 'ok',
+  until: 0
+};
+let uiFeedbackTimer = null;
+
+function showFeedback(text, type = 'ok', milliseconds = 1300) {
+  uiFeedback = {
+    text,
+    type,
+    until: Date.now() + milliseconds
+  };
+
+  clearTimeout(uiFeedbackTimer);
+  render();
+
+  uiFeedbackTimer = setTimeout(() => {
+    uiFeedback = { text: '', type: 'ok', until: 0 };
+    render();
+  }, milliseconds);
+}
+
+function feedbackMarkup() {
+  if (!uiFeedback.text || uiFeedback.until <= Date.now()) return '';
+
+  return `
+    <div class="button-feedback ${esc(uiFeedback.type)}">
+      ${esc(uiFeedback.text)}
+    </div>
+  `;
+}
+
+function render() {
+  lifecyclePollPhase();
+  latest = calculateStats();
+  const st = getStatus(latest);
+  const pressure = pressureResult(latest.id);
+
+  panel.className =
+    `theme-${st.cls}` +
+    (S.expanded ? ' expanded' : '');
+
+  compact.innerHTML = `
+    <div class="compact-stats">
+      <div><strong>${esc(pressureText(pressure))}</strong></div>
+      <div>
+        ${latest.full ? '~' + fmt(latest.activeDisplayLikeTextTokens) : '—'} display-like tok
+      </div>
+
+      <div>
+        ${latest.full ? fmt(latest.activeToolCallNodes ?? 0) : '—'} tool calls
+      </div>
+
+      <div>
+        ${latest.lifecycleCanonicalRetainedBytes != null
+          ? fmt(latest.lifecycleCanonicalRetainedBytes) + 'B DIRECT stable'
+          : '— DIRECT stable'}
+      </div>
+
+      <div>source: ${esc(lifecycleFamilyLabel(latest.lifecycleCurrentSourceFamily))}</div>
+
+      <div>attempt: ${esc(attemptStatusLabel(latest.runtimeAttemptDisplay))}</div>
+
+      ${latest.runtimeAttemptCurrent?.status === 'running'
+        ? `<div>generation HTTP max ${fmt(latest.runtimeAttemptCurrent.networkMaxBytes || 0)}B</div>`
+        : ''}
+      <div>MAX episode: ${eventActiveEpisode(latest.id) ? 'ACTIVE' : 'NONE'}</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="compact-status">
+      <span class="dot ${st.cls}">●</span>
+      <span>${esc(st.text)}</span>
+    </div>
+
+    <div class="source-note">
+      ${esc(latest.full ? 'v2.24 empirical pressure' : 'waiting for network snapshot')}
+    </div>
+  `;
+
+  detail.innerHTML = `
+    ${quickActionsMarkup()}
+
+    <div class="expanded-top">
+      <div>
+        <div class="big-number">
+          ${latest.full ? '~' + fmt(latest.activeDisplayLikeTextTokens) : '—'}
+        </div>
+        <div class="muted">display-like text token estimate</div>
+      </div>
+
+      <div class="percent">
+        ${esc(pressureText(pressure))}
+      </div>
+    </div>
+
+
+
+
+    <div class="section-title">V2.24 PRESSURE CALIBRATION</div>
+    <div class="capture-note">${esc(pressureText(pressure))} · empirical signal; no official capacity estimate</div>
+    ${eventPanelMarkup(latest.id)}
+
+    <div class="section-title">ACTIVE BRANCH — TEXT / ROLES</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">BRANCH NODES</div>
+        <div class="value">${latest.activeBranchNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">MESSAGE NODES</div>
+        <div class="value">${latest.activeMessageNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ROLE U/A TEXT</div>
+        <div class="value">${latest.tokens != null ? '~' + fmt(latest.tokens) + ' tok' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">DISPLAY-LIKE TEXT</div>
+        <div class="value">${latest.activeDisplayLikeTextTokens != null ? '~' + fmt(latest.activeDisplayLikeTextTokens) + ' tok' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ALL-ROLE TEXT</div>
+        <div class="value">${latest.activeAllTextTokens != null ? '~' + fmt(latest.activeAllTextTokens) + ' tok' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">HIDDEN TEXT</div>
+        <div class="value">${latest.activeHiddenTextTokens != null ? '~' + fmt(latest.activeHiddenTextTokens) + ' tok' : '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">ACTIVE ROLES</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeRoleCounts, 20))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">ACTIVE CONTENT TYPES</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeContentTypeCounts, 24))}</div>
+      </div>
+    </div>
+
+    <div class="section-title">TOOLS — FIXED CLASSIFIER</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">EXPLICIT TOOL ROLE</div>
+        <div class="value">${latest.activeExplicitToolRoleNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">TOOL-LIKE TOTAL</div>
+        <div class="value">${latest.activeToolishNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">TOOL CALLS</div>
+        <div class="value">${latest.activeToolCallNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">TOOL RESULTS</div>
+        <div class="value">${latest.activeToolResultNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">TOOL CALL JSON</div>
+        <div class="value">${latest.activeToolCallBytes != null ? fmt(latest.activeToolCallBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">TOOL RESULT JSON</div>
+        <div class="value">${latest.activeToolResultBytes != null ? fmt(latest.activeToolResultBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">TOOL CALL NAMES</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeToolCallNames, 24))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">TOOL RESULT NAMES</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeToolResultNames, 24))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">NON-GENERIC RECIPIENTS</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeRecipientCounts, 24))}</div>
+      </div>
+    </div>
+
+    <div class="section-title">IMAGE / FILE / ASSET DIAGNOSTICS</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">IMAGE-GEN CALLS</div>
+        <div class="value">${latest.activeImageGenCallNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">IMAGE-GEN RESULTS</div>
+        <div class="value">${latest.activeImageGenResultNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">GENERATED IMAGE NODES</div>
+        <div class="value">${latest.activeGeneratedImageNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">UPLOADED IMAGE NODES</div>
+        <div class="value">${latest.activeUploadedImageNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">UNIQUE IMAGE ASSETS</div>
+        <div class="value">${latest.activeUniqueImageAssetIds ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">UNIQUE FILE ASSETS</div>
+        <div class="value">${latest.activeUniqueFileAssetIds ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">GEN IMAGE ASSETS</div>
+        <div class="value">${latest.activeUniqueGeneratedImageAssetIds ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">UPLOADED IMG ASSETS</div>
+        <div class="value">${latest.activeUniqueUploadedImageAssetIds ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">IMAGE-NODE JSON</div>
+        <div class="value">${latest.activeImageNodeBytes != null ? fmt(latest.activeImageNodeBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ASSET-NODE JSON</div>
+        <div class="value">${latest.activeAssetNodeBytes != null ? fmt(latest.activeAssetNodeBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">IMAGE REF OCCURRENCES</div>
+        <div class="value">${latest.activeImageReferenceOccurrences ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">FILE REF OCCURRENCES</div>
+        <div class="value">${latest.activeFileReferenceOccurrences ?? '—'}</div>
+      </div>
+    </div>
+
+    <div class="section-title">MODEL METADATA</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">GPT-6 PRO-LABELED NODES</div>
+        <div class="value">${latest.activeGpt6ProMessageNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">MODEL LABELS FOUND</div>
+        <div class="value">${latest.activeModelCounts ? Object.keys(latest.activeModelCounts).length : '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">ACTIVE MODEL DISTRIBUTION</div>
+        <div class="value tiny-value">${esc(compactCounts(latest.activeModelCounts, 20))}</div>
+      </div>
+    </div>
+
+
+    <div class="section-title">CONTEXT-HISTORY TOPOLOGY — V2.12</div>
+
+    <div class="capture-note">
+      ${
+        !latest.topologySnapshotPresent
+          ? '⚠ Current saved snapshot predates V2.11 topology'
+          : latest.topologyOk
+            ? '✓ Lightweight topology captured'
+            : `⚠ Topology capture error: ${esc(latest.topologyError || 'unknown')}`
+      }
+    </div>
+
+    <div class="stats-grid">
+      <div>
+        <div class="label">CURRENT DEPTH</div>
+        <div class="value">${latest.currentDepth ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">LATEST MODEL</div>
+        <div class="value tiny-value">${esc(latest.currentModel || '—')}</div>
+      </div>
+
+      <div>
+        <div class="label">MODEL SEGMENTS</div>
+        <div class="value">${latest.modelSegmentCount ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">GPT-6 PRO SEGMENTS</div>
+        <div class="value">${latest.gpt6ProSegmentCount ?? '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">RECENT MODEL SEGMENTS</div>
+        <div class="value tiny-value">${esc(modelSegmentsTextV2114(latest.modelSegments, 14))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">LONGEST GPT-6 PRO SEGMENT</div>
+        <div class="value tiny-value">${esc(segmentTextV2114(latest.longestGpt6ProSegment))}</div>
+      </div>
+
+      <div>
+        <div class="label">LAST GPT-6 PRO DEPTH</div>
+        <div class="value">${latest.lastGpt6ProDepth ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">NODES SINCE PRO</div>
+        <div class="value">${latest.nodesSinceLastGpt6Pro ?? '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">GPT-6 PRO DEPTHS</div>
+        <div class="value tiny-value">${esc(compactDepthsV2114(latest.gpt6ProDepths, 36))}</div>
+      </div>
+
+      <div>
+        <div class="label">LAST IMAGE-GEN DEPTH</div>
+        <div class="value">${latest.lastImageGenDepth ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">NODES SINCE IMAGE-GEN</div>
+        <div class="value">${latest.nodesSinceLastImageGen ?? '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">IMAGE-GEN EVENT DEPTHS</div>
+        <div class="value tiny-value">${esc(compactDepthsV2114(latest.imageGenDepths, 36))}</div>
+      </div>
+
+      <div>
+        <div class="label">INFERRED IMG PAIRS</div>
+        <div class="value">${latest.imageGenPairCount ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">UNPAIRED IMG RESULTS</div>
+        <div class="value">${latest.imageGenUnpairedResults ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">CTX MARKERS</div>
+        <div class="value">${latest.strongContextMarkerCount ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">NODES SINCE CTX</div>
+        <div class="value">${latest.nodesSinceLastStrongContextMarker ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">RECAP MARKERS</div>
+        <div class="value">${latest.recapMarkerCount ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">NODES SINCE RECAP</div>
+        <div class="value">${latest.nodesSinceLastRecap ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">BRANCHES NEAR IMG ±32</div>
+        <div class="value">${latest.branchPointsNearImageGen32 ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">BRANCHES NEAR PRO ±32</div>
+        <div class="value">${latest.branchPointsNearGpt6Pro32 ?? '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">RECENT WINDOWS</div>
+        <div class="value tiny-value">${esc(recentWindowsTextV2114(latest.recentWindows))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">SINCE LAST CONTEXT MARKER</div>
+        <div class="value tiny-value">
+          ${
+            latest.sinceLastContext
+              ? esc(JSON.stringify(latest.sinceLastContext))
+              : '—'
+          }
+        </div>
+      </div>
+    </div>
+
+
+
+    <div class="section-title">RETAINED-STATE PROFILER — V2.12</div>
+
+    <div class="capture-note">
+      ${
+        latest.retainedStatePresent
+          ? '✓ Retained-state depth profiler captured'
+          : '⚠ Retained-state profiler unavailable in this snapshot'
+      }
+    </div>
+
+    <div class="stats-grid">
+      <div>
+        <div class="label">SPECIAL NODE JSON</div>
+        <div class="value">
+          ${latest.activeSpecialNodeBytes != null
+            ? fmt(latest.activeSpecialNodeBytes) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">SPECIAL SHARE</div>
+        <div class="value">
+          ${latest.activeSpecialSharePercent != null
+            ? latest.activeSpecialSharePercent.toFixed(1) + '%'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">RETAINED PROXY JSON</div>
+        <div class="value">
+          ${latest.retainedStateProxyBytes != null
+            ? fmt(latest.retainedStateProxyBytes) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">PROXY / ACTIVE BRANCH</div>
+        <div class="value">
+          ${latest.retainedStateProxySharePercent != null
+            ? latest.retainedStateProxySharePercent.toFixed(1) + '%'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">ALT SUBTREE JSON</div>
+        <div class="value">
+          ${latest.retainedAlternateSubtreeBytesTotal != null
+            ? fmt(latest.retainedAlternateSubtreeBytesTotal) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">LARGEST ALT SUBTREE</div>
+        <div class="value">
+          ${latest.retainedAlternateSubtreeBytesMax != null
+            ? fmt(latest.retainedAlternateSubtreeBytesMax) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">HOTTEST 100-NODE BUCKETS BY SPECIAL JSON</div>
+        <div class="value tiny-value">
+          ${esc(v212BucketText(latest.retainedHottestBuckets, 10))}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">HOTTEST 128-NODE WINDOW</div>
+        <div class="value tiny-value">
+          ${esc(v212HotWindowText(latest.retainedHotWindows?.w128))}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">HOTTEST 256-NODE WINDOW</div>
+        <div class="value tiny-value">
+          ${esc(v212HotWindowText(latest.retainedHotWindows?.w256))}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">HOTTEST 512-NODE WINDOW</div>
+        <div class="value tiny-value">
+          ${esc(v212HotWindowText(latest.retainedHotWindows?.w512))}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">BRANCH RETENTION / ±32 NEIGHBORHOODS</div>
+        <div class="value tiny-value">
+          ${esc(v212BranchRetentionText(latest.retainedBranchDetails, 16))}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">GPT-6 PRO SEGMENT SPECIAL STATE</div>
+        <div class="value tiny-value">
+          ${esc(v212ProSegmentsText(latest.retainedProSegments, 16))}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">IMG-GEN RESULT JSON</div>
+        <div class="value">
+          ${latest.retainedImageGenResultTotalBytes != null
+            ? fmt(latest.retainedImageGenResultTotalBytes) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">LARGEST IMG-GEN RESULT</div>
+        <div class="value">
+          ${latest.retainedLargestImageGenResultBytes != null
+            ? fmt(latest.retainedLargestImageGenResultBytes) + ' B'
+            : '—'}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">TOP IMAGE-GEN RESULTS BY NODE JSON</div>
+        <div class="value tiny-value">
+          ${esc(v212ImageGenResultsText({
+            top: latest.retainedTopImageGenResults
+          }))}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">UNIQUE ASSETS SEEN</div>
+        <div class="value">
+          ${latest.retainedUniqueAssetsObserved ?? '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">IMG-GEN-ASSOC ASSETS</div>
+        <div class="value">
+          ${latest.retainedImageGenAssociatedAssetIds ?? '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">OLD ASSETS REFERENCED AFTER LAST IMG</div>
+        <div class="value">
+          ${latest.retainedAssetsReferencedAfterLastImage ?? '—'}
+        </div>
+      </div>
+
+      <div>
+        <div class="label">IMG-GEN ASSETS REFERENCED LATER</div>
+        <div class="value">
+          ${latest.retainedImageGenAssetsReferencedAfterLastImage ?? '—'}
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="label">POST-IMG NODES REFERENCING PRE-IMG ASSETS</div>
+        <div class="value">
+          ${latest.retainedAssetReferenceNodesAfterLastImage ?? '—'}
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">MAPPING / BRANCH TOPOLOGY</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">TOTAL MAPPING NODES</div>
+        <div class="value">${latest.mappingNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">OFF-BRANCH NODES</div>
+        <div class="value">${latest.offBranchNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">LEAVES</div>
+        <div class="value">${latest.leafNodes ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ALL BRANCH POINTS</div>
+        <div class="value">${latest.branchPoints ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ACTIVE BRANCH POINTS</div>
+        <div class="value">${latest.activeBranchPoints ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">NODES SINCE LAST BRANCH</div>
+        <div class="value">${latest.nodesSinceLastBranchPoint ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">ALT SUBTREE NODES TOTAL</div>
+        <div class="value">${latest.alternateSubtreeNodesTotal ?? '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">LARGEST ALT SUBTREE</div>
+        <div class="value">${latest.alternateSubtreeNodesMax ?? '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">ACTIVE BRANCH-POINT DEPTHS</div>
+        <div class="value tiny-value">${esc(Array.isArray(latest.activeBranchPointDepths) && latest.activeBranchPointDepths.length ? latest.activeBranchPointDepths.join(', ') : '—')}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">BRANCH-POINT DETAILS</div>
+        <div class="value tiny-value">${esc(compactBranchDetails(latest.branchPointDetails))}</div>
+      </div>
+    </div>
+
+    <div class="section-title">SERIALIZED BY ROLE / CONTENT</div>
+    <div class="stats-grid">
+      <div class="wide">
+        <div class="label">NODE JSON BY ROLE</div>
+        <div class="value tiny-value">${esc(compactByteCounts(latest.activeNodeBytesByRole, 20))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">NODE JSON BY CONTENT TYPE</div>
+        <div class="value tiny-value">${esc(compactByteCounts(latest.activeNodeBytesByContentType, 24))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">LARGEST ACTIVE NODE</div>
+        <div class="value tiny-value">${esc(describeLargest(latest.activeLargestNode))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">LARGEST TOOL RESULT</div>
+        <div class="value tiny-value">${esc(describeLargest(latest.activeLargestToolResult))}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">LARGEST IMAGE-LIKE NODE</div>
+        <div class="value tiny-value">${esc(describeLargest(latest.activeLargestImageNode))}</div>
+      </div>
+    </div>
+
+    <div class="section-title">WHOLE MAPPING / NETWORK</div>
+    <div class="stats-grid">
+      <div>
+        <div class="label">ACTIVE BRANCH JSON</div>
+        <div class="value">${latest.activeBranchSerializedBytes != null ? fmt(latest.activeBranchSerializedBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">MAPPING JSON</div>
+        <div class="value">${latest.mappingSerializedBytes != null ? fmt(latest.mappingSerializedBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">MAX FULL RESPONSE</div>
+        <div class="value">${latest.maxFullPayloadBytes != null ? fmt(latest.maxFullPayloadBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div>
+        <div class="label">LAST NETWORK EVENT</div>
+        <div class="value">${latest.lastPayloadBytes != null ? fmt(latest.lastPayloadBytes) + ' B' : '—'}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">DATA SOURCE</div>
+        <div class="value">${esc(latest.source)}</div>
+      </div>
+
+      <div class="wide">
+        <div class="label">FULL SNAPSHOT AGE</div>
+        <div class="value">${esc(formatAge(latest.fullCapturedAt))}</div>
+      </div>
+    </div>
+
+    <div class="expanded-status ${st.cls}">
+      ${esc(st.text)}
+    </div>
+
+    <div class="action-grid bottom-actions">
+      <button
+        class="wide-button"
+        data-action="save-max-sample"
+        ${latest.full && latest.liveMaximum ? '' : 'disabled'}
+      >
+        Save verified MAX sample
+      </button>
+    </div>
+
+    ${feedbackMarkup()}
+
+    <div class="capture-note">
+      ${
+        latest.liveMaximum
+          ? '✓ Red maximum-length banner visible. Saving now freezes the V2.10.1 tool/media/branch diagnostics for this MAX event.'
+          : 'A verified MAX sample can only be saved while ChatGPT’s red maximum-length banner is actually visible.'
+      }
+    </div>
+
+    <div class="cal-note warn">
+      V2.10.1 keeps V2.10 diagnostics but makes the expanded panel viewport-safe and keeps Copy diagnostics pinned at the top. It also fixes the V2.9 tool classifier and separately measures tool calls/results, image generation, assets, model metadata, branch depth and serialized byte distribution.
+    </div>
+  `;
+
+  panel.querySelector('[data-action="expand"]').textContent =
+    S.expanded ? '−' : '+';
+
+  checkNotifications(latest);
+}
+
+function updateUI() {
+  if (!panel || !document.body?.contains(panel)) {
+    if (document.body) createUI();
+    return;
+  }
+
+  render();
+}
+
+function saveCurrentVerifiedMaxSample() {
+  if (!latest?.full) {
+    alert('No full network conversation snapshot has been captured yet.');
+    return false;
+  }
+
+  if (!visibleHardMax()) {
+    alert(
+      'The red ChatGPT maximum-length banner is not visible right now.\n\n' +
+      'V2.10.1 will not label this chat as maxed based on memory or a manual guess.'
+    );
+    return false;
+  }
+
+  const sample = {
+    version: '2.10',
+    time: Date.now(),
+    chatId: latest.id,
+
+    archiveTokens: latest.tokens,
+    archiveCharacters: latest.chars,
+    messages: latest.messages,
+    userMessages: latest.userMessages,
+    assistantMessages: latest.assistantMessages,
+
+    displayLikeTextTokens: latest.activeDisplayLikeTextTokens,
+    displayLikeTextCharacters: latest.activeDisplayLikeTextChars,
+    displayLikeMessages: latest.activeDisplayLikeMessages,
+
+    activeBranchNodes: latest.activeBranchNodes,
+    activeMessageNodes: latest.activeMessageNodes,
+    activeAllTextCharacters: latest.activeAllTextChars,
+    activeAllTextTokens: latest.activeAllTextTokens,
+    activeHiddenMessageNodes: latest.activeHiddenMessageNodes,
+    activeHiddenTextCharacters: latest.activeHiddenTextChars,
+    activeHiddenTextTokens: latest.activeHiddenTextTokens,
+    activeEmptyMessageNodes: latest.activeEmptyMessageNodes,
+
+    activeExplicitToolRoleNodes: latest.activeExplicitToolRoleNodes,
+    activeToolishNodes: latest.activeToolishNodes,
+    activeToolCallNodes: latest.activeToolCallNodes,
+    activeToolResultNodes: latest.activeToolResultNodes,
+    activeToolCallBytes: latest.activeToolCallBytes,
+    activeToolResultBytes: latest.activeToolResultBytes,
+    activeToolCallNames: latest.activeToolCallNames,
+    activeToolResultNames: latest.activeToolResultNames,
+    activeRecipientCounts: latest.activeRecipientCounts,
+
+    activeContextLikeNodes: latest.activeContextLikeNodes,
+    activeAttachmentNodes: latest.activeAttachmentNodes,
+    activeImageNodes: latest.activeImageNodes,
+    activeFileNodes: latest.activeFileNodes,
+
+    activeImageGenCallNodes: latest.activeImageGenCallNodes,
+    activeImageGenResultNodes: latest.activeImageGenResultNodes,
+    activeGeneratedImageNodes: latest.activeGeneratedImageNodes,
+    activeUploadedImageNodes: latest.activeUploadedImageNodes,
+
+    activeUniqueAssetIds: latest.activeUniqueAssetIds,
+    activeUniqueImageAssetIds: latest.activeUniqueImageAssetIds,
+    activeUniqueFileAssetIds: latest.activeUniqueFileAssetIds,
+    activeUniqueGeneratedImageAssetIds: latest.activeUniqueGeneratedImageAssetIds,
+    activeUniqueUploadedImageAssetIds: latest.activeUniqueUploadedImageAssetIds,
+
+    activeImageReferenceOccurrences: latest.activeImageReferenceOccurrences,
+    activeFileReferenceOccurrences: latest.activeFileReferenceOccurrences,
+    activeAssetNodeBytes: latest.activeAssetNodeBytes,
+    activeImageNodeBytes: latest.activeImageNodeBytes,
+    activeFileNodeBytes: latest.activeFileNodeBytes,
+
+    activeModelCounts: latest.activeModelCounts,
+    activeGpt6ProMessageNodes: latest.activeGpt6ProMessageNodes,
+    activeRoleCounts: latest.activeRoleCounts,
+    activeContentTypeCounts: latest.activeContentTypeCounts,
+    activeNodeBytesByRole: latest.activeNodeBytesByRole,
+    activeNodeBytesByContentType: latest.activeNodeBytesByContentType,
+    activeLargestNode: latest.activeLargestNode,
+    activeLargestToolResult: latest.activeLargestToolResult,
+    activeLargestImageNode: latest.activeLargestImageNode,
+
+    activeBranchSerializedBytes: latest.activeBranchSerializedBytes,
+
+    mappingNodes: latest.mappingNodes,
+    offBranchNodes: latest.offBranchNodes,
+    leafNodes: latest.leafNodes,
+    branchPoints: latest.branchPoints,
+    maxChildren: latest.maxChildren,
+
+    activeBranchPoints: latest.activeBranchPoints,
+    activeBranchPointDepths: latest.activeBranchPointDepths,
+    lastBranchPointDepth: latest.lastBranchPointDepth,
+    nodesSinceLastBranchPoint: latest.nodesSinceLastBranchPoint,
+    alternateSubtreeNodesTotal: latest.alternateSubtreeNodesTotal,
+    alternateSubtreeNodesMax: latest.alternateSubtreeNodesMax,
+    branchPointDetails: latest.branchPointDetails,
+
+    mappingToolCallNodes: latest.mappingToolCallNodes,
+    mappingToolResultNodes: latest.mappingToolResultNodes,
+    mappingImageGenCallNodes: latest.mappingImageGenCallNodes,
+    mappingImageGenResultNodes: latest.mappingImageGenResultNodes,
+    mappingGeneratedImageNodes: latest.mappingGeneratedImageNodes,
+    mappingUploadedImageNodes: latest.mappingUploadedImageNodes,
+    mappingUniqueImageAssetIds: latest.mappingUniqueImageAssetIds,
+    mappingUniqueFileAssetIds: latest.mappingUniqueFileAssetIds,
+    mappingModelCounts: latest.mappingModelCounts,
+    mappingGpt6ProMessageNodes: latest.mappingGpt6ProMessageNodes,
+
+    mappingSerializedBytes: latest.mappingSerializedBytes,
+
+
+    retainedStateProfile: {
+      activeSpecialNodeBytes: latest.activeSpecialNodeBytes,
+      activeSpecialSharePercent: latest.activeSpecialSharePercent,
+      retainedStateProxyBytes: latest.retainedStateProxyBytes,
+      retainedStateProxySharePercent: latest.retainedStateProxySharePercent,
+      retainedAlternateSubtreeBytesTotal: latest.retainedAlternateSubtreeBytesTotal,
+      retainedAlternateSubtreeBytesMax: latest.retainedAlternateSubtreeBytesMax,
+      hottestBuckets: latest.retainedHottestBuckets,
+      hotWindows: latest.retainedHotWindows,
+      branchDetails: latest.retainedBranchDetails,
+      proSegments: latest.retainedProSegments,
+      imageGenResultCount: latest.retainedImageGenResultCount,
+      imageGenResultTotalBytes: latest.retainedImageGenResultTotalBytes,
+      largestImageGenResultBytes: latest.retainedLargestImageGenResultBytes,
+      topImageGenResults: latest.retainedTopImageGenResults,
+      uniqueAssetsObserved: latest.retainedUniqueAssetsObserved,
+      imageGenAssociatedAssetIds: latest.retainedImageGenAssociatedAssetIds,
+      assetsReferencedAfterLastImage: latest.retainedAssetsReferencedAfterLastImage,
+      imageGenAssetsReferencedAfterLastImage:
+        latest.retainedImageGenAssetsReferencedAfterLastImage,
+      assetReferenceNodesAfterLastImage:
+        latest.retainedAssetReferenceNodesAfterLastImage
+    },
+
+    maxFullPayloadBytes: latest.maxFullPayloadBytes,
+    lastPayloadBytes: latest.lastPayloadBytes,
+    source: latest.source
+  };
+
+  saveVerifiedMaxSample(sample);
+  render();
+  return true;
+}
+
+function clearSnapshot() {
+  const k = snapshotKey();
+
+  if (k && confirm('Clear the saved network snapshot for this chat?')) {
+    localStorage.removeItem(k);
+    snapshotCache.delete(chatIdFromURL());
+    render();
+    return true;
+  }
+
+  return false;
+}
+
+function clearVerifiedSamplesUI() {
+  if (!confirm('Clear all verified max diagnostic samples?')) return false;
+  clearVerifiedMaxSamples();
+  render();
+  return true;
+}
+
+// ============================================================
+// Clipboard / notifications
+// ============================================================
+
+async function copyStats() {
+  if (!latest) return false;
+
+  const lines = [
+    'Candidate userscript: V2.24.3 MULTI-PROFILE ANONYMOUS BUILDER',
+    ...eventDiagnostics(latest.id),
+    'OBSERVED CAPTURE ROUTES',JSON.stringify(captureRouteDiagnostics(latest.id)),
+    'RETRY CAPTURE',JSON.stringify(loadDiagnostic(latest.id)?.lastRetry || null),
+    'DEEP EXISTING DIAGNOSTICS',
+    'ChatGPT Conversation Size Meter V2.23 EVENT MODEL CLEANUP',
+    '',
+    `Full snapshot captured: ${latest.full ? 'Yes' : 'No'}`,
+    `Data source: ${latest.source}`,
+    `Full snapshot age: ${formatAge(latest.fullCapturedAt)}`,
+    `Red maximum banner visible now: ${latest.liveMaximum ? 'Yes' : 'No'}`,
+    `Verified MAX events stored: ${latest.verifiedMaxSamples}`,
+
+    `V2.11 topology snapshot present: ${latest.topologySnapshotPresent ? 'Yes' : 'No'}`,
+    `V2.11 topology calculation OK: ${latest.topologyOk ? 'Yes' : 'No'}`,
+    `V2.11 topology error: ${latest.topologyError || 'None'}`,
+    '',
+    'ACTIVE BRANCH — TEXT / ROLES',
+    `Role-based user/assistant token estimate: ${latest.tokens ?? 'Unavailable'}`,
+    `Role-based user/assistant characters: ${latest.chars ?? 'Unavailable'}`,
+    `Role-based user/assistant messages: ${latest.messages}`,
+    `User messages: ${latest.userMessages}`,
+    `Assistant messages: ${latest.assistantMessages}`,
+    `Display-like token estimate (heuristic): ${latest.activeDisplayLikeTextTokens ?? 'Unavailable'}`,
+    `Display-like characters (heuristic): ${latest.activeDisplayLikeTextChars ?? 'Unavailable'}`,
+    `Display-like messages (heuristic): ${latest.activeDisplayLikeMessages ?? 'Unavailable'}`,
+    `Active branch nodes: ${latest.activeBranchNodes ?? 'Unavailable'}`,
+    `Active message nodes: ${latest.activeMessageNodes ?? 'Unavailable'}`,
+    `All-role text token estimate: ${latest.activeAllTextTokens ?? 'Unavailable'}`,
+    `All-role text characters: ${latest.activeAllTextChars ?? 'Unavailable'}`,
+    `Hidden/internal message nodes: ${latest.activeHiddenMessageNodes ?? 'Unavailable'}`,
+    `Hidden/internal text token estimate: ${latest.activeHiddenTextTokens ?? 'Unavailable'}`,
+    `Hidden/internal text characters: ${latest.activeHiddenTextChars ?? 'Unavailable'}`,
+    `Empty message nodes: ${latest.activeEmptyMessageNodes ?? 'Unavailable'}`,
+    `Active role counts: ${compactCounts(latest.activeRoleCounts, 40)}`,
+    `Active content types: ${compactCounts(latest.activeContentTypeCounts, 40)}`,
+    '',
+    'TOOLS — V2.10.1 FIXED CLASSIFIER',
+    `Explicit tool/function role nodes: ${latest.activeExplicitToolRoleNodes ?? 'Unavailable'}`,
+    `Tool-like nodes: ${latest.activeToolishNodes ?? 'Unavailable'}`,
+    `Tool call nodes: ${latest.activeToolCallNodes ?? 'Unavailable'}`,
+    `Tool result nodes: ${latest.activeToolResultNodes ?? 'Unavailable'}`,
+    `Tool call serialized node bytes: ${latest.activeToolCallBytes ?? 'Unavailable'}`,
+    `Tool result serialized node bytes: ${latest.activeToolResultBytes ?? 'Unavailable'}`,
+    `Tool call names: ${compactCounts(latest.activeToolCallNames, 60)}`,
+    `Tool result names: ${compactCounts(latest.activeToolResultNames, 60)}`,
+    `Non-generic recipient distribution: ${compactCounts(latest.activeRecipientCounts, 60)}`,
+    '',
+    'IMAGE / FILE / ASSET DIAGNOSTICS',
+    `Attachment-like nodes: ${latest.activeAttachmentNodes ?? 'Unavailable'}`,
+    `Image-like nodes: ${latest.activeImageNodes ?? 'Unavailable'}`,
+    `File-like nodes: ${latest.activeFileNodes ?? 'Unavailable'}`,
+    `Audio-like nodes: ${latest.activeAudioNodes ?? 'Unavailable'}`,
+    `Video-like nodes: ${latest.activeVideoNodes ?? 'Unavailable'}`,
+    `Image-generation call nodes: ${latest.activeImageGenCallNodes ?? 'Unavailable'}`,
+    `Image-generation result nodes: ${latest.activeImageGenResultNodes ?? 'Unavailable'}`,
+    `Generated-image nodes: ${latest.activeGeneratedImageNodes ?? 'Unavailable'}`,
+    `Uploaded-image nodes: ${latest.activeUploadedImageNodes ?? 'Unavailable'}`,
+    `Unique asset IDs: ${latest.activeUniqueAssetIds ?? 'Unavailable'}`,
+    `Unique image asset IDs: ${latest.activeUniqueImageAssetIds ?? 'Unavailable'}`,
+    `Unique file asset IDs: ${latest.activeUniqueFileAssetIds ?? 'Unavailable'}`,
+    `Unique generated-image asset IDs: ${latest.activeUniqueGeneratedImageAssetIds ?? 'Unavailable'}`,
+    `Unique uploaded-image asset IDs: ${latest.activeUniqueUploadedImageAssetIds ?? 'Unavailable'}`,
+    `Image reference occurrences: ${latest.activeImageReferenceOccurrences ?? 'Unavailable'}`,
+    `File reference occurrences: ${latest.activeFileReferenceOccurrences ?? 'Unavailable'}`,
+    `Asset-like serialized node bytes: ${latest.activeAssetNodeBytes ?? 'Unavailable'}`,
+    `Image-like serialized node bytes: ${latest.activeImageNodeBytes ?? 'Unavailable'}`,
+    `File-like serialized node bytes: ${latest.activeFileNodeBytes ?? 'Unavailable'}`,
+    '',
+    'MODEL METADATA',
+    `Active model distribution: ${compactCounts(latest.activeModelCounts, 60)}`,
+    `GPT-6 Pro-labeled message nodes: ${latest.activeGpt6ProMessageNodes ?? 'Unavailable'}`,
+    '',
+
+
+    'CONTEXT-HISTORY TOPOLOGY — V2.12',
+    `Current active depth: ${latest.currentDepth ?? 'Unavailable'}`,
+    `Latest/current model label: ${latest.currentModel ?? 'Unavailable'}`,
+    `Model segment count: ${latest.modelSegmentCount ?? 'Unavailable'}`,
+    `Recent model segments: ${modelSegmentsTextV2114(latest.modelSegments, 40)}`,
+    `GPT-6 Pro segment count: ${latest.gpt6ProSegmentCount ?? 'Unavailable'}`,
+    `Longest GPT-6 Pro segment: ${segmentTextV2114(latest.longestGpt6ProSegment)}`,
+    `Latest GPT-6 Pro segment: ${segmentTextV2114(latest.latestGpt6ProSegment)}`,
+    `GPT-6 Pro depth count: ${latest.gpt6ProDepthCount ?? 'Unavailable'}`,
+    `GPT-6 Pro depths: ${compactDepthsV2114(latest.gpt6ProDepths, 120)}`,
+    `First GPT-6 Pro depth: ${latest.firstGpt6ProDepth ?? 'Unavailable'}`,
+    `Last GPT-6 Pro depth: ${latest.lastGpt6ProDepth ?? 'Unavailable'}`,
+    `Nodes since last GPT-6 Pro node: ${latest.nodesSinceLastGpt6Pro ?? 'Unavailable'}`,
+    `Image-generation event depth count: ${latest.imageGenDepthCount ?? 'Unavailable'}`,
+    `Image-generation event depths: ${compactDepthsV2114(latest.imageGenDepths, 120)}`,
+    `Generated-image depth count: ${latest.generatedImageDepthCount ?? 'Unavailable'}`,
+    `Generated-image depths: ${compactDepthsV2114(latest.generatedImageDepths, 120)}`,
+    `Last image-generation depth: ${latest.lastImageGenDepth ?? 'Unavailable'}`,
+    `Nodes since last image-generation event: ${latest.nodesSinceLastImageGen ?? 'Unavailable'}`,
+    `Inferred image-generation pairs: ${latest.imageGenPairCount ?? 'Unavailable'}`,
+    `Unpaired image-generation results: ${latest.imageGenUnpairedResults ?? 'Unavailable'}`,
+    `Inferred image-generation call names: ${compactCounts(latest.imageGenInferredCallNames, 60)}`,
+    `Image-generation pair distance min/max/avg: ${latest.imageGenPairDistanceMin ?? 'Unavailable'} / ${latest.imageGenPairDistanceMax ?? 'Unavailable'} / ${latest.imageGenPairDistanceAverage != null ? latest.imageGenPairDistanceAverage.toFixed(2) : 'Unavailable'}`,
+    `Strong context marker count: ${latest.strongContextMarkerCount ?? 'Unavailable'}`,
+    `Strong context marker depths: ${compactDepthsV2114(latest.strongContextMarkerDepths, 120)}`,
+    `Nodes since last strong context marker: ${latest.nodesSinceLastStrongContextMarker ?? 'Unavailable'}`,
+    `Reasoning recap marker count: ${latest.recapMarkerCount ?? 'Unavailable'}`,
+    `Reasoning recap depths: ${compactDepthsV2114(latest.recapDepths, 120)}`,
+    `Nodes since last reasoning recap: ${latest.nodesSinceLastRecap ?? 'Unavailable'}`,
+    `Branch points after last image-gen: ${latest.branchPointsAfterLastImageGen ?? 'Unavailable'}`,
+    `Branch points after last GPT-6 Pro node: ${latest.branchPointsAfterLastGpt6Pro ?? 'Unavailable'}`,
+    `Branch points within ±32 nodes of image-gen: ${latest.branchPointsNearImageGen32 ?? 'Unavailable'}`,
+    `Branch points within ±32 nodes of GPT-6 Pro: ${latest.branchPointsNearGpt6Pro32 ?? 'Unavailable'}`,
+    `Nearest branch distance to last image-gen: ${latest.nearestBranchDistanceToLastImageGen ?? 'Unavailable'}`,
+    `Nearest branch distance to last GPT-6 Pro: ${latest.nearestBranchDistanceToLastGpt6Pro ?? 'Unavailable'}`,
+    `Recent windows: ${recentWindowsTextV2114(latest.recentWindows)}`,
+    `Since last strong context marker: ${latest.sinceLastContext ? JSON.stringify(latest.sinceLastContext) : 'Unavailable'}`,
+    '',
+
+
+
+
+
+    'RETAINED-STATE PROFILER — V2.12',
+    `Retained-state profiler present: ${latest.retainedStatePresent ? 'Yes' : 'No'}`,
+    `Deduplicated active special-node JSON bytes: ${latest.activeSpecialNodeBytes ?? 'Unavailable'}`,
+    `Active special-node share: ${latest.activeSpecialSharePercent != null ? latest.activeSpecialSharePercent.toFixed(2) + '%' : 'Unavailable'}`,
+    `Retained-state proxy bytes (active special + alternate subtrees): ${latest.retainedStateProxyBytes ?? 'Unavailable'}`,
+    `Retained-state proxy / active branch: ${latest.retainedStateProxySharePercent != null ? latest.retainedStateProxySharePercent.toFixed(2) + '%' : 'Unavailable'}`,
+    `Active tool-result JSON bytes: ${latest.retainedActiveToolResultBytes ?? 'Unavailable'}`,
+    `Active image-like JSON bytes: ${latest.retainedActiveImageLikeBytes ?? 'Unavailable'}`,
+    `Active GPT-6 Pro-labeled JSON bytes: ${latest.retainedActiveGpt6ProBytes ?? 'Unavailable'}`,
+    `Alternate subtree JSON bytes total: ${latest.retainedAlternateSubtreeBytesTotal ?? 'Unavailable'}`,
+    `Largest alternate subtree JSON bytes: ${latest.retainedAlternateSubtreeBytesMax ?? 'Unavailable'}`,
+    `Hottest 100-node buckets: ${v212BucketText(latest.retainedHottestBuckets, 20)}`,
+    `Hottest 128-node window: ${v212HotWindowText(latest.retainedHotWindows?.w128)}`,
+    `Hottest 256-node window: ${v212HotWindowText(latest.retainedHotWindows?.w256)}`,
+    `Hottest 512-node window: ${v212HotWindowText(latest.retainedHotWindows?.w512)}`,
+    `Branch retained-state details: ${v212BranchRetentionText(latest.retainedBranchDetails, 40)}`,
+    `GPT-6 Pro segment retained-state: ${v212ProSegmentsText(latest.retainedProSegments, 40)}`,
+    `Image-generation result count: ${latest.retainedImageGenResultCount ?? 'Unavailable'}`,
+    `Image-generation result JSON bytes total: ${latest.retainedImageGenResultTotalBytes ?? 'Unavailable'}`,
+    `Average image-generation result JSON bytes: ${latest.retainedImageGenResultAverageBytes ?? 'Unavailable'}`,
+    `Largest image-generation result JSON bytes: ${latest.retainedLargestImageGenResultBytes ?? 'Unavailable'}`,
+    `Top image-generation results: ${v212ImageGenResultsText({top: latest.retainedTopImageGenResults})}`,
+    `Unique asset IDs observed in active branch: ${latest.retainedUniqueAssetsObserved ?? 'Unavailable'}`,
+    `Image-generation-associated asset IDs: ${latest.retainedImageGenAssociatedAssetIds ?? 'Unavailable'}`,
+    `Assets existing by last image-gen event: ${latest.retainedAssetsExistingByLastImage ?? 'Unavailable'}`,
+    `Old assets referenced after last image-gen event: ${latest.retainedAssetsReferencedAfterLastImage ?? 'Unavailable'}`,
+    `Image-gen-associated assets referenced after last image-gen event: ${latest.retainedImageGenAssetsReferencedAfterLastImage ?? 'Unavailable'}`,
+    `Post-image nodes referencing pre-image assets: ${latest.retainedAssetReferenceNodesAfterLastImage ?? 'Unavailable'}`,
+    '',
+
+    'MAPPING / BRANCH TOPOLOGY',
+    `Total mapping nodes: ${latest.mappingNodes ?? 'Unavailable'}`,
+    `Off-branch nodes: ${latest.offBranchNodes ?? 'Unavailable'}`,
+    `Leaf nodes: ${latest.leafNodes ?? 'Unavailable'}`,
+    `Branch points (>1 child): ${latest.branchPoints ?? 'Unavailable'}`,
+    `Maximum children on one node: ${latest.maxChildren ?? 'Unavailable'}`,
+    `Branch points on active ancestry: ${latest.activeBranchPoints ?? 'Unavailable'}`,
+    `Active branch-point depths: ${Array.isArray(latest.activeBranchPointDepths) ? latest.activeBranchPointDepths.join(', ') : 'Unavailable'}`,
+    `Last branch-point depth: ${latest.lastBranchPointDepth ?? 'Unavailable'}`,
+    `Nodes since last branch point: ${latest.nodesSinceLastBranchPoint ?? 'Unavailable'}`,
+    `Alternate subtree nodes total: ${latest.alternateSubtreeNodesTotal ?? 'Unavailable'}`,
+    `Largest alternate subtree nodes: ${latest.alternateSubtreeNodesMax ?? 'Unavailable'}`,
+    `Branch-point details: ${compactBranchDetails(latest.branchPointDetails, 30)}`,
+    '',
+    'SERIALIZED BY ROLE / CONTENT TYPE',
+    `Active node JSON bytes by role: ${compactByteCounts(latest.activeNodeBytesByRole, 60)}`,
+    `Active node JSON bytes by content type: ${compactByteCounts(latest.activeNodeBytesByContentType, 60)}`,
+    `Largest active node: ${describeLargest(latest.activeLargestNode)}`,
+    `Largest active tool result: ${describeLargest(latest.activeLargestToolResult)}`,
+    `Largest active image-like node: ${describeLargest(latest.activeLargestImageNode)}`,
+    '',
+    'WHOLE MAPPING — SELECTED DEEP COUNTERS',
+    `Mapping explicit tool/function role nodes: ${latest.mappingExplicitToolRoleNodes ?? 'Unavailable'}`,
+    `Mapping tool-like nodes: ${latest.mappingToolishNodes ?? 'Unavailable'}`,
+    `Mapping tool call nodes: ${latest.mappingToolCallNodes ?? 'Unavailable'}`,
+    `Mapping tool result nodes: ${latest.mappingToolResultNodes ?? 'Unavailable'}`,
+    `Mapping image-generation call nodes: ${latest.mappingImageGenCallNodes ?? 'Unavailable'}`,
+    `Mapping image-generation result nodes: ${latest.mappingImageGenResultNodes ?? 'Unavailable'}`,
+    `Mapping generated-image nodes: ${latest.mappingGeneratedImageNodes ?? 'Unavailable'}`,
+    `Mapping uploaded-image nodes: ${latest.mappingUploadedImageNodes ?? 'Unavailable'}`,
+    `Mapping unique image asset IDs: ${latest.mappingUniqueImageAssetIds ?? 'Unavailable'}`,
+    `Mapping unique file asset IDs: ${latest.mappingUniqueFileAssetIds ?? 'Unavailable'}`,
+    `Mapping model distribution: ${compactCounts(latest.mappingModelCounts, 60)}`,
+    `Mapping GPT-6 Pro-labeled message nodes: ${latest.mappingGpt6ProMessageNodes ?? 'Unavailable'}`,
+    '',
+    'SERIALIZED / NETWORK SIZE',
+    `Active branch serialized JSON bytes: ${latest.activeBranchSerializedBytes ?? 'Unavailable'}`,
+    `Full mapping serialized JSON bytes: ${latest.mappingSerializedBytes ?? 'Unavailable'}`,
+    `Largest captured full conversation response bytes: ${latest.maxFullPayloadBytes ?? 'Unavailable'}`,
+    `Largest observed conversation-network event bytes: ${latest.maxObservedPayloadBytes ?? 'Unavailable'}`,
+    `Last observed conversation-network event bytes: ${latest.lastPayloadBytes ?? 'Unavailable'}`,
+    '',
+    'Note: V2.23 confirms SUCCESS directly from explicit SSE completion signals, records outcome-confirmation evidence, treats post-completion clone aborts as benign, and collects optional post-outcome source-family correlation while preserving preflight/WebSocket/source separation; heuristic classifiers for display-like content, tool names, image generation, assets and model metadata because these internal payload fields are not a public stable schema. Counts are for comparison across chats, not a universal remaining-capacity percentage.'
+  ];
+
+  try {
+    await navigator.clipboard.writeText(redactDiagnosticText(lines.join('\n')));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function enableNotifications() {
+  if (!('Notification' in window)) return false;
+
+  if (Notification.permission === 'granted') return true;
+
+  if (Notification.permission === 'denied') {
+    alert('Notifications are blocked for chatgpt.com.');
+    return false;
+  }
+
+  return (await Notification.requestPermission()) === 'granted';
+}
+
+function checkNotifications(s) {
+  if (
+    !S.notifications ||
+    !s.liveMaximum ||
+    !('Notification' in window) ||
+    Notification.permission !== 'granted'
+  ) {
+    return;
+  }
+
+  const k = `${P}:notify:${s.id}:live-max`;
+  if (sessionStorage.getItem(k)) return;
+
+  sessionStorage.setItem(k, '1');
+
+  new Notification(
+    'ChatGPT conversation maxed out',
+    {
+      body: 'The maximum-length banner is visible in this conversation.'
+    }
+  );
+}
+
+// ============================================================
+// Settings UI
+// ============================================================
+
+function fillSettings() {
+  panel.querySelector('[data-setting="charsPerToken"]').value =
+    S.charsPerToken;
+
+  panel.querySelector('[data-setting="notifications"]').checked =
+    S.notifications;
+}
+
+async function saveSettingsForm() {
+  const c = Number(
+    panel.querySelector('[data-setting="charsPerToken"]').value
+  );
+
+  let n = panel.querySelector('[data-setting="notifications"]').checked;
+
+  if (!Number.isFinite(c) || c < 2 || c > 8) {
+    alert('Chars/token must be between 2 and 8.');
+    return false;
+  }
+
+  if (n && !S.notifications) {
+    n = await enableNotifications();
+  }
+
+  S.charsPerToken = c;
+  S.notifications = n;
+  S.calibrationTokens = null;
+
+  saveSettings();
+  settingsBox.classList.remove('open');
+  render();
+  return true;
+}
+
+// ============================================================
+// Styles
+// ============================================================
+
+function injectStyles() {
+  if (
+    document.getElementById(`${P}:css`)
+  ) {
+    return;
+  }
+
+  const s = document.createElement('style');
+  s.id = `${P}:css`;
+
+  s.textContent = `
+#${P}{
+  --bg:rgba(20,92,55,.97);
+  --muted:rgba(255,255,255,.68);
+
+  position:fixed;
+  right:22px;
+  bottom:88px;
+  z-index:2147483000;
+  width:166px;
+
+  background:var(--bg);
+  color:#fff;
+
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:12px;
+
+  box-shadow:0 7px 25px rgba(0,0,0,.32);
+  backdrop-filter:blur(12px);
+
+  font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+
+  overflow:hidden;
+  transition:width .18s,background .25s;
+}
+
+#${P} *{box-sizing:border-box}
+
+#${P}.theme-normal{--bg:rgba(20,92,55,.97)}
+#${P}.theme-large{--bg:rgba(100,83,20,.97)}
+#${P}.theme-warning{--bg:rgba(127,66,19,.97)}
+#${P}.theme-critical,
+#${P}.theme-maximum{--bg:rgba(119,27,27,.98)}
+#${P}.theme-waiting{--bg:rgba(55,62,70,.97)}
+
+#${P} .hdr{
+  position:sticky;
+  top:0;
+  z-index:4;
+  background:var(--bg);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:9px 10px 4px;
+  cursor:move;
+  user-select:none;
+}
+
+#${P} .title{font-weight:800}
+
+#${P} .expand{
+  width:19px;
+  height:19px;
+  padding:0;
+  border:0;
+  border-radius:5px;
+  background:rgba(255,255,255,.09);
+  color:#fff;
+  font:inherit;
+  cursor:pointer;
+}
+
+#${P} .compact{
+  padding:0 11px 10px;
+  font-weight:600;
+}
+
+#${P} .divider{
+  height:1px;
+  margin:7px 0 6px;
+  background:rgba(255,255,255,.3);
+}
+
+#${P} .compact-status{
+  display:flex;
+  gap:5px;
+  align-items:center;
+  font-weight:800;
+  white-space:nowrap;
+}
+
+#${P} .dot{font-size:13px}
+#${P} .dot.normal{color:#70f3b6}
+#${P} .dot.large{color:#ffe36b}
+#${P} .dot.warning{color:#ffad5c}
+#${P} .dot.critical,
+#${P} .dot.maximum{color:#ff7777}
+#${P} .dot.waiting{color:#b8c0c8}
+
+#${P} .source-note{
+  margin-top:5px;
+  color:var(--muted);
+  font-size:9px;
+}
+
+#${P} .detail{
+  display:none;
+  padding:2px 11px 10px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+  min-height:0;
+}
+
+#${P}.expanded{
+  width:360px;
+  max-height:88vh;
+  display:flex;
+  flex-direction:column;
+}
+#${P}.expanded .compact{display:none}
+#${P}.expanded .detail{
+  display:block;
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto;
+}
+
+#${P} .expanded-top{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-end;
+}
+
+#${P} .big-number{
+  font-size:22px;
+  font-weight:800;
+  line-height:1.1;
+}
+
+#${P} .percent{
+  font-size:17px;
+  font-weight:800;
+}
+
+#${P} .muted,
+#${P} .headroom{
+  color:var(--muted);
+  font-size:9px;
+}
+
+#${P} .progress-shell{
+  height:7px;
+  margin:10px 0 4px;
+  background:rgba(0,0,0,.22);
+  border-radius:999px;
+  overflow:hidden;
+}
+
+#${P} .progress-bar{
+  height:100%;
+  border-radius:999px;
+}
+
+#${P} .headroom{
+  text-align:right;
+  margin-bottom:10px;
+}
+
+#${P} .stats-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:7px 10px;
+}
+
+#${P} .wide{grid-column:1/-1}
+#${P} .label{color:var(--muted);font-size:8px}
+#${P} .value{font-weight:700}
+#${P} .tiny-value{font-size:8px;line-height:1.35;overflow-wrap:anywhere}
+
+#${P} .section-title{
+  margin:10px 0 6px;
+  padding-top:7px;
+  border-top:1px solid rgba(255,255,255,.16);
+  color:rgba(255,255,255,.82);
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.45px;
+}
+
+#${P} .expanded-status{
+  margin-top:11px;
+  padding:7px;
+  border-radius:7px;
+  background:rgba(0,0,0,.18);
+  text-align:center;
+  font-weight:800;
+}
+
+#${P} .action-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:5px;
+  margin-top:7px;
+}
+
+#${P} .wide-button{grid-column:1/-1}
+
+#${P} .quick-actions{
+  position:sticky;
+  top:0;
+  z-index:3;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:6px;
+  margin:0 -2px 8px;
+  padding:4px 2px 7px;
+  background:linear-gradient(
+    to bottom,
+    var(--bg) 0%,
+    var(--bg) 78%,
+    rgba(0,0,0,0) 100%
+  );
+}
+
+#${P} .last-action{
+  grid-column:1/-1;
+  font-size:10px;
+  font-weight:700;
+  color:var(--muted);
+  overflow-wrap:anywhere;
+}
+#${P} .last-action.ok{color:#9af8c8}
+#${P} .last-action.error{color:#ffaaaa}
+#${P} .last-action.busy{color:#d6e7ff}
+
+#${P} .quick-actions button{
+  padding:7px 6px;
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:7px;
+  background:rgba(0,0,0,.28);
+  color:#fff;
+  font-size:9px;
+  font-weight:800;
+  cursor:pointer;
+}
+
+#${P} .quick-actions button:hover{
+  background:rgba(0,0,0,.40);
+}
+
+#${P} .detail::-webkit-scrollbar,
+#${P} .settings::-webkit-scrollbar{
+  width:8px;
+}
+
+#${P} .detail::-webkit-scrollbar-thumb,
+#${P} .settings::-webkit-scrollbar-thumb{
+  background:rgba(255,255,255,.22);
+  border-radius:999px;
+}
+
+#${P} .detail::-webkit-scrollbar-track,
+#${P} .settings::-webkit-scrollbar-track{
+  background:rgba(0,0,0,.08);
+}
+
+
+#${P} button{font-family:inherit}
+
+#${P} .action-grid button,
+#${P} .settings-btn,
+#${P} .settings-actions button,
+#${P} .expand{
+  transition:
+    transform .07s ease,
+    background .10s ease,
+    border-color .10s ease,
+    box-shadow .10s ease,
+    filter .10s ease;
+}
+
+#${P} .action-grid button,
+#${P} .settings-btn,
+#${P} .settings-actions button{
+  padding:6px 5px;
+  border:1px solid rgba(255,255,255,.1);
+  border-radius:6px;
+  background:rgba(0,0,0,.2);
+  color:#fff;
+  font-size:9px;
+  cursor:pointer;
+  box-shadow:0 1px 0 rgba(255,255,255,.05);
+}
+
+#${P} button:not(:disabled):hover{
+  background:rgba(0,0,0,.29);
+  border-color:rgba(255,255,255,.18);
+}
+
+#${P} button:not(:disabled):active,
+#${P} button.press-flash{
+  transform:translateY(1px) scale(.975);
+  background:rgba(255,255,255,.16);
+  border-color:rgba(255,255,255,.34);
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.28);
+  filter:brightness(1.13);
+}
+
+
+#${P} button{
+  transition:
+    transform .07s ease,
+    filter .07s ease,
+    box-shadow .07s ease,
+    background .07s ease;
+}
+
+#${P} button:active:not(:disabled){
+  transform:translateY(2px) scale(.985);
+  filter:brightness(1.35);
+  box-shadow:
+    inset 0 2px 5px rgba(0,0,0,.38),
+    0 0 0 1px rgba(255,255,255,.18);
+}
+
+#${P} button:disabled{
+  opacity:.48;
+  cursor:not-allowed;
+}
+
+#${P} .button-feedback{
+  margin-top:6px;
+  padding:5px 6px;
+  border-radius:6px;
+  text-align:center;
+  font-size:8px;
+  font-weight:800;
+  background:rgba(0,0,0,.18);
+  border:1px solid rgba(255,255,255,.10);
+}
+
+#${P} .button-feedback.ok{color:#9af8c8}
+#${P} .button-feedback.busy{color:#d6e7ff}
+#${P} .button-feedback.warn{color:#ffe38a}
+#${P} .button-feedback.error{color:#ffaaaa}
+
+
+#${P} .risk-card{
+  margin:8px 0 10px;
+  padding:8px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,.16);
+  background:rgba(0,0,0,.18);
+}
+
+
+#${P} .density-advisory{
+  color:#ffe38a;
+  font-weight:800;
+}
+
+#${P} .density-card{
+  margin-top:7px;
+  padding:6px;
+  border-radius:6px;
+  background:rgba(0,0,0,.14);
+  border:1px solid rgba(255,255,255,.10);
+}
+
+#${P} .density-card.normal{
+  border-color:rgba(112,243,182,.18);
+}
+
+#${P} .density-card.dense{
+  border-color:rgba(255,227,107,.35);
+}
+
+#${P} .density-card.extreme{
+  border-color:rgba(255,119,119,.48);
+}
+
+#${P} .risk-card-top{
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  align-items:center;
+}
+
+#${P} .risk-label{
+  font-size:8px;
+  color:var(--muted);
+  font-weight:800;
+  letter-spacing:.35px;
+}
+
+#${P} .risk-band{
+  font-size:13px;
+  font-weight:900;
+}
+
+#${P} .risk-meter-shell{
+  height:7px;
+  margin:7px 0 5px;
+  border-radius:999px;
+  overflow:hidden;
+  background:rgba(0,0,0,.28);
+}
+
+#${P} .risk-meter-fill{
+  height:100%;
+  border-radius:999px;
+  background:rgba(255,255,255,.72);
+}
+
+#${P} .risk-explain{
+  color:rgba(255,255,255,.76);
+  font-size:8px;
+  line-height:1.4;
+}
+
+#${P} .risk-calibration{
+  margin-top:5px;
+  color:rgba(255,255,255,.55);
+  font-size:7px;
+  line-height:1.35;
+}
+
+#${P} .capture-note,
+#${P} .diag,
+#${P} .cal-note{
+  margin-top:6px;
+  text-align:center;
+  font-size:8px;
+}
+
+#${P} .capture-note,
+#${P} .diag{
+  color:rgba(255,255,255,.72);
+}
+
+#${P} .cal-note.good{color:#8ff7c1}
+#${P} .cal-note.warn{color:#ffe38a}
+
+#${P} .settings-toggle{
+  flex:0 0 auto;
+  background:var(--bg);
+  display:none;
+  padding:0 11px 9px;
+}
+
+#${P}.expanded .settings-toggle{display:block}
+
+#${P} .settings-btn{width:100%}
+
+#${P} .settings{
+  flex:0 0 auto;
+  max-height:42vh;
+  overflow-y:auto;
+  display:none;
+  padding:9px 11px 11px;
+  border-top:1px solid rgba(255,255,255,.15);
+  background:rgba(0,0,0,.1);
+}
+
+#${P} .settings.open{display:block}
+
+#${P} .row{margin-bottom:8px}
+
+#${P} .row label{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+}
+
+#${P} .row span{font-size:9px}
+
+#${P} input[type="number"]{
+  width:79px;
+  padding:4px;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:5px;
+  background:rgba(0,0,0,.2);
+  color:#fff;
+  font:9px inherit;
+}
+
+#${P} .settings-actions{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:5px;
+  margin-top:9px;
+}
+
+#${P} .settings-wide{grid-column:1/-1}
+`;
+
+  (
+    document.head ||
+    document.documentElement
+  ).appendChild(s);
+}
+
+
+// ============================================================
+// UI creation / dragging
+// ============================================================
+
+function createUI() {
+  panel?.remove();
+  injectStyles();
+
+  panel = document.createElement('div');
+  panel.id = P;
+
+  panel.innerHTML = `
+    <div class="hdr">
+      <div class="title">CHAT SIZE</div>
+
+      <button class="expand" data-action="expand">+</button>
+    </div>
+
+    <div class="compact"></div>
+    <div class="detail"></div>
+
+    <div class="settings-toggle">
+      <button class="settings-btn" data-action="settings">
+        Settings
+      </button>
+    </div>
+
+    <div class="settings">
+      <div class="row">
+        <label>
+          <span>Chars / token estimate</span>
+          <input
+            data-setting="charsPerToken"
+            type="number"
+            min="2"
+            max="8"
+            step="0.1"
+          >
+        </label>
+      </div>
+
+      <div class="row">
+        <label>
+          <span>Notify on real MAX banner</span>
+          <input
+            data-setting="notifications"
+            type="checkbox"
+          >
+        </label>
+      </div>
+
+      <div class="settings-actions">
+        <button data-action="save-settings">Save</button>
+
+        <button data-action="clear-snapshot">
+          Clear chat snapshot
+        </button>
+
+        <button
+          class="settings-wide"
+          data-action="clear-max-samples"
+        >
+          Clear verified max samples
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(panel);
+
+  compact = panel.querySelector('.compact');
+  detail = panel.querySelector('.detail');
+  settingsBox = panel.querySelector('.settings');
+
+  restorePosition();
+  fillSettings();
+  bindUI();
+  render();
+}
+
+function restorePosition() {
+  let pos = null;
+
+  for (const k of [
+    POSITION_KEY,
+    'cgpt-size-meter-v210:position',
+    'cgpt-size-meter-v29:position',
+    'cgpt-size-meter-v26:position',
+    'cgpt-size-meter-v25:position',
+    'cgpt-size-meter-v24:position'
+  ]) {
+    try {
+      const x = JSON.parse(
+        localStorage.getItem(k)
+      );
+
+      if (x) {
+        pos = x;
+        break;
+      }
+    } catch {}
+  }
+
+  if (
+    !pos ||
+    !Number.isFinite(pos.left) ||
+    !Number.isFinite(pos.top)
+  ) {
+    return;
+  }
+
+  panel.style.left = `${pos.left}px`;
+  panel.style.top = `${pos.top}px`;
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
+}
+
+function savePosition() {
+  const r = panel.getBoundingClientRect();
+
+  localStorage.setItem(
+    POSITION_KEY,
+    JSON.stringify({
+      left: r.left,
+      top: r.top
+    })
+  );
+}
+
+function bindUI() {
+  panel.addEventListener(
+    'pointerdown',
+    e => {
+      const b = e.target.closest('button:not(:disabled)');
+      if (!b) return;
+      b.classList.add('press-flash');
+      setTimeout(() => b.classList.remove('press-flash'), 130);
+    }
+  );
+
+  panel.addEventListener(
+    'click',
+    async e => {
+      const b = e.target.closest('[data-action]');
+      if (!b || b.disabled) return;
+
+      switch (b.dataset.action) {
+        case 'expand':
+          S.expanded = !S.expanded;
+          saveSettings();
+          render();
+          break;
+
+        case 'settings': {
+          const opening = !settingsBox.classList.contains('open');
+          settingsBox.classList.toggle('open');
+          b.textContent = opening ? 'Settings ▲' : 'Settings';
+          break;
+        }
+
+        case 'retry':
+          await runQuickAction('retry');
+          break;
+
+        case 'anon':
+          await runAnonymousCopy();
+          break;
+
+        case 'copy':
+          await runQuickAction('copy');
+          break;
+
+        case 'save-max-sample': {
+          b.textContent = 'Saving…';
+          const ok = saveCurrentVerifiedMaxSample();
+          if (ok) {
+            showFeedback('Verified MAX sample saved ✓', 'ok', 1700);
+          }
+          break;
+        }
+
+        case 'save-settings': {
+          b.textContent = 'Saving…';
+          const ok = await saveSettingsForm();
+          if (ok) showFeedback('Settings saved ✓', 'ok', 1300);
+          break;
+        }
+
+        case 'clear-snapshot': {
+          const ok = clearSnapshot();
+          if (ok) showFeedback('Chat snapshot cleared ✓', 'ok', 1300);
+          break;
+        }
+
+        case 'clear-max-samples': {
+          const ok = clearVerifiedSamplesUI();
+          if (ok) showFeedback('Verified MAX samples cleared ✓', 'ok', 1300);
+          break;
+        }
+      }
+    }
+  );
+
+  panel.querySelector('.hdr').addEventListener(
+    'mousedown',
+    e => {
+      if (
+        e.button !== 0 ||
+        e.target.closest('button')
+      ) {
+        return;
+      }
+
+      const r = panel.getBoundingClientRect();
+
+      drag = true;
+      dx = e.clientX - r.left;
+      dy = e.clientY - r.top;
+
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+
+      e.preventDefault();
+    }
+  );
+
+  document.addEventListener(
+    'mousemove',
+    e => {
+      if (!drag) return;
+
+      panel.style.left =
+        Math.max(
+          0,
+          Math.min(
+            innerWidth - panel.offsetWidth,
+            e.clientX - dx
+          )
+        ) + 'px';
+
+      panel.style.top =
+        Math.max(
+          0,
+          Math.min(
+            innerHeight - panel.offsetHeight,
+            e.clientY - dy
+          )
+        ) + 'px';
+    }
+  );
+
+  document.addEventListener(
+    'mouseup',
+    () => {
+      if (!drag) return;
+      drag = false;
+      savePosition();
+    }
+  );
+}
+
+
+// ============================================================
+// Start
+// ============================================================
+
+function startUI() {
+  if (!document.body) {
+    setTimeout(startUI, 100);
+    return;
+  }
+
+  pressureCollect(chatIdFromURL());
+  createUI();
+  installAttemptDOMObserver();
+  installSendIntentHook();
+
+  /*
+    A direct retry shortly after the page settles. Network hooks are already
+    active from document-start, so this is only a backup.
+  */
+  scheduleBoundCapture({chatId:chatIdFromURL(),reason:'initial capture'},1800);
+
+  directRetryTimer = setInterval(
+    () => {
+      const id = chatIdFromURL();
+
+      if (id) {
+        const snap = loadSnapshot(id);
+
+        if (
+          !snap.full ||
+          !snap.structure ||
+          !snap.structure.contextTopology
+        ) {
+          controlledCapture({chatId:id,reason:'background capture'});
+        }
+      }
+    },
+    15000
+  );
+
+  setInterval(
+    () => {
+      if (location.href !== lastURL) {
+        lastURL = location.href;
+
+        render();
+        scheduleBoundCapture({chatId:chatIdFromURL(),reason:'SPA capture'},400);
+      } else {
+        render();
+      }
+    },
+    3000
+  );
+}
+
+startUI();
+
+})();
